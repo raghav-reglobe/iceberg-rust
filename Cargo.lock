@@ -3515,6 +3515,7 @@ dependencies = [
  "chrono",
  "http 1.4.0",
  "iceberg",
+ "iceberg-storage-opendal",
  "iceberg_test_utils",
  "itertools 0.13.0",
  "mockito",
