@@ -66,6 +66,7 @@ parquet = { workspace = true, features = ["async", "encryption"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
 roaring = { workspace = true }
+crc32fast = { workspace = true }
 fastnum = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
