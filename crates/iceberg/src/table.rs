@@ -287,7 +287,10 @@ impl Table {
     }
 
     /// Returns the [`Runtime`] for this table.
-    pub(crate) fn runtime(&self) -> &Runtime {
+    ///
+    /// Public so external tools (e.g. a compaction engine) can build an
+    /// `ArrowReaderBuilder` to read a subset of `FileScanTask`s directly.
+    pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
 
