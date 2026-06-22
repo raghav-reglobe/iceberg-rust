@@ -37,6 +37,9 @@ pub struct RowDeltaAction {
     removed_data_files: Vec<DataFile>,
     /// MoR delete files (position/equality deletes, incl. V3 deletion vectors) to add.
     added_delete_files: Vec<DataFile>,
+    /// MoR delete files to mark removed — e.g. a compaction reabsorbing a
+    /// rewritten data file's deletion vectors.
+    removed_delete_files: Vec<DataFile>,
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     starting_snapshot_id: Option<i64>,
@@ -48,6 +51,7 @@ impl RowDeltaAction {
             added_data_files: vec![],
             removed_data_files: vec![],
             added_delete_files: vec![],
+            removed_delete_files: vec![],
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
@@ -72,6 +76,15 @@ impl RowDeltaAction {
     /// vectors). Written into a content=Deletes manifest at commit time.
     pub fn add_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_delete_files.extend(delete_files);
+        self
+    }
+
+    /// Mark existing Merge-on-Read delete files (position/equality deletes, incl.
+    /// V3 deletion vectors) as removed — e.g. a compaction that reabsorbs a
+    /// rewritten data file's deletes. Written as DELETED entries in the
+    /// content=Deletes manifest at commit (mirrors `remove_data_files` for data).
+    pub fn remove_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.removed_delete_files.extend(delete_files);
         self
     }
 
@@ -129,6 +142,7 @@ impl TransactionAction for RowDeltaAction {
 
         let operation = RowDeltaOperation {
             removed_data_files: self.removed_data_files.clone(),
+            removed_delete_files: self.removed_delete_files.clone(),
             has_added_data_files: !self.added_data_files.is_empty(),
             has_added_delete_files: !self.added_delete_files.is_empty(),
         };
@@ -141,6 +155,7 @@ impl TransactionAction for RowDeltaAction {
 
 struct RowDeltaOperation {
     removed_data_files: Vec<DataFile>,
+    removed_delete_files: Vec<DataFile>,
     has_added_data_files: bool,
     has_added_delete_files: bool,
 }
@@ -151,7 +166,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     /// - MoR delete files added → `Overwrite` if data files also added, else `Delete`
     /// - Only data files added (or nothing) → `Append`
     fn operation(&self) -> Operation {
-        if !self.removed_data_files.is_empty() {
+        if !self.removed_data_files.is_empty() || !self.removed_delete_files.is_empty() {
             Operation::Overwrite
         } else if self.has_added_delete_files {
             if self.has_added_data_files {
@@ -194,8 +209,13 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             .load()
             .await?;
 
-        let deleted_paths: HashSet<&str> = self
+        let removed_data_paths: HashSet<&str> = self
             .removed_data_files
+            .iter()
+            .map(|f| f.file_path())
+            .collect();
+        let removed_delete_paths: HashSet<&str> = self
+            .removed_delete_files
             .iter()
             .map(|f| f.file_path())
             .collect();
@@ -205,6 +225,15 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
                 continue;
             }
+
+            // Match each manifest against the removed set for its content: data
+            // files for Data manifests, delete files (incl. V3 deletion vectors)
+            // for Deletes manifests. This lets a compaction swap data files AND
+            // reabsorb their DVs in one snapshot.
+            let deleted_paths = match manifest_file.content {
+                ManifestContentType::Deletes => &removed_delete_paths,
+                ManifestContentType::Data => &removed_data_paths,
+            };
 
             let manifest = manifest_file
                 .load_manifest(snapshot_produce.table.file_io())
@@ -220,9 +249,9 @@ impl SnapshotProduceOperation for RowDeltaOperation {
                 continue;
             }
 
-            // Rewrite: deleted files → DELETED (new snapshot_id, original seq nums preserved),
-            // surviving files → EXISTING (all original fields preserved).
-            let mut writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
+            // Rewrite: removed files → DELETED (new snapshot_id, original seq nums
+            // preserved), survivors → EXISTING. Preserve the manifest's content type.
+            let mut writer = snapshot_produce.new_manifest_writer(manifest_file.content)?;
             for entry in manifest.entries() {
                 if deleted_paths.contains(entry.data_file().file_path()) {
                     writer.add_delete_entry((**entry).clone())?;
