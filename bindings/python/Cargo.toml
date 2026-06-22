@@ -37,6 +37,8 @@ crate-type = ["cdylib"]
 arrow = { workspace = true, features = ["pyarrow"] }
 datafusion-ffi = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-compaction = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-all"] }
 pyo3 = { workspace = true, features = ["abi3-py310"] }
