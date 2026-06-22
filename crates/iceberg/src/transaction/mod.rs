@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod rewrite_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -76,6 +77,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+use crate::transaction::rewrite_files::RewriteFilesAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -161,6 +163,13 @@ impl Transaction {
     /// - Both operations in a single transaction (updates/merges)
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
+    }
+
+    /// Creates a rewrite-files action (compaction): replace data files with
+    /// compacted ones and reabsorb their delete files (incl. V3 deletion
+    /// vectors) in a single `Replace` snapshot.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
     }
 
     /// Creates replace sort order action.

@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -187,82 +187,19 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         Ok(vec![])
     }
 
-    /// Returns manifest files for the new snapshot.
-    ///
-    /// For each manifest in the previous snapshot:
-    /// - If it contains any file being removed: rewrite it with DELETED entries for removed files
-    ///   and EXISTING entries for survivors, preserving original sequence numbers.
-    /// - Otherwise: carry it forward unchanged.
-    ///
-    /// This matches Java's `ManifestFilterManager.filterManifestWithDeletedFiles` logic.
+    /// Returns manifest files for the new snapshot, rewriting any that contain
+    /// removed data files (and reabsorbing removed delete files / DVs). Delegates
+    /// to the shared `SnapshotProducer::rewrite_existing_manifests_removing`.
     async fn existing_manifest(
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_produce
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
-        let removed_data_paths: HashSet<&str> = self
-            .removed_data_files
-            .iter()
-            .map(|f| f.file_path())
-            .collect();
-        let removed_delete_paths: HashSet<&str> = self
-            .removed_delete_files
-            .iter()
-            .map(|f| f.file_path())
-            .collect();
-
-        let mut result = Vec::new();
-        for manifest_file in manifest_list.entries() {
-            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
-                continue;
-            }
-
-            // Match each manifest against the removed set for its content: data
-            // files for Data manifests, delete files (incl. V3 deletion vectors)
-            // for Deletes manifests. This lets a compaction swap data files AND
-            // reabsorb their DVs in one snapshot.
-            let deleted_paths = match manifest_file.content {
-                ManifestContentType::Deletes => &removed_delete_paths,
-                ManifestContentType::Data => &removed_data_paths,
-            };
-
-            let manifest = manifest_file
-                .load_manifest(snapshot_produce.table.file_io())
-                .await?;
-
-            let needs_rewrite = manifest
-                .entries()
-                .iter()
-                .any(|e| e.is_alive() && deleted_paths.contains(e.data_file().file_path()));
-
-            if !needs_rewrite {
-                result.push(manifest_file.clone());
-                continue;
-            }
-
-            // Rewrite: removed files → DELETED (new snapshot_id, original seq nums
-            // preserved), survivors → EXISTING. Preserve the manifest's content type.
-            let mut writer = snapshot_produce.new_manifest_writer(manifest_file.content)?;
-            for entry in manifest.entries() {
-                if deleted_paths.contains(entry.data_file().file_path()) {
-                    writer.add_delete_entry((**entry).clone())?;
-                } else {
-                    writer.add_existing_entry((**entry).clone())?;
-                }
-            }
-            result.push(writer.write_manifest_file().await?);
-        }
-
-        Ok(result)
+        snapshot_produce
+            .rewrite_existing_manifests_removing(
+                &self.removed_data_files,
+                &self.removed_delete_files,
+            )
+            .await
     }
 
     fn removed_data_files(&self) -> &[DataFile] {

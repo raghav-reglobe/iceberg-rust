@@ -290,6 +290,73 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Carry forward the previous snapshot's manifests, rewriting any that
+    /// contain files being removed: removed **data** files in Data manifests and
+    /// removed **delete** files (incl. V3 deletion vectors) in Deletes manifests
+    /// become DELETED entries; survivors stay EXISTING (original sequence numbers
+    /// preserved). Untouched manifests are carried forward unchanged.
+    ///
+    /// Shared by `RowDelta` (remove data + reabsorb deletes) and `RewriteFiles`
+    /// (compaction: swap data files + reabsorb their DVs in one snapshot). Mirrors
+    /// Java's `ManifestFilterManager.filterManifestWithDeletedFiles`.
+    pub(crate) async fn rewrite_existing_manifests_removing(
+        &mut self,
+        removed_data_files: &[DataFile],
+        removed_delete_files: &[DataFile],
+    ) -> Result<Vec<ManifestFile>> {
+        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
+
+        let removed_data_paths: HashSet<&str> =
+            removed_data_files.iter().map(|f| f.file_path()).collect();
+        let removed_delete_paths: HashSet<&str> =
+            removed_delete_files.iter().map(|f| f.file_path()).collect();
+
+        let mut result = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+                continue;
+            }
+
+            // Match each manifest against the removed set for its content: data
+            // files for Data manifests, delete files (incl. V3 deletion vectors)
+            // for Deletes manifests.
+            let deleted_paths = match manifest_file.content {
+                ManifestContentType::Deletes => &removed_delete_paths,
+                ManifestContentType::Data => &removed_data_paths,
+            };
+
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+
+            let needs_rewrite = manifest
+                .entries()
+                .iter()
+                .any(|e| e.is_alive() && deleted_paths.contains(e.data_file().file_path()));
+
+            if !needs_rewrite {
+                result.push(manifest_file.clone());
+                continue;
+            }
+
+            // Removed files → DELETED (new snapshot_id, original seq nums
+            // preserved), survivors → EXISTING. Preserve the manifest's content.
+            let mut writer = self.new_manifest_writer(manifest_file.content)?;
+            for entry in manifest.entries() {
+                if deleted_paths.contains(entry.data_file().file_path()) {
+                    writer.add_delete_entry((**entry).clone())?;
+                } else {
+                    writer.add_existing_entry((**entry).clone())?;
+                }
+            }
+            result.push(writer.write_manifest_file().await?);
+        }
+
+        Ok(result)
+    }
+
     // Check if the partition value is compatible with the partition type.
     fn validate_partition_value(
         partition_value: &Struct,
