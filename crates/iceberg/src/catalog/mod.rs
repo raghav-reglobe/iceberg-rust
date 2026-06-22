@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use _serde::{deserialize_snapshot, serialize_snapshot};
 use async_trait::async_trait;
-pub use memory::MemoryCatalog;
+pub use memory::{MemoryCatalog, MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
 pub use metadata_location::*;
 #[cfg(test)]
 use mockall::automock;
