@@ -16,11 +16,13 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_compaction::config::Config;
 use iceberg_compaction::engine::compact_table;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -77,6 +79,9 @@ fn compact(
     py.detach(|| {
         runtime().block_on(async move {
             let catalog = RestCatalogBuilder::default()
+                // S3 (and other object stores) via opendal — without a storage
+                // factory the RestCatalog can't issue any data-file IO.
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
