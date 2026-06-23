@@ -6,7 +6,7 @@
 //! write internals are the remaining net-new pieces (`rewrite.rs`); the plan,
 //! manifest-enum, and commit boundaries here are wired and correct.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use futures::TryStreamExt;
@@ -67,9 +67,16 @@ pub async fn current_data_files(table: &Table) -> Result<HashMap<String, DataFil
 }
 
 /// Enumerate the current-snapshot DELETE files (V3 deletion vectors), keyed by
-/// the data file each one references. When a data file is rewritten, its DV is
-/// reabsorbed (removed) in the same RowDelta commit so it doesn't linger
-/// orphaned. Equality deletes (no `referenced_data_file`) are skipped.
+/// **each delete file's own path**. Which deletes to reabsorb is decided from the
+/// scan's per-task binding (`FileScanTask.deletes`, see `compact_table`) — matching
+/// iceberg-go (`CollectSafeDeletionVectors(group.Tasks)`) and iceberg-java
+/// (`RewriteFileGroup.danglingDVs()` = `tasks.flatMap(t -> t.deletes())`); this map
+/// only resolves a bound delete's path back to its full `DataFile` (needed to mark
+/// it removed). Keyed by the delete's OWN path, NOT `referenced_data_file`:
+/// iceberg-rust's `referenced_data_file()` accessor returns None for some
+/// cross-engine (duckdb-written) DVs, so a referenced_data_file map silently misses
+/// them and the rewrite leaves them dangling (the multi-DV corruption). The delete's
+/// own `file_path` is always populated, and it's what the scan task carries.
 pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataFile>> {
     let mut out = HashMap::new();
     let Some(snapshot) = table.metadata().current_snapshot() else {
@@ -90,9 +97,7 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
         for entry in manifest.entries() {
             if entry.is_alive() {
                 let df = entry.data_file().clone();
-                if let Some(referenced) = df.referenced_data_file() {
-                    out.insert(referenced, df);
-                }
+                out.insert(df.file_path().to_string(), df); // key by the delete file's OWN path
             }
         }
     }
@@ -117,16 +122,28 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     let mut all_removed: Vec<DataFile> = Vec::new();
     let mut all_removed_deletes: Vec<DataFile> = Vec::new();
     let mut all_added: Vec<DataFile> = Vec::new();
+    let mut seen_delete_paths: HashSet<String> = HashSet::new();
     for group in &plan.groups {
         let added = read_sort_write(&table, group).await?;
         if added.is_empty() {
             continue; // no live rows to write (e.g. fully-deleted group) — never remove without replacement
         }
         all_removed.extend(group.tasks.iter().filter_map(|t| files.get(&t.data_file_path).cloned()));
-        // Deletion vectors bound to the rewritten data files — reabsorbed in the
-        // same commit so no delete file references the removed data afterward.
-        all_removed_deletes
-            .extend(group.tasks.iter().filter_map(|t| delete_files.get(&t.data_file_path).cloned()));
+        // Delete files (DVs) the SCAN bound to these rewritten data files — now
+        // dangling, so reabsorbed in the same commit. Sourced from `task.deletes`
+        // (the scan's per-file binding, the same the read applies), NOT a
+        // referenced_data_file lookup — matching iceberg-go (CollectSafeDeletionVectors)
+        // and iceberg-java (RewriteFileGroup.danglingDVs). `delete_files` only
+        // resolves each bound delete's path -> its DataFile; dedup by path.
+        for t in &group.tasks {
+            for d in &t.deletes {
+                if seen_delete_paths.insert(d.file_path.clone()) {
+                    if let Some(dv) = delete_files.get(&d.file_path) {
+                        all_removed_deletes.push(dv.clone());
+                    }
+                }
+            }
+        }
         all_added.extend(added);
     }
 

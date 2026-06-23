@@ -261,3 +261,108 @@ async fn multi_group_reabsorbs_all_dvs_no_multi_dv() {
         Operation::Replace,
     );
 }
+
+/// A SURVIVOR file (large/optimal → not a compaction candidate) that carries a DV
+/// must pass through compaction UNTOUCHED — its DV neither dropped nor joined by
+/// others — while smaller files are compacted and their DVs reabsorbed. This is the
+/// shape the prod incident hit (a large survivor whose DV ended up clustered with
+/// others) that `multi_group_reabsorbs_all_dvs_no_multi_dv` (all files compacted,
+/// no survivor) never exercised.
+///
+/// NB on coverage: this reproduces the *structure* but not the prod *trigger*.
+/// Prod's DVs were duckdb-written, where iceberg-rust's `referenced_data_file()`
+/// accessor returns None — so the OLD engine (which keyed delete files by
+/// referenced_data_file) silently missed them and left them dangling. iceberg-rust-
+/// written DVs (here) always populate referenced_data_file, so both the old and the
+/// fixed engine reabsorb them; the duckdb-specific path is only validatable on a real
+/// cluster. The fix (sourcing removed deletes from the scan's `FileScanTask.deletes`,
+/// matching iceberg-go/iceberg-java) is robust regardless. This test guards the
+/// survivor invariant — untouched, no clustering, no orphans — against regressions.
+#[tokio::test]
+async fn survivor_with_dv_untouched_while_others_compacted() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = MemoryCatalogBuilder::default()
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.path().to_str().unwrap().to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    let ns = NamespaceIdent::new("db".to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap();
+    let ident = TableIdent::new(ns.clone(), "t".to_string());
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .format_version(FormatVersion::V3)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    // A large survivor + two small files (distinct id ranges).
+    let survivor = write_one_data_file(&table, "survivor", (0..5000).collect()).await;
+    let small1 = write_one_data_file(&table, "small-1", vec![900001, 900002]).await;
+    let small2 = write_one_data_file(&table, "small-2", vec![900003, 900004]).await;
+    let surv_size = survivor.file_size_in_bytes();
+    let small_size = small1.file_size_in_bytes();
+    assert!(
+        surv_size > small_size,
+        "test setup: survivor must be larger than the small files ({surv_size} vs {small_size})"
+    );
+    let surv_path = survivor.file_path().to_string();
+    let small1_path = small1.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let table = tx
+        .fast_append()
+        .add_data_files(vec![survivor, small1, small2])
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+    let table = add_dv(table, &catalog, &warehouse, surv_path, 0, "dv-surv").await;
+    let table = add_dv(table, &catalog, &warehouse, small1_path, 0, "dv-small1").await;
+    assert_eq!(live_row_count(&table).await, 5002, "5000 + 2 + 2, minus 2 DV'd rows");
+    assert_eq!(delete_file_count(&table).await, 2);
+    assert_eq!(max_dvs_per_file(&table).await, 1);
+
+    // Size-based candidacy: only undersized files (the small ones) are candidates;
+    // the survivor is optimal (>= min) and its lone DV is below delete_file_threshold,
+    // so it is NOT a candidate -> skipped.
+    let cfg = Config {
+        min_file_size_bytes: small_size + 1,
+        max_file_size_bytes: surv_size * 4,
+        target_file_size_bytes: surv_size,
+        min_input_files: 1,
+        delete_file_threshold: 1000,
+        ..Config::default()
+    };
+    compact_table(&catalog, &ident, &cfg).await.unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(live_row_count(&table).await, 5002, "rows preserved");
+    assert_eq!(
+        max_dvs_per_file(&table).await,
+        1,
+        "the survivor's DV must stay alone — no clustering of other DVs onto it"
+    );
+    assert_eq!(
+        delete_file_count(&table).await,
+        1,
+        "small file's DV reabsorbed; the survivor's untouched DV remains"
+    );
+}
