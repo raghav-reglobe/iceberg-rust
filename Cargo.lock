@@ -3924,6 +3924,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-compaction"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "futures",
+ "iceberg",
+ "parquet",
+ "roaring",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
 dependencies = [
@@ -5920,6 +5938,8 @@ dependencies = [
  "arrow",
  "datafusion-ffi",
  "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-compaction",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
  "pyo3",

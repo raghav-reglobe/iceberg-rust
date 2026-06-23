@@ -58,30 +58,14 @@ pub async fn commit_rewrite(
     Ok(new_table)
 }
 
-/// Rewrite one planned group end-to-end.
-///
-/// `removed` = the current-snapshot data files backing `group.tasks`;
-/// `removed_deletes` = their deletion vectors (reabsorbed). `read_sort_write`
-/// produces `added`. Returns the table unchanged if there's nothing to write
-/// (e.g. a fully-deleted group) — **never removes without replacement.**
-pub async fn rewrite_group(
-    table: Table,
-    catalog: &dyn Catalog,
-    group: Group,
-    removed: Vec<DataFile>,
-    removed_deletes: Vec<DataFile>,
-) -> Result<Table> {
-    let added = read_sort_write(&table, &group).await?;
-    if added.is_empty() {
-        return Ok(table); // no live rows to write (e.g. fully-deleted group)
-    }
-    commit_rewrite(&table, catalog, removed, removed_deletes, added).await
-}
-
-/// Read the group's files (DVs applied, #2681), sort by `_valid_from`, write new
+/// Read one group's files (DVs applied, #2681), sort by `_valid_from`, write new
 /// parquet -> the data files to add. Handles both unpartitioned and partitioned
-/// tables (bloom-filter props are the remaining fork edit).
-async fn read_sort_write(table: &Table, group: &Group) -> Result<Vec<DataFile>> {
+/// tables. The caller (engine `compact_table`) accumulates every group's output
+/// and removed files, then commits them all in ONE `RewriteFiles` via
+/// `commit_rewrite` — a single atomic `Replace` snapshot, NOT one commit per group
+/// (per-group commits re-run the manifest carry-forward over each prior snapshot,
+/// which duplicated data files).
+pub(crate) async fn read_sort_write(table: &Table, group: &Group) -> Result<Vec<DataFile>> {
     let batches = read_group(table, group.tasks.clone()).await?.try_collect().await?;
     let sorted = crate::sort::sort_by_valid_from(batches)?;
     write_data_files(table, sorted).await
@@ -102,7 +86,16 @@ async fn write_data_files(table: &Table, batches: Vec<RecordBatch>) -> Result<Ve
         ParquetWriterBuilder::new(bloom_writer_properties(table), schema.clone()),
         table.file_io().clone(),
         DefaultLocationGenerator::new(table.metadata())?,
-        DefaultFileNameGenerator::new("compact".to_string(), None, DataFileFormat::Parquet),
+        // Unique per write: DefaultFileNameGenerator's counter resets with each new
+        // instance, and write_data_files is called once per group. A constant prefix
+        // would name every group's output `compact-00000.parquet` — multi-group
+        // compaction overwriting its own files (corrupt/duplicated data). The
+        // per-write UUID keeps each group's output path distinct.
+        DefaultFileNameGenerator::new(
+            format!("compact-{}", uuid::Uuid::now_v7()),
+            None,
+            DataFileFormat::Parquet,
+        ),
     );
     let data_file_builder = DataFileWriterBuilder::new(rolling);
     let spec = table.metadata().default_partition_spec();
@@ -129,7 +122,7 @@ async fn write_data_files(table: &Table, batches: Vec<RecordBatch>) -> Result<Ve
 
 /// Build `WriterProperties` honoring the table's `write.parquet.bloom-filter-*`
 /// TBLPROPERTIES — enable a per-column bloom (with fpp) on each marked column,
-/// matching what the Spark compaction-app writes. parquet-rs sizes blooms by
+/// matching the per-column blooms parquet-mr writes. parquet-rs sizes blooms by
 /// NDV/fpp; the parquet-mr adaptive-sizing flag
 /// (`write.parquet.bloom-filter-adaptive-enabled`) has no rust equivalent and is
 /// ignored.

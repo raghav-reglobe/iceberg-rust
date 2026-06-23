@@ -17,7 +17,7 @@ use iceberg::{Catalog, TableIdent};
 
 use crate::config::Config;
 use crate::planner::{plan_compaction, Plan};
-use crate::rewrite::rewrite_group;
+use crate::rewrite::{commit_rewrite, read_sort_write};
 
 /// Scan a table's current data files and bin-pack the candidates into a `Plan`.
 pub async fn plan_table(table: &Table, cfg: &Config) -> Result<Plan> {
@@ -100,31 +100,39 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
 }
 
 /// Compact one table end-to-end: load -> enumerate current data + delete files
-/// -> plan -> rewrite each group (swap data files + reabsorb their DVs).
+/// -> plan -> read+sort+write each group, then swap them all in via ONE commit.
 ///
-/// Each `rewrite_group` commits (RowDelta) and returns the new table snapshot,
-/// which threads into the next group's rewrite so later groups operate on the
-/// already-committed state. (Groups are disjoint by file, so the once-built
-/// maps stay valid for per-group lookups.)
+/// Each group is read/sorted/written independently (bounded memory), but every
+/// group's new files + the old files they replace + the DVs they reabsorb are
+/// **accumulated and committed in a single `RewriteFiles`** (one atomic `Replace`
+/// snapshot). Committing per group instead re-ran the manifest carry-forward over
+/// each prior snapshot, which duplicated data files. All reads are against the
+/// loaded snapshot, so the once-built `files`/`delete_files` maps stay valid.
 pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Config) -> Result<()> {
-    let mut table = catalog.load_table(ident).await?;
+    let table = catalog.load_table(ident).await?;
     let files = current_data_files(&table).await?;
     let delete_files = current_delete_files(&table).await?;
     let plan = plan_table(&table, cfg).await?;
-    for group in plan.groups {
-        let removed: Vec<DataFile> = group
-            .tasks
-            .iter()
-            .filter_map(|t| files.get(&t.data_file_path).cloned())
-            .collect();
+
+    let mut all_removed: Vec<DataFile> = Vec::new();
+    let mut all_removed_deletes: Vec<DataFile> = Vec::new();
+    let mut all_added: Vec<DataFile> = Vec::new();
+    for group in &plan.groups {
+        let added = read_sort_write(&table, group).await?;
+        if added.is_empty() {
+            continue; // no live rows to write (e.g. fully-deleted group) — never remove without replacement
+        }
+        all_removed.extend(group.tasks.iter().filter_map(|t| files.get(&t.data_file_path).cloned()));
         // Deletion vectors bound to the rewritten data files — reabsorbed in the
         // same commit so no delete file references the removed data afterward.
-        let removed_deletes: Vec<DataFile> = group
-            .tasks
-            .iter()
-            .filter_map(|t| delete_files.get(&t.data_file_path).cloned())
-            .collect();
-        table = rewrite_group(table, catalog, group, removed, removed_deletes).await?;
+        all_removed_deletes
+            .extend(group.tasks.iter().filter_map(|t| delete_files.get(&t.data_file_path).cloned()));
+        all_added.extend(added);
     }
+
+    if all_added.is_empty() {
+        return Ok(()); // nothing to compact
+    }
+    commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
     Ok(())
 }

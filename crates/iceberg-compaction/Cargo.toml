@@ -38,6 +38,7 @@ arrow-select = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 roaring = { workspace = true }
