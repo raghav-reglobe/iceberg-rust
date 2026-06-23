@@ -153,3 +153,113 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
     Ok(())
 }
+
+/// Read-only diagnostic of where `removed_deletes` would come from — for pinning
+/// the real-table `rdel=NULL` failure WITHOUT writing files or committing. Does NOT
+/// call `read_sort_write` (which would write orphan parquet) and never commits; only
+/// the same read-side manifest walks + scan plan as `compact_table`. Safe against a
+/// production table.
+#[derive(Debug)]
+pub struct DryRunReport {
+    /// current-snapshot DATA files (manifest walk)
+    pub data_files: usize,
+    /// current-snapshot DELETE files (DVs) found by the manifest walk, keyed by path
+    pub delete_files: usize,
+    /// a few DV paths from the delete-manifest walk
+    pub sample_dv_paths: Vec<String>,
+    /// those DVs' `referenced_data_file()` accessor result (Some/None) — tests whether
+    /// the old referenced_data_file-keyed map would even have found them
+    pub sample_dv_referenced: Vec<Option<String>>,
+    /// planned compaction groups
+    pub groups: usize,
+    /// candidate data files across all groups (= scan tasks the plan would rewrite)
+    pub candidate_tasks: usize,
+    /// of those tasks, how many carry ≥1 scan-bound delete (`FileScanTask.deletes`)
+    pub tasks_with_bound_deletes: usize,
+    /// total scan-bound deletes across the plan's tasks (0 ⇒ the SCAN binds no DVs)
+    pub total_bound_deletes: usize,
+    /// bound deletes that resolve to a DataFile in the delete-manifest map
+    /// (= what `compact_table` would actually reabsorb; 0 ⇒ `rdel=NULL` reproduced)
+    pub removed_deletes_resolved: usize,
+    /// sample of bound-delete paths NOT found in the manifest map (resolution mismatch)
+    pub sample_unresolved_bound_paths: Vec<String>,
+    /// per-group read result: tasks, DV-bound tasks, and rows that READ (DVs applied).
+    /// A DV-bearing group reading 0 rows would be SKIPPED by `compact_table`
+    /// (`added.is_empty()` → continue), so its DVs never reach the commit — the
+    /// `rdel=NULL` path (A). Rows>0 ⇒ not skipped ⇒ the 34 reach the commit (B).
+    pub group_reads: Vec<String>,
+}
+
+/// See [`DryRunReport`]. Loads the table, walks current data/delete manifests, plans
+/// the compaction, and computes what `removed_deletes` would be — no writes, no commit.
+pub async fn dry_run_inspect(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    cfg: &Config,
+) -> Result<DryRunReport> {
+    let table = catalog.load_table(ident).await?;
+    let files = current_data_files(&table).await?;
+    let delete_files = current_delete_files(&table).await?;
+    let plan = plan_table(&table, cfg).await?;
+
+    let sample_dv_paths: Vec<String> = delete_files.keys().take(5).cloned().collect();
+    let sample_dv_referenced: Vec<Option<String>> = sample_dv_paths
+        .iter()
+        .filter_map(|p| delete_files.get(p))
+        .map(|df| df.referenced_data_file().map(|s| s.to_string()))
+        .collect();
+
+    let mut candidate_tasks = 0usize;
+    let mut tasks_with_bound_deletes = 0usize;
+    let mut total_bound_deletes = 0usize;
+    let mut removed_deletes_resolved = 0usize;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut sample_unresolved: Vec<String> = Vec::new();
+    for group in &plan.groups {
+        for t in &group.tasks {
+            candidate_tasks += 1;
+            if !t.deletes.is_empty() {
+                tasks_with_bound_deletes += 1;
+            }
+            for d in &t.deletes {
+                total_bound_deletes += 1;
+                if seen.insert(d.file_path.clone()) {
+                    if delete_files.contains_key(&d.file_path) {
+                        removed_deletes_resolved += 1;
+                    } else if sample_unresolved.len() < 5 {
+                        sample_unresolved.push(d.file_path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Per-group READ (DVs applied) — does a DV-bearing group read empty (→ skipped)?
+    let mut group_reads: Vec<String> = Vec::new();
+    for (i, group) in plan.groups.iter().enumerate() {
+        let tasks = group.tasks.len();
+        let dv_tasks = group.tasks.iter().filter(|t| !t.deletes.is_empty()).count();
+        let rows = match crate::rewrite::read_group(&table, group.tasks.clone()).await {
+            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                Ok(batches) => batches.iter().map(|b| b.num_rows()).sum::<usize>().to_string(),
+                Err(e) => format!("READ_ERR({e})"),
+            },
+            Err(e) => format!("PLAN_ERR({e})"),
+        };
+        group_reads.push(format!("group{i}: tasks={tasks} dv_tasks={dv_tasks} rows_read={rows}"));
+    }
+
+    Ok(DryRunReport {
+        data_files: files.len(),
+        delete_files: delete_files.len(),
+        sample_dv_paths,
+        sample_dv_referenced,
+        groups: plan.groups.len(),
+        candidate_tasks,
+        tasks_with_bound_deletes,
+        total_bound_deletes,
+        removed_deletes_resolved,
+        sample_unresolved_bound_paths: sample_unresolved,
+        group_reads,
+    })
+}

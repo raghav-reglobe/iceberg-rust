@@ -149,7 +149,7 @@ fn bloom_writer_properties(table: &Table) -> WriterProperties {
 
 /// Scan a group's data files into Arrow record batches (deletes/DVs applied,
 /// #2681) via iceberg-rust's `ArrowReader`.
-async fn read_group(table: &Table, tasks: Vec<FileScanTask>) -> Result<ArrowRecordBatchStream> {
+pub(crate) async fn read_group(table: &Table, tasks: Vec<FileScanTask>) -> Result<ArrowRecordBatchStream> {
     let reader =
         ArrowReaderBuilder::new(table.file_io().clone(), table.runtime().clone()).build();
     let task_stream: FileScanTaskStream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();

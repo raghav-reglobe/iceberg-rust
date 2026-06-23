@@ -346,10 +346,20 @@ impl<'a> SnapshotProducer<'a> {
             let mut writer = self.new_manifest_writer(manifest_file.content)?;
             for entry in manifest.entries() {
                 if deleted_paths.contains(entry.data_file().file_path()) {
+                    // Removed by this operation → DELETED.
                     writer.add_delete_entry((**entry).clone())?;
-                } else {
+                } else if entry.is_alive() {
+                    // Surviving live file → EXISTING.
                     writer.add_existing_entry((**entry).clone())?;
                 }
+                // else: an already-DELETED (status=2) entry not removed by this
+                // operation — DROP it. Carrying it forward as EXISTING would
+                // RESURRECT a superseded file. For deletion vectors this is
+                // catastrophic: a data file accumulates one DELETED DV entry per
+                // prior merge (real tables: dozens per file), so resurrecting them
+                // yields many "live" DVs for one data file -> the reader trips with
+                // "Can't index multiple DVs". The deletion stays recorded in its
+                // originating snapshot's manifest; it does not belong in this one.
             }
             result.push(writer.write_manifest_file().await?);
         }
