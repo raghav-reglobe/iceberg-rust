@@ -1,6 +1,6 @@
-//! Sort compaction inputs by `_valid_from` — the platform's universal sort key
-//! for Silver/Gold/Platinum (gives Doris file-skipping on time filters). Tables
-//! without the column (e.g. Bronze) are coalesced unsorted.
+//! Sort compaction inputs by `_valid_from` — a common universal sort key that
+//! gives query engines file-skipping on time filters. Tables without the column
+//! are coalesced unsorted.
 
 use anyhow::Result;
 use arrow_array::RecordBatch;
@@ -9,7 +9,7 @@ use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 
 /// Concatenate `batches` and sort the result by `_valid_from` ascending.
-/// If the column is absent (e.g. Bronze), returns the coalesced batch unsorted.
+/// If the column is absent, returns the coalesced batch unsorted.
 /// Returns a single combined batch (the rewrite writes one sorted run per group).
 pub(crate) fn sort_by_valid_from(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     if batches.is_empty() {

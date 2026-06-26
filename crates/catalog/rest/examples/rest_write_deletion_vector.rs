@@ -17,28 +17,24 @@
 
 //! Real-data, cross-engine validation of V3 deletion-vector writes.
 //!
-//! Writes a `deletion-vector-v1` to a REAL Iceberg table via a REST catalog
-//! (Polaris), so an INDEPENDENT engine (Doris / Spark / DuckDB) can read the
-//! table back and confirm the deletes were applied. This is the gate before
-//! opening the upstream RowDelta MoR DV-write PR (#2203).
+//! Writes a `deletion-vector-v1` to a real Iceberg table via a REST catalog,
+//! so an independent engine (e.g. Spark, Trino, DuckDB) can read the table back
+//! and confirm the deletes were applied.
 //!
 //! Prereqs: a clean V3 table with one data file and NO pre-existing deletion
-//! vector (create it via Doris/Spark/DuckDB first), and a port-forward to
-//! Polaris. Run from a host with S3 access for the warehouse bucket.
+//! vector, reachable through a REST catalog, run from a host with object-store
+//! access for the warehouse. Configure via env vars:
 //!
 //! ```bash
-//! kubectl port-forward svc/polaris -n pulse-data 8181:8181 &
 //! POLARIS_URI=http://localhost:8181/api/catalog \
-//! POLARIS_CREDENTIAL="$(kubectl get secret -n pulse-compute polaris-svc-spark \
-//!     -o jsonpath='{.data.client-id}' | base64 -d):$(kubectl get secret -n \
-//!     pulse-compute polaris-svc-spark -o jsonpath='{.data.client-secret}' | base64 -d)" \
-//! POLARIS_WAREHOUSE=bronze_dbnew \
-//! DV_NAMESPACE=zz_compactbench DV_TABLE=zz_rust_dv_test DV_DELETE_COUNT=3 \
-//!   cargo run -p iceberg-catalog-rest --example pulse_dv_realdata
+//! POLARIS_CREDENTIAL="<client-id>:<client-secret>" \
+//! POLARIS_WAREHOUSE=<warehouse> \
+//! DV_NAMESPACE=<namespace> DV_TABLE=<table> DV_DELETE_COUNT=3 \
+//!   cargo run -p iceberg-catalog-rest --example rest_write_deletion_vector
 //! ```
 //!
-//! Then verify in Doris: `SELECT COUNT(*) FROM bronze_dbnew.zz_compactbench.zz_rust_dv_test;`
-//! should drop by `DV_DELETE_COUNT`.
+//! Then verify with an independent engine that `SELECT COUNT(*)` on the table
+//! dropped by `DV_DELETE_COUNT`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,9 +51,9 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uri = std::env::var("POLARIS_URI")?;
     let credential = std::env::var("POLARIS_CREDENTIAL")?;
-    let warehouse = std::env::var("POLARIS_WAREHOUSE").unwrap_or_else(|_| "bronze_dbnew".into());
-    let namespace = std::env::var("DV_NAMESPACE").unwrap_or_else(|_| "zz_compactbench".into());
-    let table_name = std::env::var("DV_TABLE").unwrap_or_else(|_| "zz_rust_dv_test".into());
+    let warehouse = std::env::var("POLARIS_WAREHOUSE").unwrap_or_else(|_| "warehouse".into());
+    let namespace = std::env::var("DV_NAMESPACE").unwrap_or_else(|_| "default".into());
+    let table_name = std::env::var("DV_TABLE").unwrap_or_else(|_| "dv_test".into());
     let delete_count: u64 = std::env::var("DV_DELETE_COUNT")
         .unwrap_or_else(|_| "3".into())
         .parse()?;

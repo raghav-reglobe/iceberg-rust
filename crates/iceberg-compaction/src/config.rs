@@ -6,8 +6,7 @@ use anyhow::{bail, Result};
 /// Tunables for a compaction pass.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Desired output file size. Pulse: 128 MB (matches the Spark worker +
-    /// `compaction_app_settings.target_file_size_mb`).
+    /// Desired output file size. Default 128 MB.
     pub target_file_size_bytes: u64,
     /// Files smaller than this are compaction candidates (combine). ~75% of target.
     pub min_file_size_bytes: u64,
@@ -16,7 +15,7 @@ pub struct Config {
     pub max_file_size_bytes: u64,
     /// Minimum candidate files in a (partition) bin to justify a rewrite.
     /// iceberg-go `DefaultMinInputFiles` = 5. Set to 1 for aggressive DV reabsorb
-    /// (our Silver/Gold want every delete-bearing file reabsorbed).
+    /// (when every delete-bearing file should be rewritten).
     pub min_input_files: usize,
     /// A data file with at least this many delete files is a candidate
     /// regardless of size (delete-pressure). iceberg-go default: 5.
