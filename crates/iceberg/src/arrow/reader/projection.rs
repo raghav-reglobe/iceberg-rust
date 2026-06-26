@@ -125,7 +125,6 @@ impl ArrowReader {
     ) -> Result<()> {
         // Once we are inside a variant, stay inside; otherwise check
         // whether this Arrow field IS a variant column.
-        let entering_variant = variant_parent.is_none();
         let effective_variant = variant_parent.or_else(|| {
             let fid = field
                 .metadata()
@@ -138,21 +137,12 @@ impl ArrowReader {
             matches!(iceberg_field.field_type.as_ref(), Type::Variant(_)).then_some(fid)
         });
 
-        // Reject shredded variants: a `typed_value` sub-field means the payload is
-        // shredded, which we can't reconstruct yet. Projecting only metadata/value
-        // would silently drop it, so fail loudly instead.
-        if entering_variant
-            && effective_variant.is_some()
-            && let DataType::Struct(sub) = field.data_type()
-            && sub.iter().any(|f| f.name() == "typed_value")
-        {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Reading shredded variant columns is not supported yet: found a \
-                 `typed_value` sub-field. Only unshredded variants (metadata + value) \
-                 can be read.",
-            ));
-        }
+        // Shredded variants (a `typed_value` sub-field) ARE supported: we project
+        // the full {metadata, value, typed_value} subtree here, then the read
+        // pipeline folds typed_value back into value via `unshred_variant` (see
+        // `pipeline.rs` / `record_batch_transformer.rs`). Recursing through the
+        // struct below maps every variant leaf (incl. nested typed_value leaves)
+        // to the variant field id so the parquet reader projects the whole column.
 
         match field.data_type() {
             DataType::Struct(sub) => {
@@ -798,9 +788,11 @@ message schema {
         );
     }
 
-    /// A shredded variant (with `typed_value`) must be rejected, not silently dropped.
+    /// A shredded variant (with `typed_value`) must project its FULL subtree
+    /// (`metadata` + `value` + `typed_value`), so the read pipeline can fold
+    /// `typed_value` back into `value` via `unshred_variant`.
     #[test]
-    fn test_arrow_projection_mask_variant_shredded_is_rejected() {
+    fn test_arrow_projection_mask_variant_shredded_projects_full_subtree() {
         // Iceberg schema: c1 (String, id=1) + v (Variant, id=2)
         let schema = Arc::new(
             Schema::builder()
@@ -848,19 +840,23 @@ message schema {
         let parquet_type = parse_message_type(message_type).expect("should parse schema");
         let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
 
-        let err = ArrowReader::get_arrow_projection_mask(
+        let mask = ArrowReader::get_arrow_projection_mask(
             &[1, 2],
             &schema,
             &parquet_schema,
             &arrow_schema,
             false,
         )
-        .expect_err("shredded variant must be rejected");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.message().contains("shredded variant"),
-            "unexpected error message: {err}"
-        );
+        .expect("shredded variant must project, not be rejected");
+        // All 4 leaves selected: c1 + the variant's metadata/value/typed_value.
+        let leaf_count = parquet_schema.num_columns();
+        assert_eq!(leaf_count, 4);
+        for leaf in 0..leaf_count {
+            assert!(
+                mask.leaf_included(leaf),
+                "leaf {leaf} should be projected for a shredded variant"
+            );
+        }
     }
 
     /// variant nested inside a struct must also have its sub-leaves
