@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Fields};
 use futures::TryStreamExt;
 use iceberg::arrow::{merge_variant_schemas, schema_of_variant};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
@@ -157,8 +157,33 @@ fn ddl_type(dt: &DataType) -> String {
         DataType::Time64(_) => "TIME".to_string(),
         DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
         DataType::Binary | DataType::FixedSizeBinary(_) => "BLOB".to_string(),
+        // A single-field struct may be a MongoDB ExtendedJSON wrapper
+        // ({"$oid": ...}, {"$date": ...}, ...) — a SCALAR, not a nested
+        // document — in which case unwrap it to the scalar DDL.
+        DataType::Struct(fields) => {
+            extended_json_scalar(fields).unwrap_or_else(|| "JSON".to_string())
+        }
         // Nested types + the Null sentinel + anything else: keep in-doc.
         _ => "JSON".to_string(),
+    }
+}
+
+/// MongoDB ExtendedJSON represents scalars as single-field wrapper objects
+/// (`{"$oid": "..."}`, `{"$date": ...}`, `{"$numberLong": "..."}`, ...). These
+/// are SCALARS, not nested documents, so map them to the unwrapped scalar DDL
+/// (mirrors the merge worker's `mongo_parse._infer_itype`) — otherwise a date /
+/// oid / number field is misclassified as nested `JSON` and never flattened to a
+/// typed column. Returns `None` for a genuine multi-field nested struct.
+fn extended_json_scalar(fields: &Fields) -> Option<String> {
+    if fields.len() != 1 {
+        return None;
+    }
+    match fields[0].name().as_str() {
+        "$oid" => Some("VARCHAR".to_string()),
+        "$date" => Some("TIMESTAMP".to_string()),
+        "$numberLong" | "$numberInt" => Some("BIGINT".to_string()),
+        "$numberDecimal" | "$numberDouble" => Some("DOUBLE".to_string()),
+        _ => None,
     }
 }
 
