@@ -36,6 +36,29 @@ use crate::error::Result;
 use crate::spec::datatypes::{PrimitiveType, Type};
 use crate::{Error, ErrorKind};
 
+/// An owned Variant value: the Iceberg V3 variant physical encoding split
+/// into its `metadata` (object-key dictionary) and `value` byte buffers.
+///
+/// This mirrors iceberg-go's `VariantLiteral` (a thin wrapper over arrow-go's
+/// `parquet/variant.Value`): we store the raw bytes rather than depending on
+/// the Rust `parquet` crate's `variant` module, which is **experimental**
+/// (gated behind the `variant_experimental` feature) and lifetime-borrowed
+/// (`Variant<'m, 'v>`), so it cannot be owned inside `Literal` today.
+///
+/// Variant values are not orderable; `Literal` derives only `Eq`/`Hash`
+/// (byte-wise), never `Ord`.
+///
+/// Future direction: once parquet's `variant_experimental` API stabilizes,
+/// this can migrate to wrap the native `parquet::variant::Variant`. Tracked
+/// upstream in apache/iceberg-rust#2581 (v3 spec types) under EPIC #2411.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VariantVal {
+    /// Variant metadata buffer (the object-key dictionary).
+    pub metadata: Vec<u8>,
+    /// Variant value buffer.
+    pub value: Vec<u8>,
+}
+
 /// Values present in iceberg type
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Literal {
@@ -53,6 +76,9 @@ pub enum Literal {
     /// Both the key field and value field each have an integer id that is unique in the table schema.
     /// Map keys are required and map values can be either optional or required. Both map keys and map values may be any type, including nested types.
     Map(Map),
+    /// A variant value, stored as the Iceberg V3 variant physical encoding
+    /// split into its `metadata` and `value` byte buffers (see [`VariantVal`]).
+    Variant(VariantVal),
 }
 
 impl Literal {

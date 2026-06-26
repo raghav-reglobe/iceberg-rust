@@ -375,6 +375,12 @@ pub(crate) mod _serde {
                         ));
                     }
                 }
+                Literal::Variant(_) => {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        "Variant literals have no single-value/JSON serialized form (RawLiteral)",
+                    ));
+                }
             };
             Ok(raw)
         }

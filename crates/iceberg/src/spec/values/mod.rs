@@ -32,7 +32,7 @@ mod tests;
 // Re-export all public types
 pub use datum::Datum;
 pub use decimal_utils::Decimal;
-pub use literal::Literal;
+pub use literal::{Literal, VariantVal};
 pub use map::Map;
 pub use primitive::PrimitiveLiteral;
 pub(crate) use serde::_serde::RawLiteral;

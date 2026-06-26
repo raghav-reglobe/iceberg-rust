@@ -30,8 +30,8 @@ use uuid::Uuid;
 use super::get_field_id_from_metadata;
 use crate::spec::{
     ListType, Literal, Map, MapType, NestedField, PartnerAccessor, PrimitiveLiteral, PrimitiveType,
-    SchemaWithPartnerVisitor, Struct, StructType, Type, VariantType, visit_struct_with_partner,
-    visit_type_with_partner,
+    SchemaWithPartnerVisitor, Struct, StructType, Type, VariantType, VariantVal,
+    visit_struct_with_partner, visit_type_with_partner,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -427,11 +427,51 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
         }
     }
 
-    fn variant(&mut self, _v: &VariantType, _partner: &ArrayRef) -> Result<Vec<Option<Literal>>> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Converting variant Arrow array to Iceberg literal is not supported yet",
-        ))
+    fn variant(&mut self, _v: &VariantType, partner: &ArrayRef) -> Result<Vec<Option<Literal>>> {
+        // Variant is stored as a struct of two required binary fields
+        // {metadata, value} (see `arrow::schema` variant mapping). Shredded
+        // variants are rejected at read time, so these buffers carry the full
+        // V3 variant physical encoding.
+        let struct_array = partner
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "The partner of a variant field is not a struct array",
+                )
+            })?;
+        let metadata = struct_array
+            .column_by_name("metadata")
+            .and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "variant struct is missing the required binary `metadata` field",
+                )
+            })?;
+        let value = struct_array
+            .column_by_name("value")
+            .and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "variant struct is missing the required binary `value` field",
+                )
+            })?;
+
+        let mut result = Vec::with_capacity(struct_array.len());
+        for i in 0..struct_array.len() {
+            if struct_array.is_null(i) {
+                result.push(None);
+            } else {
+                result.push(Some(Literal::Variant(VariantVal {
+                    metadata: metadata.value(i).to_vec(),
+                    value: value.value(i).to_vec(),
+                })));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1329,9 +1369,10 @@ mod test {
     }
 
     #[test]
-    fn test_arrow_variant_to_literal_is_unsupported() {
-        // Converting a variant Arrow array back to an Iceberg literal is not implemented;
-        // the visitor must reject it rather than silently decode it incorrectly.
+    fn test_arrow_variant_to_literal_roundtrips() {
+        // A variant Arrow column is a struct of two required binary fields
+        // {metadata, value}; the visitor decodes each row into a
+        // Literal::Variant carrying the raw V3 variant bytes.
         let variant_child = Arc::new(StructArray::from(vec![
             (
                 Arc::new(Field::new("metadata", DataType::Binary, false)),
@@ -1356,13 +1397,13 @@ mod test {
             NestedField::required(1, "v", Type::Variant(VariantType)).into(),
         ]);
 
-        let err = arrow_struct_to_literal(&struct_array, &ty).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string()
-                .contains("Converting variant Arrow array to Iceberg literal is not supported yet"),
-            "{err}"
-        );
+        let result = arrow_struct_to_literal(&struct_array, &ty).unwrap();
+        assert_eq!(result, vec![Some(Literal::Struct(Struct::from_iter(vec![
+            Some(Literal::Variant(VariantVal {
+                metadata: b"m".to_vec(),
+                value: b"v".to_vec(),
+            })),
+        ])))]);
     }
 
     #[test]
