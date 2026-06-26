@@ -25,6 +25,7 @@ mod error;
 mod manifest;
 mod runtime;
 mod transform;
+mod variant_schema;
 
 #[pymodule]
 fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -33,5 +34,6 @@ fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     manifest::register_module(py, m)?;
     compaction::register_module(py, m)?;
     catalog::register_module(py, m)?;
+    variant_schema::register_module(py, m)?;
     Ok(())
 }

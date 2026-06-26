@@ -34,10 +34,13 @@ pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
 mod scan_metrics;
 mod value;
+/// Infer + merge Arrow schemas from Variant values (Spark `SchemaOfVariant` port)
+pub mod variant_schema;
 
 pub use reader::*;
 pub use scan_metrics::{ScanMetrics, ScanResult};
 pub use value::*;
+pub use variant_schema::{merge_variant_schemas, schema_of_variant};
 /// Partition value calculator for computing partition values
 pub mod partition_value_calculator;
 pub use partition_value_calculator::*;

@@ -35,12 +35,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow = { workspace = true, features = ["pyarrow"] }
+arrow-schema = { workspace = true }
 datafusion-ffi = { workspace = true }
+futures = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-compaction = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-all"] }
+parquet = { workspace = true, features = ["variant_experimental"] }
 pyo3 = { workspace = true, features = ["abi3-py310"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }
