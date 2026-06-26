@@ -42,6 +42,7 @@ iceberg-compaction = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-all"] }
 pyo3 = { workspace = true, features = ["abi3-py310"] }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [package.metadata.cargo-machete]

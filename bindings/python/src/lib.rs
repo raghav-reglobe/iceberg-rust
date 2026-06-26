@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 
+mod catalog;
 mod compaction;
 mod data_file;
 mod datafusion_table_provider;
@@ -31,5 +32,6 @@ fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     transform::register_module(py, m)?;
     manifest::register_module(py, m)?;
     compaction::register_module(py, m)?;
+    catalog::register_module(py, m)?;
     Ok(())
 }
