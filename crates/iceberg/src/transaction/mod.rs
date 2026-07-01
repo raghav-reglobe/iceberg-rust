@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod rewrite_files;
+mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -78,6 +79,7 @@ use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
+use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -170,6 +172,14 @@ impl Transaction {
     /// vectors) in a single `Replace` snapshot.
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new()
+    }
+
+    /// Creates a rewrite-manifests action: consolidate the current snapshot's
+    /// data manifests into fewer, target-sized manifests without changing any
+    /// data (`Replace` snapshot). Alive entries keep their original lineage;
+    /// already-DELETED entries are dropped, never resurrected.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
