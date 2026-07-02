@@ -256,7 +256,6 @@ impl TransactionAction for RewriteManifestsAction {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            None,
             snapshot_properties,
             vec![],
         );

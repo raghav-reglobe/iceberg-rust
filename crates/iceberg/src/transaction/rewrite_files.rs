@@ -121,7 +121,6 @@ impl TransactionAction for RewriteFilesAction {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            None,
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
         );
