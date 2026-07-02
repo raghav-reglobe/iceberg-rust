@@ -503,10 +503,15 @@ mod tests {
         let table_metadata = fixture.table.metadata_ref();
 
         // A manifest written WITHOUT `schema-id` / `partition-spec-id` keys
-        // (some writers omit them). Its self-described schema — a single long
-        // column that does NOT match the table's schemas — must win: assuming
-        // the default id 0 and looking that up in the table metadata would
-        // mistype this manifest's column bounds.
+        // (some writers omit them): the recorded-id LOOKUP must not fire (a
+        // defaulted id 0 would mistype column bounds after a type promotion).
+        //
+        // FORK semantics diverge from the upstream PR here: with table
+        // metadata available the fork resolves against the CURRENT schema
+        // (the authoritative superset — platform schema evolution is add-only
+        // and partition-spec sources must resolve; see parse_with's fallback
+        // comment), while the pure self-describing path applies only without
+        // table metadata.
         let mut meta: HashMap<String, Vec<u8>> = HashMap::new();
         meta.insert("format-version".to_string(), b"2".to_vec());
         meta.insert("content".to_string(), b"data".to_vec());
@@ -517,17 +522,22 @@ mod tests {
         );
         meta.insert("partition-spec".to_string(), b"[]".to_vec());
 
+        // With table metadata: current schema wins (NOT a defaulted-id lookup,
+        // NOT the embedded schema).
         let parsed = ManifestMetadata::parse_with(&meta, Some(&table_metadata)).unwrap();
+        assert_eq!(
+            parsed.schema.as_ref().as_struct(),
+            table_metadata.current_schema().as_struct(),
+            "fork fallback resolves against the current schema"
+        );
+
+        // Without table metadata: the manifest self-describes.
+        let parsed = ManifestMetadata::parse_with(&meta, None).unwrap();
         let field = parsed.schema.field_by_id(1).unwrap();
         assert_eq!(field.name, "foo");
         assert_eq!(
             *field.field_type,
             Type::Primitive(crate::spec::PrimitiveType::Long)
-        );
-        assert_ne!(
-            parsed.schema.as_ref().as_struct(),
-            table_metadata.current_schema().as_struct(),
-            "must not silently adopt a table schema the manifest never referenced"
         );
     }
 }

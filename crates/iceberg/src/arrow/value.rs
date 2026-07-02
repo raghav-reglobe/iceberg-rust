@@ -1398,12 +1398,12 @@ mod test {
         ]);
 
         let result = arrow_struct_to_literal(&struct_array, &ty).unwrap();
-        assert_eq!(result, vec![Some(Literal::Struct(Struct::from_iter(vec![
-            Some(Literal::Variant(VariantVal {
+        assert_eq!(result, vec![Some(Literal::Struct(Struct::from_iter(
+            vec![Some(Literal::Variant(VariantVal {
                 metadata: b"m".to_vec(),
                 value: b"v".to_vec(),
-            })),
-        ])))]);
+            })),]
+        )))]);
     }
 
     #[test]

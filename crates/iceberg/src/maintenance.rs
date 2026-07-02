@@ -26,8 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use futures::StreamExt;
-use futures::stream;
+use futures::{StreamExt, stream};
 
 use crate::io::ListEntry;
 use crate::table::Table;
@@ -310,7 +309,11 @@ impl RemoveOrphanFilesAction {
         ));
 
         // Statistics + partition statistics (Puffin).
-        referenced.extend(metadata.statistics_iter().map(|s| s.statistics_path.clone()));
+        referenced.extend(
+            metadata
+                .statistics_iter()
+                .map(|s| s.statistics_path.clone()),
+        );
         referenced.extend(
             metadata
                 .partition_statistics_iter()
@@ -362,7 +365,10 @@ fn normalize_uri(
     let Some((scheme, rest)) = path.split_once("://") else {
         return path.to_string();
     };
-    let scheme = equal_schemes.get(scheme).map(String::as_str).unwrap_or(scheme);
+    let scheme = equal_schemes
+        .get(scheme)
+        .map(String::as_str)
+        .unwrap_or(scheme);
     let (authority, tail) = match rest.split_once('/') {
         Some((a, t)) => (a, Some(t)),
         None => (rest, None),

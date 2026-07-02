@@ -250,7 +250,10 @@ impl TransactionAction for RewriteManifestsAction {
             candidates.len().to_string(),
         );
         snapshot_properties.insert(KEPT_MANIFESTS_COUNT.to_string(), kept.len().to_string());
-        snapshot_properties.insert(CREATED_MANIFESTS_COUNT.to_string(), chunks.len().to_string());
+        snapshot_properties.insert(
+            CREATED_MANIFESTS_COUNT.to_string(),
+            chunks.len().to_string(),
+        );
         snapshot_properties.insert(PROCESSED_ENTRY_COUNT.to_string(), total_entries.to_string());
 
         let snapshot_producer = SnapshotProducer::new(
@@ -438,7 +441,11 @@ mod tests {
             .load()
             .await
             .unwrap();
-        assert_eq!(list_s2.entries().len(), 2, "expected 2 manifests before rewrite");
+        assert_eq!(
+            list_s2.entries().len(),
+            2,
+            "expected 2 manifests before rewrite"
+        );
 
         // S3: rewrite manifests.
         let mut c3 = Arc::new(Transaction::new(&table_s2).rewrite_manifests())
@@ -454,8 +461,14 @@ mod tests {
 
         assert_eq!(snap3.summary().operation, Operation::Replace);
         let props = &snap3.summary().additional_properties;
-        assert_eq!(props.get("manifests-replaced").map(String::as_str), Some("2"));
-        assert_eq!(props.get("manifests-created").map(String::as_str), Some("1"));
+        assert_eq!(
+            props.get("manifests-replaced").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            props.get("manifests-created").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(props.get("manifests-kept").map(String::as_str), Some("0"));
 
         let list_s3 = table_s2
@@ -463,7 +476,11 @@ mod tests {
             .load()
             .await
             .unwrap();
-        assert_eq!(list_s3.entries().len(), 1, "expected 1 consolidated manifest");
+        assert_eq!(
+            list_s3.entries().len(),
+            1,
+            "expected 1 consolidated manifest"
+        );
         let manifest = list_s3.entries()[0]
             .load_manifest(table_s2.file_io())
             .await
@@ -473,11 +490,19 @@ mod tests {
             assert_eq!(entry.status(), ManifestStatus::Existing);
             match entry.file_path() {
                 "test/a.parquet" => {
-                    assert_eq!(entry.snapshot_id(), Some(snap1_id), "file-a keeps S1 lineage");
+                    assert_eq!(
+                        entry.snapshot_id(),
+                        Some(snap1_id),
+                        "file-a keeps S1 lineage"
+                    );
                     assert_eq!(entry.sequence_number(), Some(snap1_seq));
                 }
                 "test/b.parquet" => {
-                    assert_eq!(entry.snapshot_id(), Some(snap2_id), "file-b keeps S2 lineage");
+                    assert_eq!(
+                        entry.snapshot_id(),
+                        Some(snap2_id),
+                        "file-b keeps S2 lineage"
+                    );
                     assert_eq!(entry.sequence_number(), Some(snap2_seq));
                 }
                 other => panic!("unexpected file {other}"),
@@ -629,7 +654,10 @@ mod tests {
             panic!("expected AddSnapshot");
         };
         let props = &snap4.summary().additional_properties;
-        assert_eq!(props.get("manifests-replaced").map(String::as_str), Some("2"));
+        assert_eq!(
+            props.get("manifests-replaced").map(String::as_str),
+            Some("2")
+        );
         assert_eq!(props.get("manifests-kept").map(String::as_str), Some("1"));
 
         let list_s4 = table_s3

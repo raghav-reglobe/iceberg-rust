@@ -331,8 +331,7 @@ mod tests {
         // Manifest's embedded partition spec partitions by the added column.
         meta.insert(
             "partition-spec".to_string(),
-            br#"[{"name":"flag","transform":"identity","source-id":2,"field-id":1000}]"#
-                .to_vec(),
+            br#"[{"name":"flag","transform":"identity","source-id":2,"field-id":1000}]"#.to_vec(),
         );
 
         // Without table metadata, the manifest is self-describing and the stale
@@ -506,8 +505,7 @@ mod tests {
         // Manifest partitions by the ALTER-added `flag` (source-id 25).
         meta.insert(
             "partition-spec".to_string(),
-            br#"[{"name":"flag","transform":"identity","source-id":25,"field-id":1000}]"#
-                .to_vec(),
+            br#"[{"name":"flag","transform":"identity","source-id":25,"field-id":1000}]"#.to_vec(),
         );
 
         // Without table metadata, the stale embedded schema can't resolve the

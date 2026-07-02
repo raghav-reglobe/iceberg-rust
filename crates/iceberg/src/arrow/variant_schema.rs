@@ -97,18 +97,15 @@ pub fn schema_of_variant(v: &Variant) -> DataType {
         // (Decimal4 -> 9, Decimal8 -> 18, Decimal16 -> 38), matching the
         // declared precision Spark reads off `v.getDecimal.precision`. scale
         // is the value's own scale.
-        Variant::Decimal4(d) => decimal_type(
-            parquet::variant::VariantDecimal4::MAX_PRECISION,
-            d.scale(),
-        ),
-        Variant::Decimal8(d) => decimal_type(
-            parquet::variant::VariantDecimal8::MAX_PRECISION,
-            d.scale(),
-        ),
-        Variant::Decimal16(d) => decimal_type(
-            parquet::variant::VariantDecimal16::MAX_PRECISION,
-            d.scale(),
-        ),
+        Variant::Decimal4(d) => {
+            decimal_type(parquet::variant::VariantDecimal4::MAX_PRECISION, d.scale())
+        }
+        Variant::Decimal8(d) => {
+            decimal_type(parquet::variant::VariantDecimal8::MAX_PRECISION, d.scale())
+        }
+        Variant::Decimal16(d) => {
+            decimal_type(parquet::variant::VariantDecimal16::MAX_PRECISION, d.scale())
+        }
 
         // Strings (the long-form `String` + the inline `ShortString` both map
         // to Utf8).
@@ -118,7 +115,9 @@ pub fn schema_of_variant(v: &Variant) -> DataType {
         // Date / time / timestamp.
         Variant::Date(_) => DataType::Date32,
         Variant::Time(_) => DataType::Time64(TimeUnit::Microsecond),
-        Variant::TimestampMicros(_) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        Variant::TimestampMicros(_) => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
         Variant::TimestampNtzMicros(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
         Variant::TimestampNanos(_) => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         Variant::TimestampNtzNanos(_) => DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -162,7 +161,8 @@ pub fn merge_variant_schemas(a: &DataType, b: &DataType) -> DataType {
 
         // Datetime widening: TimestampNtz + Timestamp(tz) -> Timestamp(tz).
         // (Spark's findWiderDateTimeType; only the NTZ<->LTZ pair widens.)
-        (Timestamp(u1, None), Timestamp(u2, Some(_))) | (Timestamp(u1, Some(_)), Timestamp(u2, None))
+        (Timestamp(u1, None), Timestamp(u2, Some(_)))
+        | (Timestamp(u1, Some(_)), Timestamp(u2, None))
             if u1 == u2 =>
         {
             Timestamp(u1.clone(), Some("UTC".into()))
@@ -179,7 +179,7 @@ pub fn merge_variant_schemas(a: &DataType, b: &DataType) -> DataType {
         // if range+scale > 38 -> Double, else Decimal(range+scale, scale).
         (Decimal128(p1, s1), Decimal128(p2, s2)) => {
             let scale = (*s1).max(*s2);
-            let range = ((*p1 as i16 - *s1 as i16)).max(*p2 as i16 - *s2 as i16);
+            let range = (*p1 as i16 - *s1 as i16).max(*p2 as i16 - *s2 as i16);
             if range + scale as i16 > 38 {
                 Float64
             } else {
@@ -359,8 +359,7 @@ mod tests {
             Field::new("n", DataType::Int64, true),
             Field::new("s", DataType::Utf8, true),
         ]));
-        let expected =
-            DataType::Struct(Fields::from(vec![Field::new("outer", inner, true)]));
+        let expected = DataType::Struct(Fields::from(vec![Field::new("outer", inner, true)]));
         assert_eq!(schema_of_variant(&var), expected);
     }
 

@@ -555,7 +555,8 @@ fn unshred_variant_columns(batch: RecordBatch) -> Result<RecordBatch> {
         }
     }
 
-    let new_schema = Arc::new(ArrowSchema::new(new_fields).with_metadata(schema.metadata().clone()));
+    let new_schema =
+        Arc::new(ArrowSchema::new(new_fields).with_metadata(schema.metadata().clone()));
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
 }
 
@@ -1306,8 +1307,7 @@ mod tests {
         let empty_meta = EMPTY_VARIANT_METADATA_BYTES;
         let metadata = Arc::new(BinaryArray::from(vec![empty_meta, empty_meta])) as ArrayRef;
         // Shredded: the payload lives in typed_value, so value is null for both rows.
-        let value =
-            Arc::new(BinaryArray::from(vec![None as Option<&[u8]>, None])) as ArrayRef;
+        let value = Arc::new(BinaryArray::from(vec![None as Option<&[u8]>, None])) as ArrayRef;
         let typed_value = Arc::new(Int32Array::from(vec![7, 42])) as ArrayRef;
 
         let shredded_fields = arrow_schema::Fields::from(vec![
@@ -1315,9 +1315,11 @@ mod tests {
             Field::new("value", DataType::Binary, true),
             Field::new("typed_value", DataType::Int32, true),
         ]);
-        let shredded =
-            Arc::new(StructArray::new(shredded_fields.clone(), vec![metadata, value, typed_value], None))
-                as ArrayRef;
+        let shredded = Arc::new(StructArray::new(
+            shredded_fields.clone(),
+            vec![metadata, value, typed_value],
+            None,
+        )) as ArrayRef;
 
         // Top-level variant field carries name "v", field id 2, non-nullable.
         let v_field = Field::new("v", DataType::Struct(shredded_fields), false).with_metadata(
@@ -1335,7 +1337,10 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
 
         // Sibling 'id' column passes through untouched.
-        let out_id = out.column_by_name("id").expect("'id' dropped").as_primitive::<arrow_array::types::Int32Type>();
+        let out_id = out
+            .column_by_name("id")
+            .expect("'id' dropped")
+            .as_primitive::<arrow_array::types::Int32Type>();
         assert_eq!(out_id.values(), &[1, 2]);
 
         // The variant column is now unshredded: Struct(metadata: Binary, value: Binary), no typed_value.
@@ -1348,7 +1353,12 @@ mod tests {
             "variant field id must be preserved"
         );
         let s = v.as_struct();
-        assert_eq!(s.fields().len(), 2, "typed_value must be folded away: {:?}", s.fields());
+        assert_eq!(
+            s.fields().len(),
+            2,
+            "typed_value must be folded away: {:?}",
+            s.fields()
+        );
         assert!(s.column_by_name("typed_value").is_none());
         let m = s.column_by_name("metadata").expect("missing metadata");
         let val = s.column_by_name("value").expect("missing value");
@@ -1375,12 +1385,16 @@ mod tests {
             Field::new("metadata", DataType::Binary, false),
             Field::new("value", DataType::Binary, false),
         ]);
-        let v = Arc::new(StructArray::new(unshredded_fields.clone(), vec![metadata, value], None))
-            as ArrayRef;
+        let v = Arc::new(StructArray::new(
+            unshredded_fields.clone(),
+            vec![metadata, value],
+            None,
+        )) as ArrayRef;
         let v_field = Field::new("v", DataType::Struct(unshredded_fields), false);
 
         // A plain struct that happens to NOT be a variant (no metadata field).
-        let plain_fields = arrow_schema::Fields::from(vec![Field::new("a", DataType::Int32, false)]);
+        let plain_fields =
+            arrow_schema::Fields::from(vec![Field::new("a", DataType::Int32, false)]);
         let plain = Arc::new(StructArray::new(
             plain_fields.clone(),
             vec![Arc::new(Int32Array::from(vec![9])) as ArrayRef],
