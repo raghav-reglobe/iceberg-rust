@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iceberg::maintenance::{PrefixMismatchMode, RemoveOrphanFilesAction};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
@@ -184,10 +185,88 @@ fn rewrite_manifests(
     })
 }
 
+/// Identify (and, unless `dry_run`, delete) files under the table location
+/// that no retained snapshot or table metadata references.
+///
+/// **`dry_run` defaults to `True`** — the report-only mode. Deleting a
+/// referenced file is unrecoverable, so callers are expected to verify a
+/// dry-run report (e.g. against an independent engine's `all_files` metadata)
+/// before ever passing `dry_run=False`.
+///
+/// `older_than_ms` is the REQUIRED absolute cutoff (epoch ms): only files
+/// last-modified before it are candidates — set it comfortably in the past
+/// (e.g. now − 3 days) so an in-flight commit's freshly-written files are
+/// never touched. Files without a modification time are always skipped.
+///
+/// Returns a dict: `orphan_files`, `deleted_files`, `failed_deletes`
+/// (list of `[path, error]`), `listed_count`, `referenced_count`,
+/// `skipped_recent`, `skipped_missing_mtime`.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, older_than_ms, dry_run=true, delete_concurrency=None))]
+fn remove_orphan_files(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    older_than_ms: i64,
+    dry_run: bool,
+    delete_concurrency: Option<usize>,
+) -> PyResult<Py<PyAny>> {
+    if older_than_ms <= 0 {
+        return Err(PyValueError::new_err(
+            "older_than_ms must be a positive epoch-milliseconds cutoff",
+        ));
+    }
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+
+    let result = py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .load(catalog_name.clone(), catalog_props)
+                .await
+                .map_err(|e| {
+                    PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}"))
+                })?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let ident = TableIdent::new(namespace, table_name);
+            let table = catalog
+                .load_table(&ident)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("load table {fqn}: {e}")))?;
+
+            let mut action = RemoveOrphanFilesAction::new(table)
+                .older_than_ms(older_than_ms)
+                .dry_run(dry_run)
+                // Everything on this platform writes plain `s3://` URIs; a
+                // mismatched scheme/authority is unexpected → fail loud.
+                .prefix_mismatch_mode(PrefixMismatchMode::Error);
+            if let Some(c) = delete_concurrency {
+                action = action.delete_concurrency(c);
+            }
+            action
+                .execute()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("orphan scan of {fqn}: {e}")))
+        })
+    })?;
+
+    let out = pyo3::types::PyDict::new(py);
+    out.set_item("orphan_files", result.orphan_files)?;
+    out.set_item("deleted_files", result.deleted_files)?;
+    out.set_item("failed_deletes", result.failed_deletes)?;
+    out.set_item("listed_count", result.listed_count)?;
+    out.set_item("referenced_count", result.referenced_count)?;
+    out.set_item("skipped_recent", result.skipped_recent)?;
+    out.set_item("skipped_missing_mtime", result.skipped_missing_mtime)?;
+    Ok(out.into_any().unbind())
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "compaction")?;
     this.add_function(wrap_pyfunction!(compact, &this)?)?;
     this.add_function(wrap_pyfunction!(rewrite_manifests, &this)?)?;
+    this.add_function(wrap_pyfunction!(remove_orphan_files, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }

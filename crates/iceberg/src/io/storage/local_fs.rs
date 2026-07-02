@@ -34,10 +34,24 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Recursively collect all files under `dir` into `out` as (path, metadata).
+fn walk_dir(dir: &std::path::Path, out: &mut Vec<(PathBuf, fs::Metadata)>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            walk_dir(&entry.path(), out)?;
+        } else {
+            out.push((entry.path(), meta));
+        }
+    }
+    Ok(())
+}
 
 /// Local filesystem storage implementation.
 ///
@@ -200,6 +214,48 @@ impl Storage for LocalFsStorage {
             })?;
         }
         Ok(())
+    }
+
+    async fn list_prefix(&self, path: &str) -> Result<Vec<ListEntry>> {
+        let root = Self::normalize_path(path);
+        if !root.is_dir() {
+            return Ok(vec![]);
+        }
+        let mut files = Vec::new();
+        walk_dir(&root, &mut files).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to list directory {}: {}", root.display(), e),
+            )
+        })?;
+        let abs_prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+        let root_str = root.to_string_lossy().to_string();
+        let root_prefix = if root_str.ends_with('/') {
+            root_str
+        } else {
+            format!("{root_str}/")
+        };
+        Ok(files
+            .into_iter()
+            .map(|(p, meta)| {
+                let full = p.to_string_lossy();
+                let suffix = full.strip_prefix(&root_prefix).unwrap_or(&full).to_string();
+                ListEntry {
+                    // Reconstruct in the caller's prefix form so paths round-trip.
+                    path: format!("{abs_prefix}{suffix}"),
+                    size: meta.len(),
+                    last_modified_ms: meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64),
+                }
+            })
+            .collect())
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
