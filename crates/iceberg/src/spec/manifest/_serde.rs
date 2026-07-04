@@ -251,16 +251,15 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             .or_else(|| metadata_columns::get_metadata_field(entry.key).ok());
 
         if let Some(field) = field {
-            let data_type = field
-                .field_type
-                .as_primitive_type()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("field {} is not a primitive type", field.name),
-                    )
-                })?
-                .clone();
+            // Bounds are only meaningful for primitive types. Some writers
+            // (e.g. DuckDB's iceberg extension) also record bounds entries for
+            // non-primitive fields such as variant — skip those instead of
+            // failing the whole manifest read (Java converts bounds lazily at
+            // access time, so it never trips on them either).
+            let Some(primitive_type) = field.field_type.as_primitive_type() else {
+                continue;
+            };
+            let data_type = primitive_type.clone();
             m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
@@ -624,6 +623,44 @@ mod tests {
             result.get(&RESERVED_FIELD_ID_POS),
             Some(&Datum::long(pos_value)),
             "_pos should be parsed as long with correct value"
+        );
+    }
+    #[test]
+    fn test_parse_bytes_entry_skips_non_primitive_fields() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+        use crate::spec::{NestedField, Type, VariantType};
+
+        // Schema with one primitive and one variant field: some writers (e.g.
+        // DuckDB's iceberg extension) record bounds for variant columns too;
+        // the parse must skip them instead of failing the manifest read.
+        let test_schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "v_int",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(2, "doc", Type::Variant(VariantType))),
+            ])
+            .build()
+            .unwrap();
+
+        let entries = vec![
+            BytesEntry {
+                key: 1,
+                value: serde_bytes::ByteBuf::from(1i32.to_le_bytes().to_vec()),
+            },
+            BytesEntry {
+                key: 2,
+                value: serde_bytes::ByteBuf::from(vec![0x51, 0xd9, 0x00, 0x01]),
+            },
+        ];
+
+        let result = parse_bytes_entry(entries, &test_schema).unwrap();
+        assert_eq!(result.get(&1), Some(&Datum::int(1)));
+        assert!(
+            !result.contains_key(&2),
+            "variant bounds entry must be skipped, not parsed or errored"
         );
     }
 }
