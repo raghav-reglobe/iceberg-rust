@@ -36,11 +36,12 @@ dashmap = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["variant_experimental"] }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 expect-test = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }

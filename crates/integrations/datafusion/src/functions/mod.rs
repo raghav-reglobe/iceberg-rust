@@ -15,18 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+//! Scalar UDFs that complement the Iceberg table provider.
 
-mod error;
-pub use error::*;
+pub mod variant;
 
-pub mod functions;
-
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
-
-pub(crate) mod task_writer;
+pub use variant::{all_variant_functions, register_variant_functions};
