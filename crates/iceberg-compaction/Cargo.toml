@@ -41,6 +41,7 @@ parquet = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+arrow-buffer = { workspace = true }
 bytes = { workspace = true }
 roaring = { workspace = true }
 tempfile = { workspace = true }
