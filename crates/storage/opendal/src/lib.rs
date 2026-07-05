@@ -365,7 +365,16 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; we retry temporary
         // failures with exponential backoff. The retry behavior also
         // benefits non-object-store backends.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+        //
+        // The default per-io-op timeout (10s) is too tight for LARGE writes:
+        // a compaction/rewrite flushing a ~128 MB parquet buffer is one io op,
+        // and at modest throughput a single part upload legitimately exceeds
+        // 10s — surfacing as `io operation timeout reached` (persistent, so
+        // RetryLayer does not retry it). 120s keeps hang-detection while
+        // giving big uploads real headroom.
+        let operator = operator
+            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(120)))
+            .layer(RetryLayer::new());
         Ok((operator, relative_path))
     }
 
