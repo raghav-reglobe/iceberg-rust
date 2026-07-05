@@ -150,10 +150,44 @@ async fn write_data_files(
 /// (`write.parquet.bloom-filter-adaptive-enabled`) has no rust equivalent and is
 /// ignored.
 fn bloom_writer_properties(table: &Table) -> WriterProperties {
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
     const ENABLED: &str = "write.parquet.bloom-filter-enabled.column.";
     const FPP: &str = "write.parquet.bloom-filter-fpp.column.";
     let props = table.metadata().properties();
-    let mut builder = WriterProperties::builder();
+    // Compression from `write.parquet.compression-codec` (+ optional
+    // `write.parquet.compression-level`), defaulting to ZSTD — the iceberg
+    // default. parquet-rs's own default is UNCOMPRESSED, which silently
+    // inflated rewritten files ~20x before this translated the property.
+    let codec = props
+        .get("write.parquet.compression-codec")
+        .map(|s| s.as_str())
+        .unwrap_or("zstd");
+    let level = props
+        .get("write.parquet.compression-level")
+        .and_then(|s| s.parse::<i32>().ok());
+    let compression = match codec.to_ascii_lowercase().as_str() {
+        "uncompressed" => Compression::UNCOMPRESSED,
+        "snappy" => Compression::SNAPPY,
+        "gzip" => Compression::GZIP(
+            level
+                .and_then(|l| u32::try_from(l).ok())
+                .and_then(|l| GzipLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        "lz4" => Compression::LZ4,
+        "brotli" => Compression::BROTLI(
+            level
+                .and_then(|l| u32::try_from(l).ok())
+                .and_then(|l| BrotliLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        _ => Compression::ZSTD(
+            level
+                .and_then(|l| ZstdLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+    };
+    let mut builder = WriterProperties::builder().set_compression(compression);
     for (key, val) in props {
         let Some(col) = key.strip_prefix(ENABLED) else {
             continue;

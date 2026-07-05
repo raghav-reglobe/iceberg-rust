@@ -480,6 +480,14 @@ async fn doc_children_of(table: &Table, path: &str) -> Vec<String> {
         .await
         .unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    // The rewrite must emit COMPRESSED output (iceberg default zstd) — the
+    // parquet-rs WriterProperties default is UNCOMPRESSED, which inflated
+    // real rewrites ~20x before the codec property was translated.
+    assert_eq!(
+        reader.metadata().row_group(0).column(0).compression(),
+        parquet::basic::Compression::ZSTD(Default::default()),
+        "rewrite output must honor the table's compression codec"
+    );
     let field = reader
         .schema()
         .field_with_name("doc")
