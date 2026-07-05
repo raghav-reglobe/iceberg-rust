@@ -16,7 +16,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 
 use crate::config::Config;
-use crate::planner::{plan_compaction, Plan};
+use crate::planner::{Plan, plan_compaction};
 use crate::rewrite::{commit_rewrite, read_sort_write};
 
 /// Scan a table's current data files and bin-pack the candidates into a `Plan`.
@@ -124,11 +124,16 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     let mut all_added: Vec<DataFile> = Vec::new();
     let mut seen_delete_paths: HashSet<String> = HashSet::new();
     for group in &plan.groups {
-        let added = read_sort_write(&table, group).await?;
+        let added = read_sort_write(&table, group, cfg).await?;
         if added.is_empty() {
             continue; // no live rows to write (e.g. fully-deleted group) — never remove without replacement
         }
-        all_removed.extend(group.tasks.iter().filter_map(|t| files.get(&t.data_file_path).cloned()));
+        all_removed.extend(
+            group
+                .tasks
+                .iter()
+                .filter_map(|t| files.get(&t.data_file_path).cloned()),
+        );
         // Delete files (DVs) the SCAN bound to these rewritten data files — now
         // dangling, so reabsorbed in the same commit. Sourced from `task.deletes`
         // (the scan's per-file binding, the same the read applies), NOT a
@@ -241,12 +246,18 @@ pub async fn dry_run_inspect(
         let dv_tasks = group.tasks.iter().filter(|t| !t.deletes.is_empty()).count();
         let rows = match crate::rewrite::read_group(&table, group.tasks.clone()).await {
             Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-                Ok(batches) => batches.iter().map(|b| b.num_rows()).sum::<usize>().to_string(),
+                Ok(batches) => batches
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>()
+                    .to_string(),
                 Err(e) => format!("READ_ERR({e})"),
             },
             Err(e) => format!("PLAN_ERR({e})"),
         };
-        group_reads.push(format!("group{i}: tasks={tasks} dv_tasks={dv_tasks} rows_read={rows}"));
+        group_reads.push(format!(
+            "group{i}: tasks={tasks} dv_tasks={dv_tasks} rows_read={rows}"
+        ));
     }
 
     Ok(DryRunReport {

@@ -156,19 +156,31 @@ mod tests {
     #[test]
     fn oversized_without_deletes_is_skipped() {
         let c = Config::default();
-        assert!(!is_candidate(c.max_file_size_bytes + 1, c.delete_file_threshold - 1, &c));
+        assert!(!is_candidate(
+            c.max_file_size_bytes + 1,
+            c.delete_file_threshold - 1,
+            &c
+        ));
     }
 
     #[test]
     fn oversized_with_deletes_is_candidate() {
         let c = Config::default();
-        assert!(is_candidate(c.max_file_size_bytes + 1, c.delete_file_threshold, &c));
+        assert!(is_candidate(
+            c.max_file_size_bytes + 1,
+            c.delete_file_threshold,
+            &c
+        ));
     }
 
     #[test]
     fn delete_pressure_overrides_any_size() {
         let c = Config::default();
-        assert!(is_candidate(c.target_file_size_bytes, c.delete_file_threshold, &c));
+        assert!(is_candidate(
+            c.target_file_size_bytes,
+            c.delete_file_threshold,
+            &c
+        ));
     }
 
     // --- bin-packing ---

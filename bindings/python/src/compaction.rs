@@ -57,7 +57,7 @@ fn split_fqn(fqn: &str) -> PyResult<(String, Vec<String>, String)> {
 /// (target file size + the candidate / delete-pressure thresholds). Blocks until
 /// the rewrite commits; raises `ValueError` on failure.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -65,6 +65,7 @@ fn compact(
     target_file_size_bytes: Option<u64>,
     min_input_files: Option<usize>,
     delete_file_threshold: Option<usize>,
+    shred_variants: Option<bool>,
 ) -> PyResult<()> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
@@ -78,6 +79,11 @@ fn compact(
     }
     if let Some(v) = delete_file_threshold {
         cfg.delete_file_threshold = v;
+    }
+    // Preserve the input files' variant SHREDDING on rewrite (default false =
+    // canonical output). See `Config::shred_variants`.
+    if let Some(v) = shred_variants {
+        cfg.shred_variants = v;
     }
     cfg.validate()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;

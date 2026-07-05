@@ -34,3 +34,4 @@ pub mod engine;
 pub mod planner;
 pub mod rewrite;
 mod sort;
+mod variant_shred;

@@ -52,6 +52,10 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    /// Per-column SHREDDED arrow types for variant columns (column name →
+    /// the full shredded struct type the batches carry). See
+    /// [`Self::with_variant_shred_types`].
+    variant_shred_types: HashMap<String, arrow_schema::DataType>,
 }
 
 impl ParquetWriterBuilder {
@@ -75,7 +79,22 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            variant_shred_types: HashMap::new(),
         }
+    }
+
+    /// Write the named variant columns SHREDDED instead of in the canonical
+    /// `{metadata, value}` layout. The value is the FULL shredded struct type
+    /// (`{metadata, value, typed_value: ...}`) that the incoming record
+    /// batches carry for that column — the writer's arrow schema is rewritten
+    /// to match so the parquet file gets a `typed_value` subtree readers can
+    /// prune into. Columns must be variant in the iceberg schema.
+    pub fn with_variant_shred_types(
+        mut self,
+        variant_shred_types: HashMap<String, arrow_schema::DataType>,
+    ) -> Self {
+        self.variant_shred_types = variant_shred_types;
+        self
     }
 
     /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
@@ -121,6 +140,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            variant_shred_types: self.variant_shred_types.clone(),
         })
     }
 }
@@ -250,12 +270,70 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 }
 
+/// Rewrite the writer's arrow schema so the named variant columns use their
+/// SHREDDED struct type (`{metadata, value, typed_value: ...}`) instead of the
+/// canonical `{metadata, value}` mapping — the incoming batches must carry
+/// exactly these types. Field name, nullability, and metadata (field id) of
+/// the outer column are preserved; only its data type changes.
+fn apply_variant_shred_types(
+    schema: &Schema,
+    arrow_schema: ArrowSchemaRef,
+    variant_shred_types: &HashMap<String, arrow_schema::DataType>,
+) -> Result<ArrowSchemaRef> {
+    let mut fields: Vec<arrow_schema::FieldRef> = arrow_schema.fields().iter().cloned().collect();
+    for (column, shredded_type) in variant_shred_types {
+        let iceberg_field = schema.field_by_name(column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("variant shred type for unknown column: {column}"),
+            )
+        })?;
+        if !matches!(iceberg_field.field_type.as_ref(), Type::Variant(_)) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("variant shred type for non-variant column: {column}"),
+            ));
+        }
+        let has_typed_value = matches!(
+            shredded_type,
+            arrow_schema::DataType::Struct(children)
+                if children.iter().any(|c| c.name() == "typed_value")
+        );
+        if !has_typed_value {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "shred type for column {column} is not a shredded variant struct (no typed_value child): {shredded_type:?}"
+                ),
+            ));
+        }
+        let idx = arrow_schema.index_of(column).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("variant column {column} missing from arrow schema"),
+            )
+            .with_source(e)
+        })?;
+        fields[idx] = Arc::new(
+            fields[idx]
+                .as_ref()
+                .clone()
+                .with_data_type(shredded_type.clone()),
+        );
+    }
+    Ok(Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        arrow_schema.metadata().clone(),
+    )))
+}
+
 /// `ParquetWriter`` is used to write arrow data into parquet file on storage.
 pub struct ParquetWriter {
     schema: SchemaRef,
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
     writer_properties: WriterProperties,
+    variant_shred_types: HashMap<String, arrow_schema::DataType>,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
 }
@@ -532,6 +610,11 @@ impl FileWriter for ParquetWriter {
             writer
         } else {
             let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            let arrow_schema = if self.variant_shred_types.is_empty() {
+                arrow_schema
+            } else {
+                apply_variant_shred_types(&self.schema, arrow_schema, &self.variant_shred_types)?
+            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(

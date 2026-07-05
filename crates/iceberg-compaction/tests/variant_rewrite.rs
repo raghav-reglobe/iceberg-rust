@@ -21,10 +21,18 @@
 //! the maintenance tiers' rewrite (Tier 2/3) on mongo silver tables, whose
 //! documents live in canonical VARIANT columns.
 //!
-//! Covers: two undersized data files with mixed variant payloads (object,
-//! string, long) plus a NULL variant slot → one compacted file; every
-//! surviving row's variant bytes equal the seeded bytes, and the null stays
-//! null.
+//! Covers:
+//! - canonical round-trip: two undersized data files with mixed variant
+//!   payloads (object, string, long) plus a NULL variant slot → one compacted
+//!   file; every surviving row's variant bytes equal the seeded bytes, and
+//!   the null stays null.
+//! - SHREDDED input: a data file whose variant column is (partially) shredded
+//!   (`{metadata, value, typed_value}` — the layout engines like DuckDB and
+//!   Spark produce) scans back correctly through the unshred fold, and a
+//!   mixed shredded+canonical table compacts into one file whose values are
+//!   semantically intact. Today's rewrite emits CANONICAL output (un-shreds);
+//!   that behavior is pinned here so a future shred-preserving writer changes
+//!   it deliberately.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,10 +40,12 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use bytes::Bytes;
 use futures::TryStreamExt;
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestList, NestedField,
-    Operation, PrimitiveType, Schema, Type, VariantType,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType,
+    ManifestList, NestedField, Operation, PrimitiveType, Schema, Struct as IcebergStruct, Type,
+    VariantType,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -47,16 +57,20 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
-    MEMORY_CATALOG_WAREHOUSE,
+    Catalog, CatalogBuilder, MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder, NamespaceIdent,
+    TableCreation, TableIdent,
 };
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use parquet::file::properties::WriterProperties;
-use parquet::variant::VariantBuilder;
-use tempfile::TempDir;
-
 use iceberg_compaction::config::Config;
 use iceberg_compaction::engine::compact_table;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use parquet::variant::{
+    ShreddedSchemaBuilder, Variant, VariantArrayBuilder, VariantBuilder, shred_variant,
+    variant_to_json,
+};
+use tempfile::TempDir;
 
 fn aggressive_cfg() -> Config {
     Config {
@@ -103,9 +117,10 @@ fn arrow_schema() -> Arc<ArrowSchema> {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             "1".to_string(),
         )])),
-        Field::new("doc", DataType::Struct(variant_fields), true).with_metadata(HashMap::from([
-            (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
-        ])),
+        Field::new("doc", DataType::Struct(variant_fields), true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
     ]))
 }
 
@@ -141,7 +156,10 @@ async fn write_data_file(table: &Table, prefix: &str, batch: RecordBatch) -> Vec
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
         DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet),
     );
-    let mut writer = DataFileWriterBuilder::new(rolling).build(None).await.unwrap();
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .unwrap();
     writer.write(batch).await.unwrap();
     writer.close().await.unwrap()
 }
@@ -214,11 +232,8 @@ async fn data_file_count(table: &Table) -> usize {
     n
 }
 
-/// The spike: binpack-compact a canonical-VARIANT table; every variant byte
-/// survives unchanged and the NULL slot stays NULL.
-#[tokio::test]
-async fn compaction_round_trips_canonical_variant() {
-    let warehouse = TempDir::new().unwrap();
+/// Fresh V3 table [id: int, doc: variant] on a memory catalog.
+async fn setup_table(warehouse: &TempDir) -> (impl Catalog, TableIdent, Table) {
     let catalog = MemoryCatalogBuilder::default()
         .load(
             "memory",
@@ -252,6 +267,15 @@ async fn compaction_round_trips_canonical_variant() {
         )
         .await
         .unwrap();
+    (catalog, ident, table)
+}
+
+/// The spike: binpack-compact a canonical-VARIANT table; every variant byte
+/// survives unchanged and the NULL slot stays NULL.
+#[tokio::test]
+async fn compaction_round_trips_canonical_variant() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
 
     // Two undersized files with mixed payloads + one NULL variant slot.
     let seeded: Vec<(i32, Option<VariantBytes>)> = vec![
@@ -305,4 +329,388 @@ async fn compaction_round_trips_canonical_variant() {
         seeded,
         "variant column must round-trip byte-for-byte through the rewrite"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Shredded-input coverage
+// ---------------------------------------------------------------------------
+
+/// Build a (partially) SHREDDED variant column from canonical byte pairs:
+/// shred on `a: Int64`, so object rows with an integer `a` get a typed_value
+/// while other payload shapes (string, long, objects without `a`) stay in the
+/// binary `value` — the mixed reality a schemaless-document writer produces.
+fn shredded_doc_array(rows: &[(i32, Option<VariantBytes>)]) -> ArrayRef {
+    let mut b = VariantArrayBuilder::new(rows.len());
+    for (_, v) in rows {
+        match v {
+            None => b.append_null(),
+            Some((m, val)) => b.append_variant(Variant::try_new(m, val).unwrap()),
+        }
+    }
+    let canonical = b.build();
+    let as_type = ShreddedSchemaBuilder::new()
+        .with_path("a", DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&canonical, &as_type).unwrap();
+    assert!(
+        matches!(ArrayRef::from(shredded.clone()).data_type(),
+                 DataType::Struct(f) if f.iter().any(|x| x.name() == "typed_value")),
+        "seed must actually be shredded"
+    );
+    ArrayRef::from(shredded)
+}
+
+/// Batch of (id, shredded doc) with iceberg field ids on the OUTER fields —
+/// the shape a shredding engine writes into a data file.
+fn shredded_batch(rows: &[(i32, Option<VariantBytes>)]) -> RecordBatch {
+    let ids = Int32Array::from(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+    let doc = shredded_doc_array(rows);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("doc", doc.data_type().clone(), true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(ids), doc]).unwrap()
+}
+
+/// Write a batch as a raw parquet data file (bypassing the iceberg writer
+/// chain, which only emits the canonical variant layout) and hand-build its
+/// DataFile — how an external engine's shredded file enters the table.
+async fn write_raw_data_file(table: &Table, name: &str, batch: RecordBatch) -> DataFile {
+    let mut buf = Vec::new();
+    let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let path = format!("{}/data/{name}.parquet", table.metadata().location());
+    table
+        .file_io()
+        .new_output(&path)
+        .unwrap()
+        .write(Bytes::from(buf.clone()))
+        .await
+        .unwrap();
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path)
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(buf.len() as u64)
+        .record_count(batch.num_rows() as u64)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(IcebergStruct::empty())
+        .build()
+        .unwrap()
+}
+
+/// JSON view of canonical byte pairs (order-preserving with the ids).
+fn jsons_of(rows: &[(i32, Option<VariantBytes>)]) -> Vec<(i32, Option<String>)> {
+    let arr = {
+        let metas = BinaryArray::from_iter_values(
+            rows.iter()
+                .map(|(_, v)| v.as_ref().map(|(m, _)| m.clone()).unwrap_or_default()),
+        );
+        let vals = BinaryArray::from_iter_values(
+            rows.iter()
+                .map(|(_, v)| v.as_ref().map(|(_, x)| x.clone()).unwrap_or_default()),
+        );
+        let validity = NullBuffer::from(rows.iter().map(|(_, v)| v.is_some()).collect::<Vec<_>>());
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]);
+        Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(metas) as ArrayRef, Arc::new(vals) as ArrayRef],
+            Some(validity),
+        )) as ArrayRef
+    };
+    let json = variant_to_json(&arr).unwrap();
+    rows.iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, (!json.is_null(i)).then(|| json.value(i).to_string())))
+        .collect()
+}
+
+/// Scan the table and render every doc as JSON (via the same kernel), sorted
+/// by id — semantic comparison for rows that crossed a shred/unshred boundary
+/// (their re-canonicalized bytes need not be identical to the seed bytes).
+async fn live_docs_as_json(table: &Table) -> Vec<(i32, Option<String>)> {
+    jsons_of(&live_variant_rows(table).await)
+}
+
+/// Live data file paths from the current snapshot's manifests.
+async fn live_data_file_paths(table: &Table) -> Vec<String> {
+    let snap = table.metadata().current_snapshot().unwrap();
+    let bytes = table
+        .file_io()
+        .new_input(snap.manifest_list())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let ml = ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
+    let mut paths = Vec::new();
+    for mf in ml.entries() {
+        if mf.content != ManifestContentType::Data {
+            continue;
+        }
+        let m = mf.load_manifest(table.file_io()).await.unwrap();
+        for e in m.entries() {
+            if e.is_alive() {
+                paths.push(e.data_file().file_path().to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// The variant struct children of column `doc` in a parquet file's arrow schema.
+async fn doc_children_of(table: &Table, path: &str) -> Vec<String> {
+    let bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let field = reader
+        .schema()
+        .field_with_name("doc")
+        .expect("doc column in output file");
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().map(|f| f.name().to_string()).collect(),
+        other => panic!("doc is not a struct: {other:?}"),
+    }
+}
+
+/// SHREDDED input: a shredded data file scans back correctly (the unshred
+/// fold), and a mixed shredded+canonical table compacts into ONE file with
+/// all values semantically intact. Pins today's rewrite output as CANONICAL
+/// (un-shredded) — a shred-preserving writer must change this test on purpose.
+#[tokio::test]
+async fn compaction_reads_shredded_input_and_writes_canonical() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
+
+    // File 1 (canonical, via the iceberg writer chain): mixed payloads.
+    let canonical_rows: Vec<(i32, Option<VariantBytes>)> = vec![
+        (1, Some(variant_object())),
+        (2, Some(variant_string("canonical file"))),
+        (3, None),
+    ];
+    let file1 = write_data_file(&table, "c1", batch(canonical_rows.clone())).await;
+
+    // File 2 (SHREDDED, raw parquet): objects with a shreddable `a`, an
+    // unshreddable string, and a NULL slot.
+    let shredded_rows: Vec<(i32, Option<VariantBytes>)> = vec![
+        (4, Some(variant_object())),
+        (5, Some(variant_string("stays in value"))),
+        (6, Some(variant_long(9000))),
+        (7, None),
+    ];
+    let file2 = write_raw_data_file(&table, "s1", shredded_batch(&shredded_rows)).await;
+
+    let tx = Transaction::new(&table);
+    let table = tx
+        .fast_append()
+        .add_data_files(file1.into_iter().chain([file2]).collect::<Vec<_>>())
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+    let mut seeded = canonical_rows.clone();
+    seeded.extend(shredded_rows.clone());
+    let expected_json = jsons_of(&seeded);
+
+    // Pre-compaction: the SCAN already unshreds — every row (incl. the ones
+    // living in typed_value) reads back semantically equal.
+    assert_eq!(
+        live_docs_as_json(&table).await,
+        expected_json,
+        "shredded file must scan back through the unshred fold"
+    );
+    assert_eq!(data_file_count(&table).await, 2);
+
+    compact_table(&catalog, &ident, &aggressive_cfg())
+        .await
+        .unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        data_file_count(&table).await,
+        1,
+        "mixed input binpacks to one"
+    );
+    assert_eq!(
+        table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .operation,
+        Operation::Replace,
+    );
+    assert_eq!(
+        live_docs_as_json(&table).await,
+        expected_json,
+        "values must survive the shred -> unshred -> rewrite trip"
+    );
+
+    // Pin today's behavior: the rewrite emits the CANONICAL layout (no
+    // typed_value) — i.e. compaction currently UN-shreds. A future
+    // shred-preserving writer flips this assertion deliberately.
+    let paths = live_data_file_paths(&table).await;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        doc_children_of(&table, &paths[0]).await,
+        vec!["metadata".to_string(), "value".to_string()],
+        "current rewrite output is canonical (un-shredded)"
+    );
+}
+
+/// The full doc field (struct children + the typed_value subtree, if any) of
+/// a parquet file's arrow schema.
+async fn doc_type_of(table: &Table, path: &str) -> DataType {
+    let bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    reader
+        .schema()
+        .field_with_name("doc")
+        .expect("doc column in output file")
+        .data_type()
+        .clone()
+}
+
+/// SHRED-WRITE: with `Config::shred_variants`, the rewrite re-shreds its
+/// output to the input files' layout — the compacted file carries the
+/// `typed_value` subtree (so engines keep pruning into it) and every value
+/// still reads back semantically intact through the scan.
+#[tokio::test]
+async fn compaction_shred_write_preserves_input_shredding() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
+
+    // Two SHREDDED files (shredded on `a: Int64`), with payloads that both
+    // do and don't match the shredding schema, plus NULL slots.
+    let rows1: Vec<(i32, Option<VariantBytes>)> = vec![
+        (1, Some(variant_object())),
+        (2, Some(variant_string("resides in value"))),
+        (3, None),
+    ];
+    let rows2: Vec<(i32, Option<VariantBytes>)> =
+        vec![(4, Some(variant_object())), (5, Some(variant_long(77)))];
+    let file1 = write_raw_data_file(&table, "s1", shredded_batch(&rows1)).await;
+    let file2 = write_raw_data_file(&table, "s2", shredded_batch(&rows2)).await;
+    let tx = Transaction::new(&table);
+    let table = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+    let mut seeded = rows1.clone();
+    seeded.extend(rows2.clone());
+    let expected_json = jsons_of(&seeded);
+    assert_eq!(live_docs_as_json(&table).await, expected_json);
+    assert_eq!(data_file_count(&table).await, 2);
+
+    let cfg = Config {
+        shred_variants: true,
+        ..aggressive_cfg()
+    };
+    compact_table(&catalog, &ident, &cfg).await.unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(data_file_count(&table).await, 1);
+
+    // The output file is SHREDDED: {metadata, value, typed_value} with the
+    // input's `a` field typed inside typed_value.
+    let paths = live_data_file_paths(&table).await;
+    assert_eq!(paths.len(), 1);
+    let doc_type = doc_type_of(&table, &paths[0]).await;
+    let DataType::Struct(children) = &doc_type else {
+        panic!("doc is not a struct: {doc_type:?}");
+    };
+    let names: Vec<_> = children.iter().map(|f| f.name().to_string()).collect();
+    assert!(
+        names.contains(&"typed_value".to_string()),
+        "shred-write output must carry typed_value, got {names:?}"
+    );
+    let tv = children.iter().find(|f| f.name() == "typed_value").unwrap();
+    let DataType::Struct(tv_children) = tv.data_type() else {
+        panic!("typed_value is not a struct: {:?}", tv.data_type());
+    };
+    assert_eq!(
+        tv_children
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"],
+        "the input's shredded field must survive the rewrite"
+    );
+
+    // And the shredded output still scans back semantically equal (the fold
+    // reads our own shred-write output correctly).
+    assert_eq!(
+        live_docs_as_json(&table).await,
+        expected_json,
+        "values must survive the shred-preserving rewrite"
+    );
+}
+
+/// Canonical input + `shred_variants: true` stays CANONICAL — the flag
+/// preserves the input's layout, it does not invent shredding.
+#[tokio::test]
+async fn shred_write_flag_is_a_noop_on_canonical_input() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
+
+    let rows: Vec<(i32, Option<VariantBytes>)> = vec![
+        (1, Some(variant_object())),
+        (2, Some(variant_string("plain"))),
+        (3, None),
+    ];
+    let file1 = write_data_file(&table, "c1", batch(rows.clone())).await;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(file1)
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+    let cfg = Config {
+        shred_variants: true,
+        ..aggressive_cfg()
+    };
+    compact_table(&catalog, &ident, &cfg).await.unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let paths = live_data_file_paths(&table).await;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        doc_children_of(&table, &paths[0]).await,
+        vec!["metadata".to_string(), "value".to_string()],
+        "canonical input stays canonical under the shred-write flag"
+    );
+    assert_eq!(live_docs_as_json(&table).await, jsons_of(&rows));
 }

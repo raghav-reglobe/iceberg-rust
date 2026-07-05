@@ -1,7 +1,7 @@
 //! Compaction config — mirrors iceberg-go's `table/compaction.Config`, with
 //! pulse's 128 MB target (iceberg-go defaults to 512 MB).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Tunables for a compaction pass.
 #[derive(Debug, Clone)]
@@ -20,6 +20,14 @@ pub struct Config {
     /// A data file with at least this many delete files is a candidate
     /// regardless of size (delete-pressure). iceberg-go default: 5.
     pub delete_file_threshold: usize,
+    /// Preserve the input files' variant SHREDDING on rewrite. When true,
+    /// each variant column's shredding schema is derived from the first input
+    /// file's parquet footer and the output is re-shredded to match (columns
+    /// canonical in the input stay canonical). When false (default) the
+    /// rewrite emits the canonical `{metadata, value}` layout — semantically
+    /// identical, but query engines lose `typed_value` pruning on the
+    /// rewritten files.
+    pub shred_variants: bool,
 }
 
 impl Default for Config {
@@ -31,6 +39,7 @@ impl Default for Config {
             max_file_size_bytes: target * 9 / 5, // 180%
             min_input_files: 5,
             delete_file_threshold: 5,
+            shred_variants: false,
         }
     }
 }
