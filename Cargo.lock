@@ -3929,6 +3929,7 @@ version = "0.10.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -3948,6 +3949,8 @@ version = "0.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
+ "chrono",
  "dashmap",
  "datafusion",
  "expect-test",
