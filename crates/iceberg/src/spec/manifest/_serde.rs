@@ -260,7 +260,15 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
                 continue;
             };
             let data_type = primitive_type.clone();
-            m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
+            // Bounds are advisory pruning stats — a value we cannot parse
+            // (e.g. a string bound a writer truncated at BYTE 16, cutting a
+            // multi-byte UTF-8 codepoint in half) must not fail the whole
+            // manifest read. Skipping the bound only costs pruning precision,
+            // never correctness. (Java reads bounds lazily and only on use.)
+            let Ok(datum) = Datum::try_from_bytes(&entry.value, data_type) else {
+                continue;
+            };
+            m.insert(entry.key, datum);
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
     }
@@ -662,5 +670,53 @@ mod tests {
             !result.contains_key(&2),
             "variant bounds entry must be skipped, not parsed or errored"
         );
+    }
+
+    #[test]
+    fn test_parse_bytes_entry_skips_unparseable_bound_values() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+        use crate::spec::{NestedField, Type};
+
+        // Some writers truncate string bounds at BYTE 16 rather than at a
+        // character boundary — a multi-byte UTF-8 codepoint cut in half makes
+        // the bound unparseable. Bounds are advisory pruning stats, so the
+        // parse must skip such a value instead of failing the manifest read.
+        let test_schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "v_int",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        // 15 ASCII bytes + the FIRST byte of a 2-byte codepoint = a 16-byte
+        // truncation that is not valid UTF-8.
+        let mut truncated = b"aaaaaaaaaaaaaaa".to_vec();
+        truncated.push(0xC3); // first byte of a 2-byte sequence, second cut off
+        let entries = vec![
+            BytesEntry {
+                key: 1,
+                value: serde_bytes::ByteBuf::from(truncated),
+            },
+            BytesEntry {
+                key: 2,
+                value: serde_bytes::ByteBuf::from(7i32.to_le_bytes().to_vec()),
+            },
+        ];
+
+        let result = parse_bytes_entry(entries, &test_schema).unwrap();
+        assert!(
+            !result.contains_key(&1),
+            "unparseable bound value must be skipped, not fail the read"
+        );
+        assert_eq!(result.get(&2), Some(&Datum::int(7)));
     }
 }

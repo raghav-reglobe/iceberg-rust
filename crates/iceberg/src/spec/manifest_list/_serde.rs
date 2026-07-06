@@ -193,7 +193,12 @@ pub(super) struct ManifestFileV3 {
     pub deleted_rows_count: i64,
     pub partitions: Option<Vec<FieldSummary>>,
     pub key_metadata: Option<ByteBuf>,
-    pub first_row_id: Option<u64>,
+    /// Deserialized as i64: the spec types `first-row-id` as a (signed) long,
+    /// and some writers (e.g. DuckDB's iceberg extension) emit `-1` (or other
+    /// negative values) instead of null for "unassigned". An unsigned field
+    /// here makes the WHOLE manifest-list read fail on such files; negatives
+    /// are mapped to None (unassigned) in the conversion below.
+    pub first_row_id: Option<i64>,
 }
 
 impl ManifestFileV3 {
@@ -215,7 +220,8 @@ impl ManifestFileV3 {
             deleted_rows_count: Some(self.deleted_rows_count.try_into()?),
             partitions: self.partitions,
             key_metadata: self.key_metadata.map(|b| b.into_vec()),
-            first_row_id: self.first_row_id,
+            // Negative = a writer's "unassigned" sentinel (Java writes null).
+            first_row_id: self.first_row_id.and_then(|v| u64::try_from(v).ok()),
         };
 
         Ok(manifest_file)
@@ -372,7 +378,7 @@ impl TryFrom<ManifestFile> for ManifestFileV3 {
                 .try_into()?,
             partitions: value.partitions,
             key_metadata,
-            first_row_id: value.first_row_id,
+            first_row_id: value.first_row_id.map(|v| v as i64),
         })
     }
 }
@@ -675,5 +681,44 @@ mod test {
         assert_eq!(v2_manifest.deleted_rows_count, Some(0));
         assert_eq!(v2_manifest.partitions, None);
         assert_eq!(v2_manifest.key_metadata, None);
+    }
+
+    fn v3_with_first_row_id(first_row_id: Option<i64>) -> super::ManifestFileV3 {
+        super::ManifestFileV3 {
+            manifest_path: "s3://x/m0.avro".to_string(),
+            manifest_length: 100,
+            partition_spec_id: 0,
+            content: 0,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: 1,
+            existing_files_count: 0,
+            deleted_files_count: 0,
+            added_rows_count: 1,
+            existing_rows_count: 0,
+            deleted_rows_count: 0,
+            partitions: None,
+            key_metadata: None,
+            first_row_id,
+        }
+    }
+
+    #[test]
+    fn test_negative_first_row_id_maps_to_unassigned() {
+        // Some writers (e.g. DuckDB's iceberg extension) emit `-1` — or other
+        // negative values — for `first-row-id` instead of null. The Avro wire
+        // type is a (signed) long; an unsigned serde field made the WHOLE
+        // manifest-list read fail on such files.
+        for raw in [-1i64, -3848051871905661517i64] {
+            let mf = v3_with_first_row_id(Some(raw)).try_into().unwrap();
+            assert_eq!(
+                mf.first_row_id, None,
+                "negative {raw} must read as unassigned"
+            );
+        }
+        // ... while a real value round-trips.
+        let mf = v3_with_first_row_id(Some(10)).try_into().unwrap();
+        assert_eq!(mf.first_row_id, Some(10));
     }
 }
