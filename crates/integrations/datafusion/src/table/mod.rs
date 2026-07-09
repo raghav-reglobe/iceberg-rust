@@ -25,20 +25,20 @@
 //! - [`IcebergStaticTableProvider`]: Static provider for read-only access to a specific
 //!   table snapshot. Use for consistent analytical queries or time-travel scenarios.
 
+pub(crate) mod merge_into;
 pub mod metadata_table;
 pub mod table_provider_factory;
 
-use std::any::Any;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DFSchemaRef, DataFusionError, TableReference};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -110,9 +110,6 @@ impl IcebergTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
@@ -239,6 +236,36 @@ impl TableProvider for IcebergTableProvider {
             self.schema.clone(),
         )))
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        source_schema: DFSchemaRef,
+        target_ref: TableReference,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog; the whole merge (scan,
+        // late fetch, commit validation) is pinned to this snapshot.
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        merge_into::build_mor_merge_plan(
+            Arc::clone(&self.catalog),
+            table,
+            state,
+            source,
+            source_schema,
+            target_ref,
+            on,
+            clauses,
+        )
+        .await
+    }
 }
 
 /// Static table provider for read-only snapshot access.
@@ -301,9 +328,6 @@ impl IcebergStaticTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
@@ -755,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_plan_fanout_enabled_no_sort() {
         use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
         use datafusion::physical_plan::empty::EmptyExec;
 
         // When fanout is enabled (default), no sort node should be added
@@ -787,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_plan_fanout_disabled_has_sort() {
         use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
         use datafusion::physical_plan::empty::EmptyExec;
 
         // When fanout is disabled, a sort node should be added
@@ -836,7 +860,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -867,7 +890,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -896,7 +918,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 

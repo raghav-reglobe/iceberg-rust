@@ -36,6 +36,7 @@ dashmap = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
+roaring = { workspace = true }
 parquet = { workspace = true, features = ["variant_experimental"] }
 tokio = { workspace = true }
 uuid = { workspace = true }
