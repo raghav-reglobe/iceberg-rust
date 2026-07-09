@@ -641,7 +641,7 @@ pub mod tests {
     use crate::arrow::ArrowReaderBuilder;
     use crate::expr::{BoundPredicate, Reference};
     use crate::io::{FileIO, OutputFile};
-    use crate::metadata_columns::RESERVED_COL_NAME_FILE;
+    use crate::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
     use crate::scan::FileScanTask;
     use crate::spec::{
         DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, DataFileBuilder, DataFileFormat, Datum,
@@ -2140,6 +2140,75 @@ pub mod tests {
         // Each file has 1024 rows, so total is 2048 rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_select_with_pos_column() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select a regular column plus the _pos metadata column
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["x", RESERVED_COL_NAME_POS])
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches[0].num_columns(), 2);
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).name(), RESERVED_COL_NAME_POS);
+
+        // Each of the two live files holds 1024 rows; positions run 0..1024
+        // within every file. Batches within a file arrive in order, so the
+        // per-file concatenation of _pos values must be exactly 0..1024.
+        let mut positions: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let pos_col = batch.column_by_name(RESERVED_COL_NAME_POS).unwrap();
+            let pos_arr = pos_col.as_any().downcast_ref::<Int64Array>().unwrap();
+            positions.extend(pos_arr.values().iter().copied());
+        }
+        assert_eq!(positions.len(), 2048);
+        let mut per_file_runs = positions.split_inclusive(|&p| p == 1023);
+        assert!(per_file_runs.all(|run| run.iter().copied().eq(0..run.len() as i64)));
+    }
+
+    #[tokio::test]
+    async fn test_pos_column_reflects_original_offsets_under_row_selection() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // y >= 5 matches only the LAST 12 rows of each 1024-row file, so the
+        // emitted _pos values must be the ORIGINAL file offsets 1012..=1023 —
+        // not a renumbering of the filtered output. This is the property MoR
+        // writers rely on to build deletion vectors.
+        let predicate = Reference::new("y").greater_than_or_equal_to(Datum::long(5));
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["y", RESERVED_COL_NAME_POS])
+            .with_filter(predicate)
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        for batch in &batches {
+            let pos_col = batch.column_by_name(RESERVED_COL_NAME_POS).unwrap();
+            let pos_arr = pos_col.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert!(
+                pos_arr.values().iter().all(|&p| (1012..=1023).contains(&p)),
+                "positions must be original file offsets, got {:?}",
+                pos_arr.values()
+            );
+        }
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 24, "12 matching rows in each of the 2 live files");
     }
 
     #[tokio::test]

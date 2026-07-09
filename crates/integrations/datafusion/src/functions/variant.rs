@@ -47,7 +47,6 @@
 //!
 //! [`Variant`]: parquet::variant::Variant
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{Array, ArrayRef};
@@ -181,9 +180,6 @@ impl VariantGetUdf {
 }
 
 impl ScalarUDFImpl for VariantGetUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         self.name
@@ -240,9 +236,6 @@ impl VariantToJsonUdf {
 }
 
 impl ScalarUDFImpl for VariantToJsonUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "variant_to_json"
@@ -290,9 +283,6 @@ impl JsonToVariantUdf {
 }
 
 impl ScalarUDFImpl for JsonToVariantUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "json_to_variant"

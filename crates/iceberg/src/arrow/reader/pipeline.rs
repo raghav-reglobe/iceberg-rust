@@ -27,7 +27,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, RowNumber};
 use parquet::variant::{VariantArray, unshred_variant};
 
 use super::{
@@ -40,7 +40,9 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_COL_NAME_POS, is_metadata_field,
+};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::Datum;
 use crate::{Error, ErrorKind};
@@ -202,6 +204,45 @@ impl FileScanTaskReader {
                         format!(
                             "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
                         ),
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else {
+            arrow_metadata
+        };
+
+        // When `_pos` is projected, re-derive the reader metadata with a Parquet
+        // virtual RowNumber column: the reader then emits each row's ORIGINAL
+        // position within the data file (correct under row-group pruning, row
+        // selection and row filters), which MoR writers need to construct
+        // deletion vectors. The virtual field carries the reserved field id so
+        // the RecordBatchTransformer can pass it through by id. Appended LAST,
+        // after all file fields, so projection-mask leaf numbering is unaffected.
+        let arrow_metadata = if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+            let pos_field = Arc::new(
+                Field::new(RESERVED_COL_NAME_POS, DataType::Int64, false)
+                    .with_metadata(std::collections::HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        RESERVED_FIELD_ID_POS.to_string(),
+                    )]))
+                    .with_extension_type(RowNumber),
+            );
+            let options = ArrowReaderOptions::new()
+                .with_schema(Arc::clone(arrow_metadata.schema()))
+                .with_virtual_columns(vec![pos_field])
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to register the _pos virtual column",
+                    )
+                    .with_source(e)
+                })?;
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to create ArrowReaderMetadata with the _pos virtual column",
                     )
                     .with_source(e)
                 },

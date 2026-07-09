@@ -28,8 +28,8 @@ use arrow_schema::{
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
-use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::get_metadata_field;
+use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema, type_to_arrow_type};
+use crate::metadata_columns::{get_metadata_field, is_metadata_field};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -394,6 +394,18 @@ impl RecordBatchTransformer {
                                 .with_metadata(field.metadata().clone());
                         Ok(Arc::new(constant_field))
                     }
+                } else if let Ok(metadata_field) = get_metadata_field(*field_id) {
+                    // Non-constant metadata field (e.g. `_pos`): not in the
+                    // snapshot schema, sourced from the incoming batch (the
+                    // Parquet reader emits it as a virtual column).
+                    let arrow_type = type_to_arrow_type(&metadata_field.field_type)?;
+                    let arrow_field =
+                        Field::new(&metadata_field.name, arrow_type, !metadata_field.required)
+                            .with_metadata(HashMap::from([(
+                                PARQUET_FIELD_ID_META_KEY.to_string(),
+                                metadata_field.id.to_string(),
+                            )]));
+                    Ok(Arc::new(arrow_field))
                 } else {
                     // Regular field - use schema as-is
                     Ok(field_id_to_mapped_schema_map
@@ -490,6 +502,25 @@ impl RecordBatchTransformer {
                     return Ok(ColumnSource::Add {
                         value: Some(datum.literal().clone()),
                         target_type: arrow_type,
+                    });
+                }
+
+                // Non-constant metadata field (e.g. `_pos`): must be produced
+                // by the reader itself (a Parquet virtual column carrying the
+                // reserved field id); it has no snapshot-schema entry, no
+                // partition constant and no initial-default to fall back on.
+                if is_metadata_field(*field_id) {
+                    let (_, source_index) =
+                        field_id_to_source_schema_map
+                            .get(field_id)
+                            .ok_or(Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "metadata column with field id {field_id} was projected but not produced by the reader"
+                                ),
+                            ))?;
+                    return Ok(ColumnSource::PassThrough {
+                        source_index: *source_index,
                     });
                 }
 
