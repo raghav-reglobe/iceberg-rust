@@ -204,6 +204,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     fn removed_data_files(&self) -> &[DataFile] {
         &self.removed_data_files
     }
+
+    fn removed_delete_files(&self) -> &[DataFile] {
+        &self.removed_delete_files
+    }
 }
 
 #[cfg(test)]

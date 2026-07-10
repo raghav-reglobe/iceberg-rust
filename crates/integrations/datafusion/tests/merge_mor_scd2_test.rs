@@ -42,8 +42,9 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, ManifestContentType, ManifestList,
-    NestedField, PrimitiveType, Schema, Type,
+    DataContentType, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList, PartitionKey,
+    NestedField, PrimitiveType, Schema, Struct as IcebergStruct, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -145,8 +146,14 @@ async fn write_one_data_file(table: &Table, batch: RecordBatch) -> Vec<iceberg::
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
         DefaultFileNameGenerator::new("seed".to_string(), None, DataFileFormat::Parquet),
     );
+    // Every seed row is `_is_current = true` — one identity partition.
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        IcebergStruct::from_iter(vec![Some(Literal::bool(true))]),
+    );
     let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(None)
+        .build(Some(partition_key))
         .await
         .unwrap();
     writer.write(batch).await.unwrap();
@@ -172,12 +179,18 @@ async fn setup(
         .unwrap());
     let ns = NamespaceIdent::new(NS.to_string());
     catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    // Partitioned like real silver: current/history physical separation.
+    let spec = UnboundPartitionSpec::builder()
+        .add_partition_field(5, "_is_current", Transform::Identity)
+        .unwrap()
+        .build();
     let table = catalog
         .create_table(
             &ns,
             TableCreation::builder()
                 .name(TABLE.to_string())
                 .schema(scd2_iceberg_schema())
+                .partition_spec(spec)
                 .format_version(FormatVersion::V3)
                 .build(),
         )

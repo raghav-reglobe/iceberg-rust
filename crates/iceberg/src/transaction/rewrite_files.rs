@@ -182,4 +182,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
     fn removed_data_files(&self) -> &[DataFile] {
         &self.removed_data_files
     }
+
+    fn removed_delete_files(&self) -> &[DataFile] {
+        &self.removed_delete_files
+    }
 }

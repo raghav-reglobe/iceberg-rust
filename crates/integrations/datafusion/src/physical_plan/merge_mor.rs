@@ -62,7 +62,7 @@ use datafusion::physical_plan::{
     execute_input_stream,
 };
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema};
 use iceberg::delete_vector::DeleteVector;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::scan::FileScanTask;
@@ -655,11 +655,22 @@ async fn run_mor_write(
         file_name_generator,
     );
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+    let partition_spec = table.metadata().default_partition_spec().clone();
+    // Partitioned writes require the computed `_partition` column on every
+    // batch (the fanout splitter routes rows by it).
+    let partition_calc = if partition_spec.is_unpartitioned() {
+        None
+    } else {
+        Some(
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema)
+                .map_err(to_datafusion_error)?,
+        )
+    };
     let mut writer = TaskWriter::try_new(
         data_file_writer_builder,
         table_props.write_datafusion_fanout_enabled,
         table_schema.clone(),
-        table.metadata().default_partition_spec().clone(),
+        partition_spec,
     )
     .map_err(to_datafusion_error)?;
 
@@ -702,6 +713,7 @@ async fn run_mor_write(
             match &clause.action {
                 MorActionPlan::Insert(assignments) => {
                     let out = build_full_rows(&subset, assignments, &table_arrow, None)?;
+                    let out = with_partition_column(out, partition_calc.as_ref())?;
                     writer.write(out).await.map_err(to_datafusion_error)?;
                 }
                 MorActionPlan::Update(assignments) => {
@@ -911,6 +923,7 @@ async fn run_mor_write(
                 }
                 let out = RecordBatch::try_new(Arc::clone(&table_arrow), columns)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                let out = with_partition_column(out, partition_calc.as_ref())?;
                 writer.write(out).await.map_err(to_datafusion_error)?;
             }
         }
@@ -995,6 +1008,28 @@ async fn run_mor_write(
         pad(removed_lane),
     ])
     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Append the computed `_partition` column for partitioned tables; pass
+/// batches through unchanged for unpartitioned ones.
+fn with_partition_column(
+    batch: RecordBatch,
+    calc: Option<&PartitionValueCalculator>,
+) -> DFResult<RecordBatch> {
+    let Some(calc) = calc else {
+        return Ok(batch);
+    };
+    let partition_array = calc.calculate(&batch).map_err(to_datafusion_error)?;
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        PROJECTED_PARTITION_VALUE_COLUMN,
+        partition_array.data_type().clone(),
+        false,
+    )));
+    let mut columns = batch.columns().to_vec();
+    columns.push(partition_array);
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Record each row of `subset` as matched (file, pos) -> (clause, store row).

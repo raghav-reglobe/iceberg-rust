@@ -87,6 +87,13 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &[]
     }
 
+    /// Delete files being removed in this operation (used for snapshot summary
+    /// metrics — e.g. superseded deletion vectors expunged by a rewrite or a
+    /// consolidating row delta).
+    fn removed_delete_files(&self) -> &[DataFile] {
+        &[]
+    }
+
     /// Whether this Overwrite replaces the entire table content. When true,
     /// `truncate_table_summary` sets `deleted-data-files` to the previous total.
     /// Row-level operations (RowDelta) return false; full-table rewrites (future
@@ -567,9 +574,27 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
+        // Delete files (deletion vectors / positional deletes) count toward the
+        // summary metrics too — the collector branches on content type.
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
         for data_file in snapshot_produce_operation.removed_data_files() {
             summary_collector.remove_file(
                 data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for delete_file in snapshot_produce_operation.removed_delete_files() {
+            summary_collector.remove_file(
+                delete_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
