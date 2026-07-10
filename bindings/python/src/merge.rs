@@ -1,0 +1,186 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! One-shot `MERGE INTO` doorway: run genuine MERGE SQL text against Iceberg
+//! tables mounted as DataFusion catalogs.
+//!
+//! The statement is planned by DataFusion's MERGE planner and executed by the
+//! merge-on-read chain behind `TableProvider::merge_into` (deletion vectors
+//! on the scanned `(_file, _pos)`, late-materialized matched-row appends, one
+//! `RowDelta` snapshot). `catalogs` maps each SQL catalog name used in the
+//! statement to standard Iceberg REST catalog properties, so every
+//! `catalog.namespace.table` reference resolves with no register steps.
+//! Catalog handles are memoized per process — repeated calls reuse the same
+//! authenticated clients instead of re-fetching config/tokens per call.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::displayable;
+use iceberg::{Catalog, CatalogBuilder};
+use iceberg_catalog_rest::RestCatalogBuilder;
+use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::functions::register_variant_functions;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
+use crate::runtime::runtime;
+
+/// Per-process memoized catalog handles, keyed by catalog name + properties.
+/// A REST catalog re-auths (`/config` + OAuth token) on construction; reusing
+/// the handle across calls avoids hammering the catalog server from a worker
+/// that merges every few seconds.
+static CATALOGS: OnceLock<Mutex<HashMap<String, Arc<dyn Catalog>>>> = OnceLock::new();
+
+fn catalog_cache_key(name: &str, props: &HashMap<String, String>) -> String {
+    let mut entries: Vec<_> = props.iter().collect();
+    entries.sort();
+    let mut key = String::from(name);
+    for (k, v) in entries {
+        key.push('\u{1f}');
+        key.push_str(k);
+        key.push('\u{1f}');
+        key.push_str(v);
+    }
+    key
+}
+
+async fn get_or_build_catalog(
+    name: &str,
+    props: HashMap<String, String>,
+) -> PyResult<Arc<dyn Catalog>> {
+    let key = catalog_cache_key(name, &props);
+    if let Some(cat) = CATALOGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&key)
+    {
+        return Ok(Arc::clone(cat));
+    }
+    let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+        .load(name.to_string(), props)
+        .await
+        .map_err(|e| PyValueError::new_err(format!("build catalog `{name}`: {e}")))?;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    CATALOGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(key, Arc::clone(&catalog));
+    Ok(catalog)
+}
+
+async fn session_with_catalogs(
+    catalogs: HashMap<String, HashMap<String, String>>,
+) -> PyResult<SessionContext> {
+    let ctx = SessionContext::new();
+    register_variant_functions(&ctx);
+    for (name, props) in catalogs {
+        let catalog = get_or_build_catalog(&name, props).await?;
+        let provider = IcebergCatalogProvider::try_new(catalog)
+            .await
+            .map_err(|e| PyValueError::new_err(format!("mount catalog `{name}`: {e}")))?;
+        ctx.register_catalog(&name, Arc::new(provider));
+    }
+    Ok(ctx)
+}
+
+/// Execute one `MERGE INTO` statement and block until its snapshot commits.
+///
+/// `catalogs` maps each SQL catalog name to Iceberg REST catalog properties
+/// (`uri`, `warehouse`, `credential`, `oauth2-server-uri`, `scope`, ...);
+/// `sql` is the full MERGE statement (DataFusion dialect). Returns a dict
+/// with `count` — the number of rows appended by the merge (inserts plus
+/// updated row versions). Raises `ValueError` on planning or execution
+/// failure.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql))]
+fn merge_into(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+) -> PyResult<HashMap<String, String>> {
+    py.detach(|| {
+        runtime().block_on(async move {
+            let ctx = session_with_catalogs(catalogs).await?;
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("planning MERGE: {e}")))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("executing MERGE: {e}")))?;
+            let mut count: u64 = 0;
+            for batch in &batches {
+                if let Some(col) = batch.column_by_name("count")
+                    && let Some(arr) = col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                {
+                    count += arr.iter().flatten().sum::<u64>();
+                }
+            }
+            Ok(HashMap::from([("count".to_string(), count.to_string())]))
+        })
+    })
+}
+
+/// Plan one `MERGE INTO` statement WITHOUT executing it and return the
+/// physical plan as text — the read-only twin of [`merge_into`]. Planning
+/// resolves every table reference against the live catalogs (metadata reads
+/// only, no data IO, no commit), so a failing or suspicious merge can be
+/// inspected with zero writes.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql))]
+fn dry_run_inspect(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+) -> PyResult<HashMap<String, String>> {
+    py.detach(|| {
+        runtime().block_on(async move {
+            let ctx = session_with_catalogs(catalogs).await?;
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("planning MERGE: {e}")))?;
+            let logical = df.logical_plan().display_indent().to_string();
+            let physical = df
+                .create_physical_plan()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("physical planning MERGE: {e}")))?;
+            let physical = displayable(physical.as_ref()).indent(true).to_string();
+            Ok(HashMap::from([
+                ("logical_plan".to_string(), logical),
+                ("physical_plan".to_string(), physical),
+            ]))
+        })
+    })
+}
+
+pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let this = PyModule::new(py, "merge")?;
+    this.add_function(wrap_pyfunction!(merge_into, &this)?)?;
+    this.add_function(wrap_pyfunction!(dry_run_inspect, &this)?)?;
+    m.add_submodule(&this)?;
+    Ok(())
+}
