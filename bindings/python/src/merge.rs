@@ -91,7 +91,12 @@ async fn get_or_build_catalog(
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
 ) -> PyResult<SessionContext> {
-    let ctx = SessionContext::new();
+    // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
+    // are mixed-case, and the in-flight MERGE planner drops the quote flag on
+    // INSERT/SET column names, so normalization would lowercase them anyway.
+    let config = datafusion::execution::context::SessionConfig::new()
+        .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+    let ctx = SessionContext::new_with_config(config);
     register_variant_functions(&ctx);
     for (name, props) in catalogs {
         let catalog = get_or_build_catalog(&name, props).await?;
