@@ -858,3 +858,73 @@ async fn insert_heavy_merge_rolls_output_files() {
         merge_files.len()
     );
 }
+
+/// The stale-R shape (rust-lane phase 3): a `WHEN MATCHED AND <cond> THEN
+/// DELETE` clause AHEAD of the demote-UPDATE removes superseded backfill
+/// rows in the SAME atomic RowDelta as the demotes + inserts. Routing under
+/// test: the stale row matches BOTH the conditional DELETE and the
+/// unconditional UPDATE — first-match must pick DELETE; deleted rows join
+/// the consolidated DV but are NOT re-appended (no demoted version).
+#[tokio::test]
+async fn matched_delete_clause_removes_stale_rows_via_dv() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup(
+        &warehouse,
+        &[
+            // id=1 is a stale backfill row: _cdc_offset = -1 (the op=R
+            // sentinel) — the source flags it for DELETE.
+            (1, "r-stale", 10, None, true, -1),
+            (2, "b", 10, None, true, 101),
+            (3, "c", 10, None, true, 102),
+        ],
+        // Batch: replacements for ids 1 and 2, plus a brand-new id=4.
+        &[(1, "a2", 20, 200), (2, "b2", 20, 201), (4, "d", 20, 203)],
+    )
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let sql = format!(
+        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING ( \
+             SELECT id, val, _valid_from, CAST(NULL AS BIGINT) AS _valid_to, \
+                    true AS _is_current, _cdc_offset, false AS _stale_r \
+             FROM batch \
+             UNION ALL \
+             SELECT t2.id, t2.val, t2._valid_from, b.new_vf AS _valid_to, \
+                    false AS _is_current, t2._cdc_offset, \
+                    (t2._cdc_offset = -1) AS _stale_r \
+             FROM {CATALOG}.{NS}.{TABLE} t2 \
+             JOIN (SELECT id, MIN(_valid_from) AS new_vf FROM batch GROUP BY id) b \
+               ON t2.id = b.id AND t2._is_current \
+         ) AS s \
+         ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+         WHEN MATCHED AND s._stale_r THEN DELETE \
+         WHEN MATCHED THEN UPDATE SET _valid_to = s._valid_to, _is_current = s._is_current \
+         WHEN NOT MATCHED THEN INSERT (id, val, _valid_from, _valid_to, _is_current, _cdc_offset) \
+             VALUES (s.id, s.val, s._valid_from, s._valid_to, s._is_current, s._cdc_offset)"
+    );
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+
+    let table = load_table(&catalog).await;
+    // ONE snapshot carries the delete + the demote + all three appends.
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+
+    let state = read_state(&ctx).await;
+    assert_eq!(state, vec![
+        // id=1: the stale backfill row is GONE (deleted, not demoted) —
+        // only its replacement remains.
+        (1, "a2".to_string(), 20, None, true),
+        // id=2: normal SCD2 demote + new current.
+        (2, "b".to_string(), 10, Some(20), false),
+        (2, "b2".to_string(), 20, None, true),
+        (3, "c".to_string(), 10, None, true),
+        (4, "d".to_string(), 20, None, true),
+    ]);
+
+    // One consolidated DV on the seed file covering BOTH the deleted stale
+    // row (id=1, pos 0) and the demoted row (id=2, pos 1).
+    let dvs = live_dvs(&table).await;
+    assert_eq!(dvs.len(), 1, "one DV total: {dvs:?}");
+    assert_eq!(dvs[0].1, 2, "DV covers the deleted + the demoted row");
+}
