@@ -23,6 +23,7 @@ mod context;
 use context::*;
 mod task;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -61,6 +62,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    data_file_path_filter: Option<Arc<HashSet<String>>>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -79,7 +81,18 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            data_file_path_filter: None,
         }
+    }
+
+    /// Restrict the scan to data files whose path is in `paths` — for
+    /// consumers that plan the file set externally (e.g. incremental
+    /// processing of a known set of appended files). Delete files are still
+    /// indexed and applied to the retained data files. Paths must match
+    /// [`FileScanTask::data_file_path`] exactly.
+    pub fn with_data_file_path_filter(mut self, paths: impl IntoIterator<Item = String>) -> Self {
+        self.data_file_path_filter = Some(Arc::new(paths.into_iter().collect()));
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -211,6 +224,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        data_file_path_filter: self.data_file_path_filter,
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -325,6 +339,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            data_file_path_filter: self.data_file_path_filter,
             runtime: self.table.runtime().clone(),
         })
     }
@@ -354,6 +369,9 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    /// When set, only data files whose path is in the set are scanned
+    /// (externally planned file subset); deletes still apply.
+    data_file_path_filter: Option<Arc<HashSet<String>>>,
 
     runtime: Runtime,
 }
@@ -477,7 +495,17 @@ impl TableScan {
             });
         }
 
-        Ok(file_scan_task_rx.boxed())
+        match &self.data_file_path_filter {
+            Some(paths) => {
+                let paths = Arc::clone(paths);
+                Ok(file_scan_task_rx
+                    .try_filter(move |task| {
+                        futures::future::ready(paths.contains(task.data_file_path()))
+                    })
+                    .boxed())
+            }
+            None => Ok(file_scan_task_rx.boxed()),
+        }
     }
 
     /// Returns an [`ArrowRecordBatchStream`].

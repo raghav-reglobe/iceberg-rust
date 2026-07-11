@@ -29,6 +29,7 @@ pub(crate) mod merge_into;
 pub mod metadata_table;
 pub mod table_provider_factory;
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -73,6 +74,9 @@ pub struct IcebergTableProvider {
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
     schema: ArrowSchemaRef,
+    /// When set, scans read ONLY the data files whose path is in the set
+    /// (externally planned file subset; deletes still apply).
+    scan_file_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 impl IcebergTableProvider {
@@ -95,7 +99,16 @@ impl IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            scan_file_allowlist: None,
         })
+    }
+
+    /// Restrict every scan of this provider to the given data-file paths
+    /// (externally planned file subset; deletes still apply). Writes and
+    /// merges into the table are unaffected.
+    pub fn with_scan_file_allowlist(mut self, files: impl IntoIterator<Item = String>) -> Self {
+        self.scan_file_allowlist = Some(Arc::new(files.into_iter().collect()));
+        self
     }
 
     pub(crate) async fn metadata_table(
@@ -140,6 +153,7 @@ impl TableProvider for IcebergTableProvider {
             projection,
             filters,
             limit,
+            self.scan_file_allowlist.clone(),
         )))
     }
 
@@ -350,6 +364,7 @@ impl TableProvider for IcebergStaticTableProvider {
             projection,
             filters,
             limit,
+            None,
         )))
     }
 

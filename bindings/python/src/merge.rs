@@ -88,8 +88,33 @@ async fn get_or_build_catalog(
     Ok(catalog)
 }
 
+/// `scan_files` keys are `catalog.namespace.table` (namespace may be
+/// multi-level: first segment = catalog, last = table, middle = namespace).
+/// Grouped per catalog as `(namespace, table) -> files`.
+type ScanFiles = HashMap<String, HashMap<(String, String), Vec<String>>>;
+
+fn parse_scan_files(scan_files: Option<HashMap<String, Vec<String>>>) -> PyResult<ScanFiles> {
+    let mut out: ScanFiles = HashMap::new();
+    for (fqn, files) in scan_files.unwrap_or_default() {
+        let parts: Vec<&str> = fqn.split('.').collect();
+        if parts.len() < 3 {
+            return Err(PyValueError::new_err(format!(
+                "scan_files key `{fqn}` must be `catalog.namespace.table`"
+            )));
+        }
+        let catalog = parts[0].to_string();
+        let table = parts[parts.len() - 1].to_string();
+        let namespace = parts[1..parts.len() - 1].join(".");
+        out.entry(catalog)
+            .or_default()
+            .insert((namespace, table), files);
+    }
+    Ok(out)
+}
+
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
+    mut scan_files: ScanFiles,
 ) -> PyResult<SessionContext> {
     // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
     // are mixed-case, and the in-flight MERGE planner drops the quote flag on
@@ -103,7 +128,24 @@ async fn session_with_catalogs(
         let provider = IcebergCatalogProvider::try_new(catalog)
             .await
             .map_err(|e| PyValueError::new_err(format!("mount catalog `{name}`: {e}")))?;
+        // Scan-file allowlists (externally planned file subsets) are applied
+        // per call — providers are rebuilt per session; only the catalog
+        // handle above is memoized.
+        for ((namespace, table), files) in scan_files.remove(&name).unwrap_or_default() {
+            provider
+                .with_table_scan_file_allowlist(&namespace, &table, files)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "scan_files for `{name}.{namespace}.{table}`: {e}"
+                    ))
+                })?;
+        }
         ctx.register_catalog(&name, Arc::new(provider));
+    }
+    if let Some(unmatched) = scan_files.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "scan_files references catalog `{unmatched}` which is not in `catalogs`"
+        )));
     }
     Ok(ctx)
 }
@@ -112,20 +154,25 @@ async fn session_with_catalogs(
 ///
 /// `catalogs` maps each SQL catalog name to Iceberg REST catalog properties
 /// (`uri`, `warehouse`, `credential`, `oauth2-server-uri`, `scope`, ...);
-/// `sql` is the full MERGE statement (DataFusion dialect). Returns a dict
-/// with `count` — the number of rows appended by the merge (inserts plus
-/// updated row versions). Raises `ValueError` on planning or execution
-/// failure.
+/// `sql` is the full MERGE statement (DataFusion dialect). `scan_files`
+/// optionally restricts named tables' scans to an externally planned set of
+/// data-file paths: `{"catalog.namespace.table": ["s3://.../f.parquet", ...]}`
+/// (deletes still apply to the retained files; unknown identifiers raise).
+/// Returns a dict with `count` — the number of rows appended by the merge
+/// (inserts plus updated row versions). Raises `ValueError` on planning or
+/// execution failure.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql))]
+#[pyo3(signature = (catalogs, sql, scan_files=None))]
 fn merge_into(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
 ) -> PyResult<HashMap<String, String>> {
+    let scan_files = parse_scan_files(scan_files)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files).await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -155,15 +202,17 @@ fn merge_into(
 /// only, no data IO, no commit), so a failing or suspicious merge can be
 /// inspected with zero writes.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql))]
+#[pyo3(signature = (catalogs, sql, scan_files=None))]
 fn dry_run_inspect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
 ) -> PyResult<HashMap<String, String>> {
+    let scan_files = parse_scan_files(scan_files)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files).await?;
             let df = ctx
                 .sql(&sql)
                 .await

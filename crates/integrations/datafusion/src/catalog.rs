@@ -80,6 +80,33 @@ impl IcebergCatalogProvider {
 
         Ok(IcebergCatalogProvider { schemas })
     }
+
+    /// Restrict `namespace.table`'s scans to the given data-file paths
+    /// (externally planned file subset; deletes still apply). Errors if the
+    /// namespace or table is not mounted — a mistyped identifier must fail
+    /// loudly rather than silently scan the whole table.
+    pub fn with_table_scan_file_allowlist(
+        &self,
+        namespace: &str,
+        table: &str,
+        files: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        let schema = self.schemas.get(namespace).ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::NamespaceNotFound,
+                format!("namespace `{namespace}` not mounted (scan-file allowlist)"),
+            )
+        })?;
+        let schema = (schema.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<IcebergSchemaProvider>()
+            .ok_or_else(|| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("schema provider for `{namespace}` is not Iceberg-backed"),
+                )
+            })?;
+        schema.set_scan_file_allowlist(table, files)
+    }
 }
 
 impl CatalogProvider for IcebergCatalogProvider {

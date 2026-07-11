@@ -91,6 +91,30 @@ impl IcebergSchemaProvider {
             tables,
         })
     }
+
+    /// Replace `table`'s provider with a clone whose scans read ONLY the
+    /// given data-file paths (externally planned file subset; deletes still
+    /// apply). Errors if the table is not present in this namespace.
+    pub(crate) fn set_scan_file_allowlist(
+        &self,
+        table: &str,
+        files: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        let restricted = {
+            let provider = self.tables.get(table).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::TableNotFound,
+                    format!(
+                        "table `{table}` not found in namespace `{}` (scan-file allowlist)",
+                        self.namespace.to_url_string()
+                    ),
+                )
+            })?;
+            provider.as_ref().clone().with_scan_file_allowlist(files)
+        };
+        self.tables.insert(table.to_string(), Arc::new(restricted));
+        Ok(())
+    }
 }
 
 #[async_trait]

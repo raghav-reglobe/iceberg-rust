@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
@@ -52,6 +53,9 @@ pub struct IcebergTableScan {
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
     limit: Option<usize>,
+    /// When set, scan ONLY the data files whose path is in the set
+    /// (externally planned file subset; deletes still apply).
+    file_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 impl IcebergTableScan {
@@ -63,6 +67,7 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        file_allowlist: Option<Arc<HashSet<String>>>,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -79,6 +84,7 @@ impl IcebergTableScan {
             projection,
             predicates,
             limit,
+            file_allowlist,
         }
     }
 
@@ -146,6 +152,7 @@ impl ExecutionPlan for IcebergTableScan {
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
+            self.file_allowlist.clone(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -195,6 +202,9 @@ impl DisplayAs for IcebergTableScan {
         if let Some(limit) = self.limit {
             write!(f, " limit:[{limit}]")?;
         }
+        if let Some(files) = &self.file_allowlist {
+            write!(f, " scan_files:[{}]", files.len())?;
+        }
         Ok(())
     }
 }
@@ -209,6 +219,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
+    file_allowlist: Option<Arc<HashSet<String>>>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -221,6 +232,9 @@ async fn get_batch_stream(
     };
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
+    }
+    if let Some(files) = file_allowlist {
+        scan_builder = scan_builder.with_data_file_path_filter(files.iter().cloned());
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
