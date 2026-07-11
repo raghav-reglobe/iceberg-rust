@@ -35,16 +35,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::buffer::NullBuffer;
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use futures::TryStreamExt;
 use iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList, PartitionKey,
-    NestedField, PrimitiveType, Schema, Struct as IcebergStruct, Transform, Type,
-    UnboundPartitionSpec,
+    DataContentType, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList,
+    NestedField, PartitionKey, PrimitiveType, Schema, Struct as IcebergStruct, Transform, Type,
+    UnboundPartitionSpec, VariantType,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -61,7 +62,10 @@ use iceberg::{
 };
 use iceberg_datafusion::IcebergCatalogProvider;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::{Compression, LogicalType};
 use parquet::file::properties::WriterProperties;
+use parquet::variant::VariantBuilder;
 use tempfile::TempDir;
 
 const CATALOG: &str = "catalog";
@@ -76,8 +80,7 @@ fn scd2_iceberg_schema() -> Schema {
             NestedField::optional(2, "val", Type::Primitive(PrimitiveType::String)).into(),
             NestedField::required(3, "_valid_from", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::optional(4, "_valid_to", Type::Primitive(PrimitiveType::Long)).into(),
-            NestedField::required(5, "_is_current", Type::Primitive(PrimitiveType::Boolean))
-                .into(),
+            NestedField::required(5, "_is_current", Type::Primitive(PrimitiveType::Boolean)).into(),
             NestedField::required(6, "_cdc_offset", Type::Primitive(PrimitiveType::Long)).into(),
         ])
         .build()
@@ -105,16 +108,24 @@ fn scd2_arrow_schema() -> Arc<ArrowSchema> {
 #[allow(clippy::type_complexity)]
 fn scd2_batch(rows: &[(i32, &str, i64, Option<i64>, bool, i64)]) -> RecordBatch {
     RecordBatch::try_new(scd2_arrow_schema(), vec![
-        Arc::new(Int32Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
         Arc::new(StringArray::from(
             rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
         )),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+        )),
         Arc::new(BooleanArray::from(
             rows.iter().map(|r| r.4).collect::<Vec<_>>(),
         )),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.5).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.5).collect::<Vec<_>>(),
+        )),
     ])
     .unwrap()
 }
@@ -128,12 +139,18 @@ fn cdc_batch(rows: &[(i32, &str, i64, i64)]) -> RecordBatch {
         Field::new("_cdc_offset", DataType::Int64, false),
     ]));
     RecordBatch::try_new(schema, vec![
-        Arc::new(Int32Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
         Arc::new(StringArray::from(
             rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
         )),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+        )),
     ])
     .unwrap()
 }
@@ -167,16 +184,27 @@ async fn setup(
     seed: &[(i32, &str, i64, Option<i64>, bool, i64)],
     batch: &[(i32, &str, i64, i64)],
 ) -> (Arc<dyn Catalog>, SessionContext) {
-    let catalog: Arc<dyn Catalog> = Arc::new(MemoryCatalogBuilder::default()
-        .load(
-            "memory",
-            HashMap::from([(
-                MEMORY_CATALOG_WAREHOUSE.to_string(),
-                warehouse.path().to_str().unwrap().to_string(),
-            )]),
-        )
-        .await
-        .unwrap());
+    setup_with_props(warehouse, seed, batch, HashMap::new()).await
+}
+
+async fn setup_with_props(
+    warehouse: &TempDir,
+    seed: &[(i32, &str, i64, Option<i64>, bool, i64)],
+    batch: &[(i32, &str, i64, i64)],
+    props: HashMap<String, String>,
+) -> (Arc<dyn Catalog>, SessionContext) {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap(),
+    );
     let ns = NamespaceIdent::new(NS.to_string());
     catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
     // Partitioned like real silver: current/history physical separation.
@@ -192,6 +220,7 @@ async fn setup(
                 .schema(scd2_iceberg_schema())
                 .partition_spec(spec)
                 .format_version(FormatVersion::V3)
+                .properties(props)
                 .build(),
         )
         .await
@@ -297,7 +326,10 @@ async fn live_dvs(table: &Table) -> Vec<(String, u64)> {
         let m = mf.load_manifest(table.file_io()).await.unwrap();
         for e in m.entries() {
             if e.is_alive() {
-                assert_eq!(e.data_file().content_type(), DataContentType::PositionDeletes);
+                assert_eq!(
+                    e.data_file().content_type(),
+                    DataContentType::PositionDeletes
+                );
                 out.push((
                     e.data_file()
                         .referenced_data_file()
@@ -340,7 +372,12 @@ async fn scd2_merge_demotes_via_dv_and_inserts_in_one_snapshot() {
     let before = load_table(&catalog).await;
     let snaps_before = before.metadata().snapshots().count();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap();
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     let table = load_table(&catalog).await;
     // Exactly ONE new snapshot carries the demote + both appends.
@@ -377,7 +414,12 @@ async fn second_merge_consolidates_dvs_per_file() {
     .await;
 
     // Merge #1: demote id=1 (seed file gets its first DV).
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap();
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     // Merge #2: new versions for id=2 (current row in the SEED file, which
     // already carries a DV) and id=1 (current row in the file appended by
@@ -387,7 +429,12 @@ async fn second_merge_consolidates_dvs_per_file() {
     let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
     ctx.register_table("batch", Arc::new(mem)).unwrap();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap();
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     let state = read_state(&ctx).await;
     assert_eq!(state, vec![
@@ -424,3 +471,390 @@ async fn second_merge_consolidates_dvs_per_file() {
     assert_eq!(dvs.len(), 2, "seed file + merge-1 output file: {dvs:?}");
 }
 
+/// Live data-file paths in the current snapshot.
+async fn live_data_paths(table: &Table) -> Vec<String> {
+    let snap = table.metadata().current_snapshot().unwrap();
+    let bytes = table
+        .file_io()
+        .new_input(snap.manifest_list())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let ml = ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
+    let mut out = Vec::new();
+    for mf in ml.entries() {
+        if mf.content != ManifestContentType::Data {
+            continue;
+        }
+        let m = mf.load_manifest(table.file_io()).await.unwrap();
+        for e in m.entries() {
+            if e.is_alive() {
+                out.push(e.data_file().file_path().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A merge over a VARIANT column: the written files must carry the parquet
+/// VARIANT logical-type annotation and the table's compression codec
+/// (defaulting to zstd), and null semantics must be byte-faithful — an SQL
+/// NULL stays a null group, a variant-null value keeps its
+/// `{metadata: 0x11 0x00 0x00, value: 0x00}` encoding, and untouched variant
+/// bytes round-trip verbatim through the late-materialized demote path.
+#[tokio::test]
+async fn merge_variant_output_is_annotated_compressed_and_null_faithful() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap(),
+    );
+    let ns = NamespaceIdent::new(NS.to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "doc", Type::Variant(VariantType)).into(),
+            NestedField::required(3, "_valid_from", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(4, "_valid_to", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(5, "_is_current", Type::Primitive(PrimitiveType::Boolean)).into(),
+            NestedField::required(6, "_cdc_offset", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .unwrap();
+    let spec = UnboundPartitionSpec::builder()
+        .add_partition_field(5, "_is_current", Transform::Identity)
+        .unwrap()
+        .build();
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name(TABLE.to_string())
+                .schema(schema)
+                .partition_spec(spec)
+                .format_version(FormatVersion::V3)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    // Canonical variant docs.
+    let doc = |a: i64| -> (Vec<u8>, Vec<u8>) {
+        let mut builder = VariantBuilder::new();
+        let mut obj = builder.new_object();
+        obj.insert("a", a);
+        obj.finish();
+        builder.finish()
+    };
+    let (m1, v1) = doc(1);
+    let (m2, v2) = doc(2);
+    // The spec encoding of a VARIANT NULL VALUE (not an SQL null): empty
+    // metadata dictionary + the null primitive.
+    let variant_null: (Vec<u8>, Vec<u8>) = (vec![0x11, 0x00, 0x00], vec![0x00]);
+
+    let canonical_fields = Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+    ]);
+    let doc_array = |rows: &[Option<(Vec<u8>, Vec<u8>)>]| -> ArrayRef {
+        let metas = BinaryArray::from_iter_values(
+            rows.iter()
+                .map(|v| v.as_ref().map(|(m, _)| m.clone()).unwrap_or_default()),
+        );
+        let vals = BinaryArray::from_iter_values(
+            rows.iter()
+                .map(|v| v.as_ref().map(|(_, x)| x.clone()).unwrap_or_default()),
+        );
+        let validity = NullBuffer::from(rows.iter().map(|v| v.is_some()).collect::<Vec<_>>());
+        Arc::new(StructArray::new(
+            canonical_fields.clone(),
+            vec![Arc::new(metas) as ArrayRef, Arc::new(vals) as ArrayRef],
+            Some(validity),
+        ))
+    };
+
+    // Seed: ids 1..=2, one current row each, both with real docs.
+    let seed_schema = Arc::new(ArrowSchema::new(vec![
+        field(1, "id", DataType::Int32, false),
+        field(2, "doc", DataType::Struct(canonical_fields.clone()), true),
+        field(3, "_valid_from", DataType::Int64, false),
+        field(4, "_valid_to", DataType::Int64, true),
+        field(5, "_is_current", DataType::Boolean, false),
+        field(6, "_cdc_offset", DataType::Int64, false),
+    ]));
+    let seed = RecordBatch::try_new(seed_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])),
+        doc_array(&[Some((m1.clone(), v1.clone())), Some(doc(9))]),
+        Arc::new(Int64Array::from(vec![10, 10])),
+        Arc::new(Int64Array::from(vec![None::<i64>, None])),
+        Arc::new(BooleanArray::from(vec![true, true])),
+        Arc::new(Int64Array::from(vec![100, 101])),
+    ])
+    .unwrap();
+    let data_files = write_one_data_file(&table, seed).await;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+            .await
+            .unwrap(),
+    );
+    ctx.register_catalog(CATALOG, provider);
+
+    // CDC batch: a new version of id=1 (real doc), a new id=5 whose doc is a
+    // VARIANT NULL value, and a new id=6 whose doc is SQL NULL.
+    let batch_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("doc", DataType::Struct(canonical_fields.clone()), true),
+        Field::new("_valid_from", DataType::Int64, false),
+        Field::new("_cdc_offset", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(batch_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 5, 6])),
+        doc_array(&[
+            Some((m2.clone(), v2.clone())),
+            Some(variant_null.clone()),
+            None,
+        ]),
+        Arc::new(Int64Array::from(vec![20, 20, 20])),
+        Arc::new(Int64Array::from(vec![200, 201, 202])),
+    ])
+    .unwrap();
+    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+    ctx.register_table("batch", Arc::new(mem)).unwrap();
+
+    let sql = format!(
+        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING ( \
+             SELECT id, doc, _valid_from, CAST(NULL AS BIGINT) AS _valid_to, \
+                    true AS _is_current, _cdc_offset \
+             FROM batch \
+             UNION ALL \
+             SELECT t2.id, t2.doc, t2._valid_from, b.new_vf AS _valid_to, \
+                    false AS _is_current, t2._cdc_offset \
+             FROM {CATALOG}.{NS}.{TABLE} t2 \
+             JOIN (SELECT id, MIN(_valid_from) AS new_vf FROM batch GROUP BY id) b \
+               ON t2.id = b.id AND t2._is_current \
+         ) AS s \
+         ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+         WHEN MATCHED THEN UPDATE SET _valid_to = s._valid_to, _is_current = s._is_current \
+         WHEN NOT MATCHED THEN INSERT (id, doc, _valid_from, _valid_to, _is_current, _cdc_offset) \
+             VALUES (s.id, s.doc, s._valid_from, s._valid_to, s._is_current, s._cdc_offset)"
+    );
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+
+    // The read path must treat the variant-null VALUE as NOT NULL and the
+    // SQL-null slot as NULL.
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id FROM {CATALOG}.{NS}.{TABLE} WHERE doc IS NULL"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let null_ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..b.num_rows()).map(|i| ids.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(null_ids, vec![6], "only the SQL-null doc row is NULL");
+
+    // Byte-level checks on every merge-written file: VARIANT annotation,
+    // compression, and per-row doc encoding.
+    let table = load_table(&catalog).await;
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    assert!(!merge_files.is_empty(), "merge appended data files");
+
+    let mut seen: HashMap<i32, (bool, Vec<u8>, Vec<u8>)> = HashMap::new();
+    for path in &merge_files {
+        let bytes = table
+            .file_io()
+            .new_input(path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+
+        // Finding-class regressions: the annotation + the codec.
+        let doc_field = reader
+            .metadata()
+            .file_metadata()
+            .schema()
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == "doc")
+            .expect("doc column in file schema")
+            .clone();
+        assert!(
+            matches!(
+                doc_field.get_basic_info().logical_type_ref(),
+                Some(LogicalType::Variant { .. })
+            ),
+            "merge output must annotate variant columns: {path}"
+        );
+        assert_eq!(
+            reader.metadata().row_group(0).column(0).compression(),
+            Compression::ZSTD(Default::default()),
+            "merge output must honor the table's compression codec: {path}"
+        );
+
+        for batch in reader.build().unwrap() {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .clone();
+            let docs = batch
+                .column_by_name("doc")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .clone();
+            let metas = docs
+                .column_by_name("metadata")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .clone();
+            let vals = docs
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .clone();
+            for i in 0..batch.num_rows() {
+                seen.insert(
+                    ids.value(i),
+                    (
+                        docs.is_null(i),
+                        metas.value(i).to_vec(),
+                        vals.value(i).to_vec(),
+                    ),
+                );
+            }
+        }
+    }
+
+    // id=1's new version: the batch doc verbatim. id=1's demoted version came
+    // through the late fetch — same id key, the LAST write wins in `seen`, so
+    // assert via the distinct doc bytes instead: both versions carry m1/v1 or
+    // m2/v2, never a corrupted mix. id=5: the variant-null value, byte-exact,
+    // NOT an SQL null. id=6: SQL null.
+    let (null5, meta5, val5) = seen.get(&5).expect("id=5 written");
+    assert!(!null5, "variant-null is a VALUE, not an SQL null");
+    assert_eq!(
+        (meta5.as_slice(), val5.as_slice()),
+        (variant_null.0.as_slice(), variant_null.1.as_slice())
+    );
+    let (null6, _, _) = seen.get(&6).expect("id=6 written");
+    assert!(null6, "SQL-null doc stays a null group");
+    let (null1, meta1, val1) = seen.get(&1).expect("id=1 written");
+    assert!(!null1);
+    assert!(
+        (meta1 == &m2 && val1 == &v2) || (meta1 == &m1 && val1 == &v1),
+        "id=1 doc bytes round-trip verbatim"
+    );
+}
+
+/// An insert-heavy merge (the whole NOT MATCHED set arrives as ONE join
+/// batch) against a tiny file-size target must ROLL the output into multiple
+/// data files — and still commit exactly one snapshot.
+#[tokio::test]
+async fn insert_heavy_merge_rolls_output_files() {
+    let warehouse = TempDir::new().unwrap();
+    let rows: Vec<(i32, String, i64, i64)> = (10..20_010)
+        .map(|i| (i, format!("v{i}"), 20i64, 1_000 + i as i64))
+        .collect();
+    let batch: Vec<(i32, &str, i64, i64)> = rows
+        .iter()
+        .map(|(i, v, vf, off)| (*i, v.as_str(), *vf, *off))
+        .collect();
+    let (catalog, ctx) = setup_with_props(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &batch,
+        HashMap::from([(
+            "write.target-file-size-bytes".to_string(),
+            "8192".to_string(),
+        )]),
+    )
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_before + 1,
+        "chunked writes still commit ONE atomic snapshot"
+    );
+
+    let count = ctx
+        .sql(&format!("SELECT count(*) FROM {CATALOG}.{NS}.{TABLE}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = count[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 20_001, "seed row + 20k inserts");
+
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    assert!(
+        merge_files.len() > 1,
+        "a giant insert batch must roll at the file-size target, got {} file(s)",
+        merge_files.len()
+    );
+}

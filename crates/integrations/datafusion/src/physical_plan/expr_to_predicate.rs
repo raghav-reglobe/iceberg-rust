@@ -17,7 +17,7 @@
 
 use std::vec;
 
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
@@ -42,11 +42,32 @@ enum OpTransformedResult {
 /// Converts DataFusion filters ([`Expr`]) to an iceberg [`Predicate`].
 /// If none of the filters could be converted, return `None` which adds no predicates to the scan operation.
 /// If the conversion was successful, return the converted predicates combined with an AND operator.
-pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
+pub fn convert_filters_to_predicate(schema: &Schema, filters: &[Expr]) -> Option<Predicate> {
     filters
         .iter()
+        .filter(|expr| expr_is_pushable(schema, expr))
         .filter_map(convert_filter_to_predicate)
         .reduce(Predicate::and)
+}
+
+/// A filter can only be pushed into the Iceberg scan when every column it
+/// references can BIND there — struct-shaped columns (including VARIANT,
+/// whose arrow type is a struct) have no accessor, and a predicate over one
+/// fails the whole scan at bind time. Such filters are left behind; pushdown
+/// is `Inexact`, so DataFusion re-applies every filter after the scan.
+fn expr_is_pushable(schema: &Schema, expr: &Expr) -> bool {
+    expr.column_refs()
+        .iter()
+        .all(|col| match schema.field_with_name(col.name()) {
+            Err(_) => true,
+            Ok(f) => !matches!(
+                f.data_type(),
+                DataType::Struct(_)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::Map(_, _)
+            ),
+        })
 }
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
@@ -140,7 +161,8 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::Cast(c) => {
-            if c.field.data_type() == &DataType::Date32 || c.field.data_type() == &DataType::Date64 {
+            if c.field.data_type() == &DataType::Date32 || c.field.data_type() == &DataType::Date64
+            {
                 // Casts to date truncate the expression, we cannot simply extract it as it
                 // can create erroneous predicates.
                 return TransformedResult::NotTransformed;
@@ -262,7 +284,9 @@ fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
         Expr::Cast(cast) => {
             // Casts to date truncate the value and are not numeric, so they
             // cannot be treated as NaN-preserving.
-            if cast.field.data_type() == &DataType::Date32 || cast.field.data_type() == &DataType::Date64 {
+            if cast.field.data_type() == &DataType::Date32
+                || cast.field.data_type() == &DataType::Date64
+            {
                 return None;
             }
             resolve_nan_preserving_reference(&cast.expr)
@@ -447,8 +471,8 @@ mod tests {
 
     use super::convert_filters_to_predicate;
 
-    fn create_test_schema() -> DFSchema {
-        let arrow_schema = Schema::new(vec![
+    fn create_test_schema() -> Schema {
+        Schema::new(vec![
             Field::new("foo", DataType::Int32, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "1".to_string(),
@@ -464,17 +488,43 @@ mod tests {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "4".to_string(),
             )])),
-        ]);
-        DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
+            // A variant column: arrow-side it is a struct — filters over it
+            // must NOT be pushed into the scan (no iceberg accessor).
+            Field::new(
+                "doc",
+                DataType::Struct(
+                    vec![
+                        Field::new("metadata", DataType::Binary, false),
+                        Field::new("value", DataType::Binary, false),
+                    ]
+                    .into(),
+                ),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "5".to_string(),
+            )])),
+        ])
     }
 
     fn convert_to_iceberg_predicate(sql: &str) -> Option<Predicate> {
-        let df_schema = create_test_schema();
+        let arrow_schema = create_test_schema();
+        let df_schema = DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap();
         let expr = SessionContext::new()
             .parse_sql_expr(sql, &df_schema)
             .unwrap();
         let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
-        convert_filters_to_predicate(&exprs[..])
+        convert_filters_to_predicate(&arrow_schema, &exprs[..])
+    }
+
+    #[test]
+    fn test_struct_column_filters_are_not_pushed() {
+        assert_eq!(convert_to_iceberg_predicate("doc IS NULL"), None);
+        assert_eq!(convert_to_iceberg_predicate("doc IS NOT NULL"), None);
+        // Other conjuncts survive when a struct-column conjunct is dropped.
+        let predicate = convert_to_iceberg_predicate("doc IS NULL AND foo = 1").unwrap();
+        assert_eq!(predicate, Reference::new("foo").equal_to(Datum::long(1)));
     }
 
     #[test]

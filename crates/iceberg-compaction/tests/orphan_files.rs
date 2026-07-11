@@ -131,10 +131,9 @@ async fn seed_table(warehouse: &TempDir) -> (impl Catalog, Table) {
         )])),
     ]));
     for (i, ids) in [vec![1, 2, 3, 4], vec![5, 6, 7, 8]].into_iter().enumerate() {
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            ids,
-        ))])
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(ids))])
+                .unwrap();
         let files = write_one_data_file(&table, &format!("data-{i}"), batch).await;
         let tx = Transaction::new(&table);
         table = tx

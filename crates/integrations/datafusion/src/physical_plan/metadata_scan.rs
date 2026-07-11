@@ -62,7 +62,6 @@ impl ExecutionPlan for IcebergMetadataScan {
         "IcebergMetadataScan"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

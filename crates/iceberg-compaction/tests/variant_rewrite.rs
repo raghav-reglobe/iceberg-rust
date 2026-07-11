@@ -488,6 +488,23 @@ async fn doc_children_of(table: &Table, path: &str) -> Vec<String> {
         parquet::basic::Compression::ZSTD(Default::default()),
         "rewrite output must honor the table's compression codec"
     );
+    // Rewritten variant columns — canonical AND shredded — must carry the
+    // parquet VARIANT logical-type annotation, or readers see a raw struct.
+    let parquet_doc = reader
+        .metadata()
+        .file_metadata()
+        .schema()
+        .get_fields()
+        .iter()
+        .find(|f| f.name() == "doc")
+        .expect("doc column in parquet schema");
+    assert!(
+        matches!(
+            parquet_doc.get_basic_info().logical_type_ref(),
+            Some(parquet::basic::LogicalType::Variant { .. })
+        ),
+        "rewrite output must annotate variant columns"
+    );
     let field = reader
         .schema()
         .field_with_name("doc")

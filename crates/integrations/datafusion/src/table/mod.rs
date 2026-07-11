@@ -110,7 +110,6 @@ impl IcebergTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -328,7 +327,6 @@ impl IcebergStaticTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -779,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_plan_fanout_enabled_no_sort() {
         use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
+        use datafusion::logical_expr::dml::InsertOp;
         use datafusion::physical_plan::empty::EmptyExec;
 
         // When fanout is enabled (default), no sort node should be added
@@ -811,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_plan_fanout_disabled_has_sort() {
         use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
+        use datafusion::logical_expr::dml::InsertOp;
         use datafusion::physical_plan::empty::EmptyExec;
 
         // When fanout is disabled, a sort node should be added

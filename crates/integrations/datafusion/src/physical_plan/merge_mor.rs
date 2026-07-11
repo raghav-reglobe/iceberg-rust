@@ -37,7 +37,6 @@
 //! superseding DV (prior deleted positions unioned in, prior DV removed in
 //! the same commit) — never a second live DV per data file.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -62,7 +61,10 @@ use datafusion::physical_plan::{
     execute_input_stream,
 };
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema};
+use iceberg::Catalog;
+use iceberg::arrow::{
+    PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
+};
 use iceberg::delete_vector::DeleteVector;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::scan::FileScanTask;
@@ -78,8 +80,6 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::Catalog;
-use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
 use uuid::Uuid;
 
@@ -88,6 +88,15 @@ use crate::to_datafusion_error;
 
 /// Name of the clause-routing column appended by [`IcebergMorMergeExec`].
 pub(crate) const MOR_CLAUSE_COL: &str = "__mor_clause";
+
+/// Rows per processing chunk inside the write node. The hash join emits its
+/// unmatched-build output — the entire NOT MATCHED (insert) set — as ONE
+/// batch, bypassing the output coalescer's target size. Processing that
+/// whole defeats file rolling (the rolling writer only checks size between
+/// write calls) and multiplies wide-row memory through every filter /
+/// evaluate / cast copy. Slicing is zero-copy; everything downstream then
+/// works on bounded rows.
+const MOR_WRITE_CHUNK_ROWS: usize = 8192;
 
 /// A WHEN clause with its expressions bound to the join output schema.
 #[derive(Debug, Clone)]
@@ -202,7 +211,10 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
             if let Some(id) = snapshot_id {
                 builder = builder.snapshot_id(id);
             }
-            let scan = builder.select(select).build().map_err(to_datafusion_error)?;
+            let scan = builder
+                .select(select)
+                .build()
+                .map_err(to_datafusion_error)?;
             let stream = scan.to_arrow().await.map_err(to_datafusion_error)?;
             let out = stream.map(move |batch| {
                 let batch = batch.map_err(to_datafusion_error)?;
@@ -227,9 +239,8 @@ fn plain_cast_batch(batch: &RecordBatch, schema: &ArrowSchemaRef) -> DFResult<Re
             columns.push(cast(col.as_ref(), field.data_type())?);
         }
     }
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|e| {
-        DataFusionError::ArrowError(Box::new(e), Some("cast scan batch".to_string()))
-    })
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), Some("cast scan batch".to_string())))
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +368,11 @@ impl ExecutionPlan for IcebergMorMergeExec {
             .partition_count()
             > 1
         {
-            Arc::new(datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
-                Arc::clone(&self.source),
-            )) as Arc<dyn ExecutionPlan>
+            Arc::new(
+                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                    Arc::clone(&self.source),
+                ),
+            ) as Arc<dyn ExecutionPlan>
         } else {
             Arc::clone(&self.source)
         };
@@ -593,7 +606,15 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
 
         let run_schema = Arc::clone(&result_schema);
         let stream = futures::stream::once(async move {
-            run_mor_write(table, snapshot_id, input, input_schema, &clauses, &run_schema).await
+            run_mor_write(
+                table,
+                snapshot_id,
+                input,
+                input_schema,
+                &clauses,
+                &run_schema,
+            )
+            .await
         })
         .boxed();
 
@@ -627,10 +648,9 @@ async fn run_mor_write(
         .metadata()
         .table_properties()
         .map_err(to_datafusion_error)?;
-    let file_format = <DataFileFormat as std::str::FromStr>::from_str(
-        &table_props.write_format_default,
-    )
-    .map_err(to_datafusion_error)?;
+    let file_format =
+        <DataFileFormat as std::str::FromStr>::from_str(&table_props.write_format_default)
+            .map_err(to_datafusion_error)?;
     if file_format != DataFileFormat::Parquet {
         return Err(to_datafusion_error(iceberg::Error::new(
             iceberg::ErrorKind::FeatureUnsupported,
@@ -638,8 +658,11 @@ async fn run_mor_write(
         )));
     }
 
+    // Derive writer properties from the table's write.parquet.* settings —
+    // parquet-rs defaults are UNCOMPRESSED, which inflates real merge output
+    // ~20x and was the bulk of an oversized single-file write at soak scale.
     let parquet_writer_builder =
-        ParquetWriterBuilder::new(WriterProperties::default(), table_schema.clone());
+        ParquetWriterBuilder::from_table_properties(&table_props, table_schema.clone());
     let location_generator =
         DefaultLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -690,53 +713,56 @@ async fn run_mor_write(
     let mut matched: HashMap<(String, u64), MatchedRow> = HashMap::new();
 
     while let Some(batch) = input.try_next().await? {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let clause_arr = batch
-            .column(clause_idx_col)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| DataFusionError::Internal("__mor_clause must be UInt32".into()))?
-            .clone();
+        let mut chunk_start = 0;
+        while chunk_start < batch.num_rows() {
+            let chunk_len = MOR_WRITE_CHUNK_ROWS.min(batch.num_rows() - chunk_start);
+            let chunk = batch.slice(chunk_start, chunk_len);
+            chunk_start += chunk_len;
 
-        for (ci, clause) in clauses.iter().enumerate() {
-            let mask: Vec<bool> = (0..batch.num_rows())
-                .map(|r| clause_arr.is_valid(r) && clause_arr.value(r) == ci as u32)
-                .collect();
-            if !mask.iter().any(|&m| m) {
-                continue;
-            }
-            let mask_arr = datafusion::arrow::array::BooleanArray::from(mask);
-            let subset = filter_record_batch(&batch, &mask_arr)?;
+            let clause_arr = chunk
+                .column(clause_idx_col)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| DataFusionError::Internal("__mor_clause must be UInt32".into()))?
+                .clone();
 
-            match &clause.action {
-                MorActionPlan::Insert(assignments) => {
-                    let out = build_full_rows(&subset, assignments, &table_arrow, None)?;
-                    let out = with_partition_column(out, partition_calc.as_ref())?;
-                    writer.write(out).await.map_err(to_datafusion_error)?;
+            for (ci, clause) in clauses.iter().enumerate() {
+                let mask: Vec<bool> = (0..chunk.num_rows())
+                    .map(|r| clause_arr.is_valid(r) && clause_arr.value(r) == ci as u32)
+                    .collect();
+                if !mask.iter().any(|&m| m) {
+                    continue;
                 }
-                MorActionPlan::Update(assignments) => {
-                    // Evaluate SET values now (they reference join columns);
-                    // the full old row arrives with the late fetch.
-                    let mut evaluated: Vec<ArrayRef> = Vec::with_capacity(assignments.len());
-                    for (_, expr) in assignments {
-                        evaluated
-                            .push(expr.evaluate(&subset)?.into_array(subset.num_rows())?);
+                let mask_arr = datafusion::arrow::array::BooleanArray::from(mask);
+                let subset = filter_record_batch(&chunk, &mask_arr)?;
+
+                match &clause.action {
+                    MorActionPlan::Insert(assignments) => {
+                        let out = build_full_rows(&subset, assignments, &table_arrow, None)?;
+                        let out = with_partition_column(out, partition_calc.as_ref())?;
+                        writer.write(out).await.map_err(to_datafusion_error)?;
                     }
-                    record_matched(
-                        &subset,
-                        file_idx,
-                        pos_idx,
-                        ci as u32,
-                        update_store_rows[ci],
-                        &mut matched,
-                    )?;
-                    update_store_rows[ci] += subset.num_rows();
-                    update_stores[ci].push(evaluated);
-                }
-                MorActionPlan::Delete => {
-                    record_matched(&subset, file_idx, pos_idx, ci as u32, 0, &mut matched)?;
+                    MorActionPlan::Update(assignments) => {
+                        // Evaluate SET values now (they reference join columns);
+                        // the full old row arrives with the late fetch.
+                        let mut evaluated: Vec<ArrayRef> = Vec::with_capacity(assignments.len());
+                        for (_, expr) in assignments {
+                            evaluated.push(expr.evaluate(&subset)?.into_array(subset.num_rows())?);
+                        }
+                        record_matched(
+                            &subset,
+                            file_idx,
+                            pos_idx,
+                            ci as u32,
+                            update_store_rows[ci],
+                            &mut matched,
+                        )?;
+                        update_store_rows[ci] += subset.num_rows();
+                        update_stores[ci].push(evaluated);
+                    }
+                    MorActionPlan::Delete => {
+                        record_matched(&subset, file_idx, pos_idx, ci as u32, 0, &mut matched)?;
+                    }
                 }
             }
         }
@@ -796,8 +822,7 @@ async fn run_mor_write(
             .filter(|t| affected.contains(t.data_file_path()))
             .collect();
         {
-            let planned: HashSet<&str> =
-                fetch_tasks.iter().map(|t| t.data_file_path()).collect();
+            let planned: HashSet<&str> = fetch_tasks.iter().map(|t| t.data_file_path()).collect();
             if let Some((missing, _)) = matched.keys().find(|(f, _)| !planned.contains(f.as_str()))
             {
                 return Err(DataFusionError::Internal(format!(
@@ -862,18 +887,14 @@ async fn run_mor_write(
             for row in 0..fbatch.num_rows() {
                 let file = file_arr.value(row);
                 let pos = pos_arr.value(row) as u64;
-                alive
-                    .entry(file.to_string())
-                    .or_default()
-                    .insert(pos);
-                if let Some(m) = matched.get(&(file.to_string(), pos)) {
-                    if clauses
+                alive.entry(file.to_string()).or_default().insert(pos);
+                if let Some(m) = matched.get(&(file.to_string(), pos))
+                    && clauses
                         .get(m.clause as usize)
                         .is_some_and(|c| matches!(c.action, MorActionPlan::Update(_)))
-                    {
-                        fetch_rows.push(row as u32);
-                        stored.push(*m);
-                    }
+                {
+                    fetch_rows.push(row as u32);
+                    stored.push(*m);
                 }
             }
             if fetch_rows.is_empty() {
@@ -889,28 +910,24 @@ async fn run_mor_write(
                 e.1.push(m.update_row as u64);
             }
             for (clause, (rows, store_rows)) in by_clause {
-                let MorActionPlan::Update(assignments) = &clauses[clause as usize].action
-                else {
+                let MorActionPlan::Update(assignments) = &clauses[clause as usize].action else {
                     unreachable!("only update clauses collect fetch rows");
                 };
                 let take_idx = UInt32Array::from(rows);
                 let store_idx = UInt64Array::from(store_rows);
-                let mut columns: Vec<ArrayRef> =
-                    Vec::with_capacity(table_arrow.fields().len());
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_arrow.fields().len());
                 for field in table_arrow.fields() {
                     let assigned = assignments
                         .iter()
                         .position(|(name, _)| name == field.name());
                     let arr = match assigned {
-                        Some(a) => take(
-                            update_values[clause as usize][a].as_ref(),
-                            &store_idx,
-                            None,
-                        )?,
+                        Some(a) => {
+                            take(update_values[clause as usize][a].as_ref(), &store_idx, None)?
+                        }
                         None => {
-                            let src_idx = fb_schema.index_of(field.name()).map_err(|e| {
-                                DataFusionError::ArrowError(Box::new(e), None)
-                            })?;
+                            let src_idx = fb_schema
+                                .index_of(field.name())
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                             take(fbatch.column(src_idx).as_ref(), &take_idx, None)?
                         }
                     };
@@ -954,13 +971,7 @@ async fn run_mor_write(
                 .unwrap_or_else(|| table.metadata().default_partition_spec_id());
             let dv_path = format!("{location}/data/{}-deletes.puffin", Uuid::now_v7());
             let dv_file = DeleteVector::new(bitmap)
-                .write_to_puffin_file(
-                    table.file_io(),
-                    dv_path,
-                    file.clone(),
-                    partition,
-                    spec_id,
-                )
+                .write_to_puffin_file(table.file_io(), dv_path, file.clone(), partition, spec_id)
                 .await
                 .map_err(to_datafusion_error)?;
             new_delete_files.push(dv_file);
@@ -973,8 +984,7 @@ async fn run_mor_write(
             .flat_map(|t| t.deletes.iter().map(|d| d.file_path.clone()))
             .collect();
         if !prior_paths.is_empty() {
-            removed_delete_files =
-                resolve_delete_files(&table, snapshot_id, &prior_paths).await?;
+            removed_delete_files = resolve_delete_files(&table, snapshot_id, &prior_paths).await?;
         }
     }
 
@@ -1098,7 +1108,6 @@ fn build_full_rows(
     RecordBatch::try_new(Arc::clone(table_arrow), columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
-
 
 /// Resolve delete-file paths to their manifest `DataFile` entries in the
 /// pinned snapshot (needed by `RowDelta::remove_delete_files`).
@@ -1268,9 +1277,7 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 let lane = |name: &str| -> DFResult<Vec<DataFile>> {
                     let arr = batch
                         .column_by_name(name)
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!("missing '{name}' lane"))
-                        })?
+                        .ok_or_else(|| DataFusionError::Internal(format!("missing '{name}' lane")))?
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
@@ -1335,9 +1342,9 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
 
 impl IcebergMorMergeCommitExec {
     fn make_count_batch(schema: &ArrowSchemaRef, count: u64) -> DFResult<RecordBatch> {
-        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(UInt64Array::from(vec![
-            count,
-        ])) as ArrayRef])
+        RecordBatch::try_new(Arc::clone(schema), vec![
+            Arc::new(UInt64Array::from(vec![count])) as ArrayRef,
+        ])
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }

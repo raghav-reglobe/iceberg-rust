@@ -22,23 +22,22 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
-    MEMORY_CATALOG_WAREHOUSE,
+    Catalog, CatalogBuilder, MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder, NamespaceIdent,
+    TableCreation, TableIdent,
 };
+use iceberg_compaction::config::Config;
+use iceberg_compaction::engine::compact_table;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
-
-use iceberg_compaction::config::Config;
-use iceberg_compaction::engine::compact_table;
 
 /// min_input_files=1 + delete_file_threshold=1 so a single delete-bearing file
 /// is a candidate and forms a group.
@@ -59,7 +58,10 @@ async fn write_one_data_file(table: &Table, batch: RecordBatch) -> Vec<DataFile>
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
         DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet),
     );
-    let mut writer = DataFileWriterBuilder::new(rolling).build(None).await.unwrap();
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .unwrap();
     writer.write(batch).await.unwrap();
     writer.close().await.unwrap()
 }
@@ -147,13 +149,16 @@ async fn table_with_dv(warehouse: &TempDir) -> (impl Catalog, TableIdent) {
         .unwrap();
 
     // data file id=[1,2,3,4] -> fast_append
-    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)
-        .with_metadata(HashMap::from([(
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
             PARQUET_FIELD_ID_META_KEY.to_string(),
             "1".to_string(),
-        )]))]));
-    let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))])
-        .unwrap();
+        )])),
+    ]));
+    let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
+        1, 2, 3, 4,
+    ]))])
+    .unwrap();
     let data_files = write_one_data_file(&table, batch).await;
     let data_file_path = data_files[0].file_path().to_string();
     let tx = Transaction::new(&table);
@@ -191,7 +196,11 @@ async fn table_with_dv(warehouse: &TempDir) -> (impl Catalog, TableIdent) {
         .await
         .unwrap();
     assert_eq!(live_row_count(&table).await, 3, "DV drops id=1");
-    assert_eq!(delete_file_count(&table).await, 1, "DV present pre-compaction");
+    assert_eq!(
+        delete_file_count(&table).await,
+        1,
+        "DV present pre-compaction"
+    );
 
     (catalog, ident)
 }

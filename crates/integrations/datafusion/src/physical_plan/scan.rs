@@ -70,7 +70,7 @@ impl IcebergTableScan {
         };
         let plan_properties = Self::compute_properties(output_schema.clone());
         let projection = get_column_names(schema.clone(), projection);
-        let predicates = convert_filters_to_predicate(filters);
+        let predicates = convert_filters_to_predicate(&schema, filters);
 
         Self {
             table,
@@ -120,7 +120,6 @@ impl ExecutionPlan for IcebergTableScan {
     fn name(&self) -> &str {
         "IcebergTableScan"
     }
-
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]

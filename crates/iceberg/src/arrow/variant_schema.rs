@@ -317,7 +317,7 @@ mod tests {
             schema_of_variant(&Variant::try_new(&m, &v).unwrap()),
             DataType::Utf8
         );
-        let (m, v) = build(|b| b.append_value(3.14f64));
+        let (m, v) = build(|b| b.append_value(2.75f64));
         assert_eq!(
             schema_of_variant(&Variant::try_new(&m, &v).unwrap()),
             DataType::Float64

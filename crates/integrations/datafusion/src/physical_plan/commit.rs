@@ -128,7 +128,6 @@ impl ExecutionPlan for IcebergCommitExec {
         "IcebergCommitExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -326,7 +325,6 @@ mod tests {
         fn name(&self) -> &str {
             "MockWriteExec"
         }
-
 
         fn schema(&self) -> Arc<ArrowSchema> {
             self.schema.clone()

@@ -24,9 +24,10 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use itertools::Itertools;
-use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
+use parquet::arrow::{AsyncArrowWriter, PARQUET_FIELD_ID_META_KEY};
+use parquet::basic::Compression;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
@@ -101,7 +102,10 @@ impl ParquetWriterBuilder {
     /// schema, translating `write.parquet.*` settings into `WriterProperties`
     /// instead of using parquet-rs defaults.
     ///
-    /// Currently translates the content-defined-chunking keys
+    /// Currently translates the compression keys
+    /// (`write.parquet.compression-codec` + `write.parquet.compression-level`,
+    /// defaulting to zstd — parquet-rs's own default is UNCOMPRESSED) and the
+    /// content-defined-chunking keys
     /// (`write.parquet.content-defined-chunking.*`); other keys fall back to
     /// parquet-rs defaults.
     pub fn from_table_properties(table_props: &TableProperties, schema: SchemaRef) -> Self {
@@ -110,10 +114,11 @@ impl ParquetWriterBuilder {
             max_chunk_size: table_props.cdc_max_chunk_size,
             norm_level: table_props.cdc_norm_level,
         });
-        // TODO: translate the remaining write.parquet.* keys (e.g. compression-codec,
+        // TODO: translate the remaining write.parquet.* keys (e.g.
         // row-group-size-bytes, page-size-bytes).
         // This constructor is intended to be the single place that maps them.
         let props = WriterProperties::builder()
+            .set_compression(compression_from_table_properties(table_props))
             .set_content_defined_chunking(cdc)
             .build();
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
@@ -268,6 +273,106 @@ impl SchemaVisitor for IndexByParquetPathName {
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
         self.insert_current_path()
     }
+}
+
+/// Translate `write.parquet.compression-codec` (+ optional
+/// `write.parquet.compression-level`) into a parquet [`Compression`],
+/// defaulting to ZSTD — the Iceberg default. parquet-rs's own writer default
+/// is UNCOMPRESSED, which silently inflates output ~20x on real tables.
+fn compression_from_table_properties(table_props: &TableProperties) -> Compression {
+    use parquet::basic::{BrotliLevel, GzipLevel, ZstdLevel};
+    let level = table_props.parquet_compression_level;
+    match table_props
+        .parquet_compression_codec
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "uncompressed" => Compression::UNCOMPRESSED,
+        "snappy" => Compression::SNAPPY,
+        "gzip" => Compression::GZIP(
+            level
+                .and_then(|l| u32::try_from(l).ok())
+                .and_then(|l| GzipLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        "lz4" => Compression::LZ4,
+        "brotli" => Compression::BROTLI(
+            level
+                .and_then(|l| u32::try_from(l).ok())
+                .and_then(|l| BrotliLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        _ => Compression::ZSTD(
+            level
+                .and_then(|l| ZstdLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Stamp the parquet Variant extension type (`arrow.parquet.variant`) on every
+/// arrow field whose Iceberg type is `variant` (matched by field id, recursing
+/// through structs/lists/maps). The parquet writer derives its file schema from
+/// the arrow schema, and only fields carrying this extension get the `VARIANT`
+/// logical-type annotation — without it, readers see a raw
+/// `{metadata, value}` group and cannot recognize the column as a variant.
+fn stamp_variant_extensions(
+    schema: &Schema,
+    arrow_schema: ArrowSchemaRef,
+) -> Result<ArrowSchemaRef> {
+    fn stamp_field(schema: &Schema, field: &arrow_schema::Field) -> Result<arrow_schema::Field> {
+        let is_variant = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+            .and_then(|id| schema.field_by_id(id))
+            .is_some_and(|f| matches!(f.field_type.as_ref(), Type::Variant(_)));
+        if is_variant {
+            let mut stamped = field.clone();
+            stamped
+                .try_with_extension_type(parquet::variant::VariantType)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("cannot mark column {} as a variant", field.name()),
+                    )
+                    .with_source(e)
+                })?;
+            return Ok(stamped);
+        }
+        // Not a variant — recurse into nested children (a variant's own
+        // sub-fields carry no field ids, so recursion never descends into one).
+        let new_type = match field.data_type() {
+            arrow_schema::DataType::Struct(children) => {
+                let stamped: Vec<arrow_schema::FieldRef> = children
+                    .iter()
+                    .map(|c| stamp_field(schema, c).map(Arc::new))
+                    .collect::<Result<_>>()?;
+                arrow_schema::DataType::Struct(stamped.into())
+            }
+            arrow_schema::DataType::List(child) => {
+                arrow_schema::DataType::List(Arc::new(stamp_field(schema, child)?))
+            }
+            arrow_schema::DataType::LargeList(child) => {
+                arrow_schema::DataType::LargeList(Arc::new(stamp_field(schema, child)?))
+            }
+            arrow_schema::DataType::Map(entries, sorted) => {
+                arrow_schema::DataType::Map(Arc::new(stamp_field(schema, entries)?), *sorted)
+            }
+            _ => return Ok(field.clone()),
+        };
+        Ok(field.clone().with_data_type(new_type))
+    }
+
+    let fields: Vec<arrow_schema::FieldRef> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| stamp_field(schema, f).map(Arc::new))
+        .collect::<Result<_>>()?;
+    Ok(Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        arrow_schema.metadata().clone(),
+    )))
 }
 
 /// Rewrite the writer's arrow schema so the named variant columns use their
@@ -615,6 +720,11 @@ impl FileWriter for ParquetWriter {
             } else {
                 apply_variant_shred_types(&self.schema, arrow_schema, &self.variant_shred_types)?
             };
+            // Variant columns must carry the extension type so the parquet
+            // schema gets the VARIANT logical-type annotation (canonical and
+            // shredded alike) — applied after the shred override so both
+            // layouts are stamped.
+            let arrow_schema = stamp_variant_extensions(&self.schema, arrow_schema)?;
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
@@ -2498,5 +2608,125 @@ mod tests {
         assert_eq!(cdc.min_chunk_size, 4096);
         assert_eq!(cdc.max_chunk_size, 8192);
         assert_eq!(cdc.norm_level, 2);
+    }
+
+    #[tokio::test]
+    async fn test_variant_column_gets_variant_logical_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "doc", Type::Variant(VariantType)).into(),
+                    NestedField::optional(
+                        3,
+                        "plain",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::required(4, "x", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let canonical_fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]);
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        // Row 0 carries a variant NULL VALUE; row 1 is an SQL null.
+        let doc = StructArray::new(
+            canonical_fields,
+            vec![
+                Arc::new(arrow_array::BinaryArray::from_iter_values([
+                    vec![0x11u8, 0x00, 0x00],
+                    vec![],
+                ])) as ArrayRef,
+                Arc::new(arrow_array::BinaryArray::from_iter_values([
+                    vec![0x00u8],
+                    vec![],
+                ])) as ArrayRef,
+            ],
+            Some(arrow_buffer::NullBuffer::from(vec![true, false])),
+        );
+        let DataType::Struct(plain_fields) = arrow_schema
+            .field_with_name("plain")
+            .unwrap()
+            .data_type()
+            .clone()
+        else {
+            panic!("plain is a struct");
+        };
+        let plain = StructArray::new(
+            plain_fields,
+            vec![Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(doc),
+            Arc::new(plain),
+        ])
+        .unwrap();
+
+        let path = format!("{}/variant.parquet", temp_dir.path().to_str().unwrap());
+        let mut writer = ParquetWriterBuilder::new(WriterProperties::default(), schema)
+            .build(file_io.new_output(&path).unwrap())
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let fields = reader.metadata().file_metadata().schema().get_fields();
+        let logical = |name: &str| {
+            fields
+                .iter()
+                .find(|f| f.name() == name)
+                .unwrap()
+                .get_basic_info()
+                .logical_type_ref()
+        };
+        assert!(
+            matches!(
+                logical("doc"),
+                Some(parquet::basic::LogicalType::Variant { .. })
+            ),
+            "variant column must carry the VARIANT logical type"
+        );
+        assert_eq!(
+            logical("plain"),
+            None,
+            "a plain struct column must NOT be annotated"
+        );
+
+        // Null semantics round-trip: the variant-null VALUE stays a non-null
+        // row; the SQL null stays a null group.
+        let batches: Vec<_> = reader.build().unwrap().map(|b| b.unwrap()).collect();
+        let read_doc = batches[0]
+            .column_by_name("doc")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone();
+        assert!(!read_doc.is_null(0));
+        assert!(read_doc.is_null(1));
+        let vals = read_doc
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(vals.value(0), [0x00], "variant-null bytes are verbatim");
     }
 }

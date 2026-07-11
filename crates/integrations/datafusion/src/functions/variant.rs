@@ -180,7 +180,6 @@ impl VariantGetUdf {
 }
 
 impl ScalarUDFImpl for VariantGetUdf {
-
     fn name(&self) -> &str {
         self.name
     }
@@ -236,7 +235,6 @@ impl VariantToJsonUdf {
 }
 
 impl ScalarUDFImpl for VariantToJsonUdf {
-
     fn name(&self) -> &str {
         "variant_to_json"
     }
@@ -283,7 +281,6 @@ impl JsonToVariantUdf {
 }
 
 impl ScalarUDFImpl for JsonToVariantUdf {
-
     fn name(&self) -> &str {
         "json_to_variant"
     }

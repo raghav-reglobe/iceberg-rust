@@ -125,6 +125,11 @@ pub struct TableProperties {
     pub min_snapshots_to_keep: usize,
     /// Default maximum age of a snapshot reference to keep when expiring snapshots.
     pub max_ref_age_ms: i64,
+    /// Compression codec for parquet data files (`write.parquet.compression-codec`).
+    pub parquet_compression_codec: String,
+    /// Compression level for parquet data files (`write.parquet.compression-level`),
+    /// `None` when unset (codec default applies).
+    pub parquet_compression_level: Option<i32>,
     /// Whether content-defined chunking is enabled.
     /// `true` only when `write.parquet.content-defined-chunking.enabled = "true"`.
     pub cdc_enabled: bool,
@@ -258,6 +263,14 @@ impl TableProperties {
     /// Default value for history.expire.max-ref-age-ms (effectively never expire refs).
     pub const PROPERTY_MAX_REF_AGE_MS_DEFAULT: i64 = i64::MAX;
 
+    /// Compression codec for parquet data files.
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC: &str = "write.parquet.compression-codec";
+    /// Default parquet compression codec — zstd, the Iceberg default (parquet-rs's
+    /// own writer default is UNCOMPRESSED, which must never be inherited implicitly).
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &str = "zstd";
+    /// Compression level for parquet data files (codec-specific; unset = codec default).
+    pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
+
     /// Enable content-defined chunking with parquet defaults (or per-property overrides).
     pub const PROPERTY_PARQUET_CDC_ENABLED: &str = "write.parquet.content-defined-chunking.enabled";
     /// Default value for content-defined chunking enabled.
@@ -350,6 +363,14 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
                 TableProperties::PROPERTY_MAX_REF_AGE_MS,
                 TableProperties::PROPERTY_MAX_REF_AGE_MS_DEFAULT,
             )?,
+            parquet_compression_codec: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC,
+                TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT.to_string(),
+            )?,
+            parquet_compression_level: props
+                .get(TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL)
+                .and_then(|s| s.parse::<i32>().ok()),
             cdc_enabled: parse_property(
                 props,
                 TableProperties::PROPERTY_PARQUET_CDC_ENABLED,

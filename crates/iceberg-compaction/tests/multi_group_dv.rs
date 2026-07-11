@@ -28,23 +28,22 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
-    MEMORY_CATALOG_WAREHOUSE,
+    Catalog, CatalogBuilder, MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder, NamespaceIdent,
+    TableCreation, TableIdent,
 };
+use iceberg_compaction::config::Config;
+use iceberg_compaction::engine::compact_table;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
-
-use iceberg_compaction::config::Config;
-use iceberg_compaction::engine::compact_table;
 
 /// target=1 => each candidate file is its own bin => its own group => its own
 /// commit. min_input_files=1 + delete_file_threshold=1 so every file (undersized
@@ -68,14 +67,17 @@ async fn write_one_data_file(table: &Table, name: &str, ids: Vec<i32>) -> DataFi
         // instance, so a shared prefix would collide all files to one path.
         DefaultFileNameGenerator::new(name.to_string(), None, DataFileFormat::Parquet),
     );
-    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)
-        .with_metadata(HashMap::from([(
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
             PARQUET_FIELD_ID_META_KEY.to_string(),
             "1".to_string(),
-        )]))]));
-    let batch =
-        RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(ids))]).unwrap();
-    let mut writer = DataFileWriterBuilder::new(rolling).build(None).await.unwrap();
+        )])),
+    ]));
+    let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(ids))]).unwrap();
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .unwrap();
     writer.write(batch).await.unwrap();
     let files = writer.close().await.unwrap();
     assert_eq!(files.len(), 1);
@@ -83,7 +85,14 @@ async fn write_one_data_file(table: &Table, name: &str, ids: Vec<i32>) -> DataFi
 }
 
 async fn live_row_count(table: &Table) -> usize {
-    let mut stream = table.scan().select_all().build().unwrap().to_arrow().await.unwrap();
+    let mut stream = table
+        .scan()
+        .select_all()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap();
     let mut n = 0;
     while let Some(b) = stream.try_next().await.unwrap() {
         n += b.num_rows();
@@ -95,7 +104,13 @@ async fn delete_file_count(table: &Table) -> usize {
     let Some(snap) = table.metadata().current_snapshot() else {
         return 0;
     };
-    let bytes = table.file_io().new_input(snap.manifest_list()).unwrap().read().await.unwrap();
+    let bytes = table
+        .file_io()
+        .new_input(snap.manifest_list())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
     let ml = ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
     let mut n = 0;
     for mf in ml.entries() {
@@ -118,7 +133,13 @@ async fn max_dvs_per_file(table: &Table) -> usize {
     let Some(snap) = table.metadata().current_snapshot() else {
         return 0;
     };
-    let bytes = table.file_io().new_input(snap.manifest_list()).unwrap().read().await.unwrap();
+    let bytes = table
+        .file_io()
+        .new_input(snap.manifest_list())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
     let ml = ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for mf in ml.entries() {
@@ -224,7 +245,11 @@ async fn table_with_multiple_dvs(warehouse: &TempDir) -> (impl Catalog, TableIde
     let table = add_dv(table, &catalog, warehouse, c_path, 0, "dv-c").await;
     assert_eq!(live_row_count(&table).await, 10, "DVs drop id=1 and id=7");
     assert_eq!(delete_file_count(&table).await, 2, "2 DVs pre-compaction");
-    assert_eq!(max_dvs_per_file(&table).await, 1, "clean: 1 DV per file pre-compaction");
+    assert_eq!(
+        max_dvs_per_file(&table).await,
+        1,
+        "clean: 1 DV per file pre-compaction"
+    );
 
     (catalog, ident)
 }
@@ -257,7 +282,12 @@ async fn multi_group_reabsorbs_all_dvs_no_multi_dv() {
         "all DVs reabsorbed in the single multi-group commit"
     );
     assert_eq!(
-        table.metadata().current_snapshot().unwrap().summary().operation,
+        table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .operation,
         Operation::Replace,
     );
 }
@@ -336,7 +366,11 @@ async fn survivor_with_dv_untouched_while_others_compacted() {
         .unwrap();
     let table = add_dv(table, &catalog, &warehouse, surv_path, 0, "dv-surv").await;
     let table = add_dv(table, &catalog, &warehouse, small1_path, 0, "dv-small1").await;
-    assert_eq!(live_row_count(&table).await, 5002, "5000 + 2 + 2, minus 2 DV'd rows");
+    assert_eq!(
+        live_row_count(&table).await,
+        5002,
+        "5000 + 2 + 2, minus 2 DV'd rows"
+    );
     assert_eq!(delete_file_count(&table).await, 2);
     assert_eq!(max_dvs_per_file(&table).await, 1);
 
@@ -369,7 +403,13 @@ async fn survivor_with_dv_untouched_while_others_compacted() {
 
 /// Build a deletion vector (drop `pos` from `data_file_path`) WITHOUT committing —
 /// so the caller can add several in one `row_delta` (same manifest) or later remove one.
-async fn build_dv(table: &Table, warehouse: &TempDir, data_file_path: &str, pos: u64, dv_name: &str) -> DataFile {
+async fn build_dv(
+    table: &Table,
+    warehouse: &TempDir,
+    data_file_path: &str,
+    pos: u64,
+    dv_name: &str,
+) -> DataFile {
     let mut positions = RoaringTreemap::new();
     positions.insert(pos);
     let dv_path = format!("{}/{}.puffin", warehouse.path().to_str().unwrap(), dv_name);
@@ -436,7 +476,10 @@ async fn superseded_deleted_dv_not_resurrected_on_rewrite() {
     let s_path = s.file_path().to_string();
     let a_path = a.file_path().to_string();
     let (s_size, a_size) = (s.file_size_in_bytes(), a.file_size_in_bytes());
-    assert!(s_size > a_size, "test setup: S must be larger than A ({s_size} vs {a_size})");
+    assert!(
+        s_size > a_size,
+        "test setup: S must be larger than A ({s_size} vs {a_size})"
+    );
     let tx = Transaction::new(&table);
     let table = tx
         .fast_append()
@@ -459,7 +502,11 @@ async fn superseded_deleted_dv_not_resurrected_on_rewrite() {
         .commit(&catalog)
         .await
         .unwrap();
-    assert_eq!(live_row_count(&table).await, 5000, "dv_s drops 1 of S, dv_a drops 1 of A");
+    assert_eq!(
+        live_row_count(&table).await,
+        5000,
+        "dv_s drops 1 of S, dv_a drops 1 of A"
+    );
 
     // Replace S's DV: remove dv_s + add dv_s2 (a DIFFERENT row) in one row_delta.
     // dv_s becomes a DELETED entry, co-located with dv_a (EXISTING) and dv_s2 (ADDED).
@@ -474,9 +521,21 @@ async fn superseded_deleted_dv_not_resurrected_on_rewrite() {
         .commit(&catalog)
         .await
         .unwrap();
-    assert_eq!(delete_file_count(&table).await, 2, "dv_s2 + dv_a live; dv_s removed");
-    assert_eq!(max_dvs_per_file(&table).await, 1, "clean: one live DV per file");
-    assert_eq!(live_row_count(&table).await, 5000, "dv_s2 drops 1 of S, dv_a drops 1 of A");
+    assert_eq!(
+        delete_file_count(&table).await,
+        2,
+        "dv_s2 + dv_a live; dv_s removed"
+    );
+    assert_eq!(
+        max_dvs_per_file(&table).await,
+        1,
+        "clean: one live DV per file"
+    );
+    assert_eq!(
+        live_row_count(&table).await,
+        5000,
+        "dv_s2 drops 1 of S, dv_a drops 1 of A"
+    );
 
     // Compact A (undersized → candidate). S is optimal with a sub-threshold DV count,
     // so it's a SURVIVOR. The compaction rewrites the delete manifest holding

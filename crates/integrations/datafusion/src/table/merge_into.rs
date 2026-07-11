@@ -70,8 +70,8 @@ pub(crate) async fn build_mor_merge_plan(
         ));
     }
     let snapshot_id = table.metadata().current_snapshot_id();
-    let table_arrow = schema_to_arrow_schema(table.metadata().current_schema())
-        .map_err(to_datafusion_error)?;
+    let table_arrow =
+        schema_to_arrow_schema(table.metadata().current_schema()).map_err(to_datafusion_error)?;
     let target_names: HashSet<String> = table_arrow
         .fields()
         .iter()
