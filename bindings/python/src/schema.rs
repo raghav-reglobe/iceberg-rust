@@ -47,7 +47,7 @@ fn parse_type(s: &str) -> PyResult<Type> {
             return Err(PyValueError::new_err(format!(
                 "unsupported add_column type `{other}` (expected one of \
                  variant/string/long/int/double/boolean/timestamp/date)"
-            )))
+            )));
         }
     })
 }

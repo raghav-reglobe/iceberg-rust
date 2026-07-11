@@ -76,7 +76,9 @@ fn infer_variant_schema(
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
                 .load(catalog_name.clone(), catalog_props)
                 .await
-                .map_err(|e| PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}")))?;
+                .map_err(|e| {
+                    PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}"))
+                })?;
             let namespace =
                 NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
             let ident = TableIdent::new(namespace, table_name);
@@ -111,9 +113,7 @@ fn infer_variant_schema(
                     )));
                 };
                 let variant_array = VariantArray::try_new(col.as_ref()).map_err(|e| {
-                    PyValueError::new_err(format!(
-                        "column `{column}` is not a Variant column: {e}"
-                    ))
+                    PyValueError::new_err(format!("column `{column}` is not a Variant column: {e}"))
                 })?;
                 for i in 0..variant_array.len() {
                     if variant_array.is_null(i) {

@@ -167,7 +167,10 @@ fn rewrite_manifests(
                 Ok(new_table) => {
                     let mut out = HashMap::new();
                     if let Some(snapshot) = new_table.metadata().current_snapshot() {
-                        out.insert("snapshot-id".to_string(), snapshot.snapshot_id().to_string());
+                        out.insert(
+                            "snapshot-id".to_string(),
+                            snapshot.snapshot_id().to_string(),
+                        );
                         for key in [
                             "manifests-replaced",
                             "manifests-created",

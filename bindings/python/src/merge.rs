@@ -231,10 +231,74 @@ fn dry_run_inspect(
     })
 }
 
+/// Run one READ-ONLY SQL statement and return its rows as a JSON array
+/// string — the query twin of [`merge_into`], for harnesses, referees and
+/// parity checks. DML/DDL/COPY plans are rejected before execution; the
+/// result is capped at `max_rows` (error, not truncation — a capped result
+/// silently read as complete is worse than a loud failure). `scan_files`
+/// bounds named tables' scans exactly as in [`merge_into`]. Columns must be
+/// JSON-serializable by the arrow JSON writer — wrap variant/binary columns
+/// in `variant_to_json(...)` in the statement.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000))]
+fn sql_collect(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
+    max_rows: usize,
+) -> PyResult<String> {
+    use datafusion::logical_expr::LogicalPlan;
+
+    let scan_files = parse_scan_files(scan_files)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let ctx = session_with_catalogs(catalogs, scan_files).await?;
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("planning query: {e}")))?;
+            if matches!(
+                df.logical_plan(),
+                LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Copy(_)
+            ) {
+                return Err(PyValueError::new_err(
+                    "sql_collect is read-only — use merge_into for writes",
+                ));
+            }
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("executing query: {e}")))?;
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if total > max_rows {
+                return Err(PyValueError::new_err(format!(
+                    "result has {total} rows > max_rows={max_rows} — narrow the query or raise the cap"
+                )));
+            }
+            let mut buf = Vec::new();
+            {
+                let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+                for batch in &batches {
+                    writer
+                        .write(batch)
+                        .map_err(|e| PyValueError::new_err(format!("serializing rows: {e}")))?;
+                }
+                writer
+                    .finish()
+                    .map_err(|e| PyValueError::new_err(format!("serializing rows: {e}")))?;
+            }
+            String::from_utf8(buf)
+                .map_err(|e| PyValueError::new_err(format!("serializing rows: {e}")))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "merge")?;
     this.add_function(wrap_pyfunction!(merge_into, &this)?)?;
     this.add_function(wrap_pyfunction!(dry_run_inspect, &this)?)?;
+    this.add_function(wrap_pyfunction!(sql_collect, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }

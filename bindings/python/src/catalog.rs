@@ -86,9 +86,10 @@ fn create_table(
         .map_err(|e| PyValueError::new_err(format!("parsing schema_json: {e}")))?;
 
     let partition_spec: Option<UnboundPartitionSpec> = match partition_spec_json {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            PyValueError::new_err(format!("parsing partition_spec_json: {e}"))
-        })?),
+        Some(s) => Some(
+            serde_json::from_str(&s)
+                .map_err(|e| PyValueError::new_err(format!("parsing partition_spec_json: {e}")))?,
+        ),
         None => None,
     };
     let sort_order: Option<SortOrder> = match sort_order_json {
