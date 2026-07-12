@@ -739,3 +739,127 @@ async fn shred_write_flag_is_a_noop_on_canonical_input() {
     );
     assert_eq!(live_docs_as_json(&table).await, jsons_of(&rows));
 }
+
+/// ARRAY-shredded input: with `Config::shred_variants`, an input file whose
+/// `typed_value` carries an array node (`tags: List<{value?, typed_value}>`)
+/// keeps its array shredding through the rewrite — the derivation covers
+/// arrays, not just objects and primitives.
+#[tokio::test]
+async fn compaction_shred_write_preserves_array_shredding() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
+
+    let doc_with_tags = |a: i64, tags: &[i64]| -> VariantBytes {
+        let mut b = VariantBuilder::new();
+        let mut obj = b.new_object();
+        obj.insert("a", a);
+        let mut list = obj.new_list("tags");
+        for t in tags {
+            list.append_value(*t);
+        }
+        list.finish();
+        obj.finish();
+        b.finish()
+    };
+    let rows: Vec<(i32, Option<VariantBytes>)> = vec![
+        (1, Some(doc_with_tags(1, &[10, 11]))),
+        (2, Some(doc_with_tags(2, &[]))),
+        (3, None),
+    ];
+
+    // Shred on {a: Int64, tags: List<Int64>} and land it as a raw file — the
+    // layout an array-shredding engine writes.
+    let mut b = VariantArrayBuilder::new(rows.len());
+    for (_, v) in &rows {
+        match v {
+            None => b.append_null(),
+            Some((m, val)) => b.append_variant(Variant::try_new(m, val).unwrap()),
+        }
+    }
+    let plain = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+            true,
+        ),
+    ]));
+    let shredded = shred_variant(&b.build(), &plain).unwrap();
+    let doc = ArrayRef::from(shredded);
+    let ids = Int32Array::from(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("doc", doc.data_type().clone(), true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
+    ]));
+    let seed = RecordBatch::try_new(schema, vec![Arc::new(ids), doc]).unwrap();
+    let file1 = write_raw_data_file(&table, "arr1", seed).await;
+    // A second undersized file so the plan has something to binpack.
+    let file2 = write_raw_data_file(
+        &table,
+        "arr2",
+        shredded_batch(&[(4, Some(variant_object()))]),
+    )
+    .await;
+    let tx = Transaction::new(&table);
+    let table = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+    let mut seeded = rows.clone();
+    seeded.push((4, Some(variant_object())));
+    let expected_json = jsons_of(&seeded);
+    assert_eq!(live_docs_as_json(&table).await, expected_json);
+
+    let cfg = Config {
+        shred_variants: true,
+        ..aggressive_cfg()
+    };
+    compact_table(&catalog, &ident, &cfg).await.unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let paths = live_data_file_paths(&table).await;
+    assert_eq!(paths.len(), 1);
+    let doc_type = doc_type_of(&table, &paths[0]).await;
+    let DataType::Struct(children) = &doc_type else {
+        panic!("doc is not a struct: {doc_type:?}");
+    };
+    let tv = children
+        .iter()
+        .find(|f| f.name() == "typed_value")
+        .expect("output is shredded");
+    let DataType::Struct(tv_children) = tv.data_type() else {
+        panic!("typed_value is not a struct: {:?}", tv.data_type());
+    };
+    // The FIRST input file's layout wins (derivation reads one footer):
+    // both `a` and the ARRAY `tags` survive.
+    let tags_node = tv_children
+        .iter()
+        .find(|f| f.name() == "tags")
+        .expect("array field survives the rewrite");
+    let DataType::Struct(tags_children) = tags_node.data_type() else {
+        panic!("tags is not a shred node: {:?}", tags_node.data_type());
+    };
+    let tags_tv = tags_children
+        .iter()
+        .find(|f| f.name() == "typed_value")
+        .expect("tags carries a typed_value");
+    assert!(
+        matches!(tags_tv.data_type(), DataType::List(_)),
+        "tags typed_value stays a list: {:?}",
+        tags_tv.data_type()
+    );
+
+    // Values still read back semantically equal through the fold.
+    assert_eq!(live_docs_as_json(&table).await, expected_json);
+}

@@ -130,6 +130,9 @@ pub struct TableProperties {
     /// Compression level for parquet data files (`write.parquet.compression-level`),
     /// `None` when unset (codec default applies).
     pub parquet_compression_level: Option<i32>,
+    /// Whether variant columns are written SHREDDED (`write.parquet.shred-variants`),
+    /// deriving the shredding layout from existing data files.
+    pub parquet_shred_variants: bool,
     /// Whether content-defined chunking is enabled.
     /// `true` only when `write.parquet.content-defined-chunking.enabled = "true"`.
     pub cdc_enabled: bool,
@@ -271,6 +274,14 @@ impl TableProperties {
     /// Compression level for parquet data files (codec-specific; unset = codec default).
     pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
 
+    /// Write variant columns SHREDDED (a `typed_value` subtree readers can
+    /// prune into) instead of the canonical `{metadata, value}` pair, deriving
+    /// each column's shredding from existing data files (shred-preserving —
+    /// the layout is never invented, only carried forward).
+    pub const PROPERTY_PARQUET_SHRED_VARIANTS: &str = "write.parquet.shred-variants";
+    /// Default value for shred-variants (canonical output).
+    pub const PROPERTY_PARQUET_SHRED_VARIANTS_DEFAULT: bool = false;
+
     /// Enable content-defined chunking with parquet defaults (or per-property overrides).
     pub const PROPERTY_PARQUET_CDC_ENABLED: &str = "write.parquet.content-defined-chunking.enabled";
     /// Default value for content-defined chunking enabled.
@@ -371,6 +382,11 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
             parquet_compression_level: props
                 .get(TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL)
                 .and_then(|s| s.parse::<i32>().ok()),
+            parquet_shred_variants: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_SHRED_VARIANTS,
+                TableProperties::PROPERTY_PARQUET_SHRED_VARIANTS_DEFAULT,
+            )?,
             cdc_enabled: parse_property(
                 props,
                 TableProperties::PROPERTY_PARQUET_CDC_ENABLED,
@@ -760,6 +776,18 @@ mod tests {
         assert_eq!(tp.cdc_min_chunk_size, 256 * 1024);
         assert_eq!(tp.cdc_max_chunk_size, 1024 * 1024);
         assert_eq!(tp.cdc_norm_level, 0);
+    }
+
+    #[test]
+    fn test_shred_variants_off_by_default_on_by_flag() {
+        let tp = TableProperties::try_from(&HashMap::new()).unwrap();
+        assert!(!tp.parquet_shred_variants);
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_PARQUET_SHRED_VARIANTS.to_string(),
+            "true".to_string(),
+        )]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(tp.parquet_shred_variants);
     }
 
     #[test]

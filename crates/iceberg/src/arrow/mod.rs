@@ -36,6 +36,8 @@ mod scan_metrics;
 mod value;
 /// Infer + merge Arrow schemas from Variant values (Spark `SchemaOfVariant` port)
 pub mod variant_schema;
+/// Shred-preserving variant WRITE support (derivation + batch shredding)
+pub mod variant_shred;
 
 pub use reader::*;
 pub use scan_metrics::{ScanMetrics, ScanResult};

@@ -61,6 +61,7 @@ use iceberg::{
     TableCreation, TableIdent,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::functions::register_variant_functions;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, LogicalType};
@@ -927,4 +928,489 @@ async fn matched_delete_clause_removes_stale_rows_via_dv() {
     let dvs = live_dvs(&table).await;
     assert_eq!(dvs.len(), 1, "one DV total: {dvs:?}");
     assert_eq!(dvs[0].1, 2, "DV covers the deleted + the demoted row");
+}
+
+/// Shared variant-table scaffold for the shred-write tests: V3 table with a
+/// `doc` variant column, partitioned like real silver, created with the
+/// given properties.
+async fn variant_table(warehouse: &TempDir, props: HashMap<String, String>) -> Arc<dyn Catalog> {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap(),
+    );
+    let ns = NamespaceIdent::new(NS.to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "doc", Type::Variant(VariantType)).into(),
+            NestedField::required(3, "_valid_from", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(4, "_valid_to", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(5, "_is_current", Type::Primitive(PrimitiveType::Boolean)).into(),
+            NestedField::required(6, "_cdc_offset", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .unwrap();
+    let spec = UnboundPartitionSpec::builder()
+        .add_partition_field(5, "_is_current", Transform::Identity)
+        .unwrap()
+        .build();
+    catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name(TABLE.to_string())
+                .schema(schema)
+                .partition_spec(spec)
+                .format_version(FormatVersion::V3)
+                .properties(props)
+                .build(),
+        )
+        .await
+        .unwrap();
+    catalog
+}
+
+/// Canonical `{a, tags: [..]}` variant doc bytes.
+fn doc_with_tags(a: i64, tags: &[i64]) -> (Vec<u8>, Vec<u8>) {
+    let mut builder = VariantBuilder::new();
+    let mut obj = builder.new_object();
+    obj.insert("a", a);
+    let mut list = obj.new_list("tags");
+    for t in tags {
+        list.append_value(*t);
+    }
+    list.finish();
+    obj.finish();
+    builder.finish()
+}
+
+fn variant_canonical_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+    ])
+}
+
+fn variant_doc_array(rows: &[Option<(Vec<u8>, Vec<u8>)>]) -> ArrayRef {
+    let metas = BinaryArray::from_iter_values(
+        rows.iter()
+            .map(|v| v.as_ref().map(|(m, _)| m.clone()).unwrap_or_default()),
+    );
+    let vals = BinaryArray::from_iter_values(
+        rows.iter()
+            .map(|v| v.as_ref().map(|(_, x)| x.clone()).unwrap_or_default()),
+    );
+    let validity = NullBuffer::from(rows.iter().map(|v| v.is_some()).collect::<Vec<_>>());
+    Arc::new(StructArray::new(
+        variant_canonical_fields(),
+        vec![Arc::new(metas) as ArrayRef, Arc::new(vals) as ArrayRef],
+        Some(validity),
+    ))
+}
+
+/// Seed batch of (id, doc) current rows for the variant table.
+fn variant_seed_batch(rows: &[(i32, Option<(Vec<u8>, Vec<u8>)>)]) -> RecordBatch {
+    let seed_schema = Arc::new(ArrowSchema::new(vec![
+        field(1, "id", DataType::Int32, false),
+        field(2, "doc", DataType::Struct(variant_canonical_fields()), true),
+        field(3, "_valid_from", DataType::Int64, false),
+        field(4, "_valid_to", DataType::Int64, true),
+        field(5, "_is_current", DataType::Boolean, false),
+        field(6, "_cdc_offset", DataType::Int64, false),
+    ]));
+    let n = rows.len();
+    RecordBatch::try_new(seed_schema, vec![
+        Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
+        variant_doc_array(&rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>()),
+        Arc::new(Int64Array::from(vec![10i64; n])),
+        Arc::new(Int64Array::from(vec![None::<i64>; n])),
+        Arc::new(BooleanArray::from(vec![true; n])),
+        Arc::new(Int64Array::from(
+            (0..n).map(|i| 100 + i as i64).collect::<Vec<_>>(),
+        )),
+    ])
+    .unwrap()
+}
+
+/// Write one SHREDDED seed data file (the layout a shredding engine leaves
+/// behind) and commit it.
+async fn seed_shredded(catalog: &Arc<dyn Catalog>, batch: RecordBatch, plain: &DataType) {
+    use iceberg::arrow::variant_shred::shred_record_batch as core_shred;
+    let table = load_table(catalog).await;
+    let plain_map = HashMap::from([("doc".to_string(), plain.clone())]);
+    let shredded = core_shred(&batch, &plain_map).unwrap();
+    let overrides = HashMap::from([(
+        "doc".to_string(),
+        shredded
+            .schema()
+            .field_with_name("doc")
+            .unwrap()
+            .data_type()
+            .clone(),
+    )]);
+    let schema = table.metadata().current_schema().clone();
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+            .with_variant_shred_types(overrides),
+        table.file_io().clone(),
+        DefaultLocationGenerator::new(table.metadata()).unwrap(),
+        DefaultFileNameGenerator::new("seed".to_string(), None, DataFileFormat::Parquet),
+    );
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        IcebergStruct::from_iter(vec![Some(Literal::bool(true))]),
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(Some(partition_key))
+        .await
+        .unwrap();
+    writer.write(shredded).await.unwrap();
+    let data_files = writer.close().await.unwrap();
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+}
+
+/// Register the DataFusion session (catalog + `batch` MemTable + variant
+/// UDFs) over an already-seeded variant table.
+async fn variant_session(
+    catalog: &Arc<dyn Catalog>,
+    batch_rows: &[(i32, Option<(Vec<u8>, Vec<u8>)>, i64, i64)],
+) -> SessionContext {
+    let ctx = SessionContext::new();
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(Arc::clone(catalog))
+            .await
+            .unwrap(),
+    );
+    ctx.register_catalog(CATALOG, provider);
+    register_variant_functions(&ctx);
+    let batch_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("doc", DataType::Struct(variant_canonical_fields()), true),
+        Field::new("_valid_from", DataType::Int64, false),
+        Field::new("_cdc_offset", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(batch_schema, vec![
+        Arc::new(Int32Array::from(
+            batch_rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
+        variant_doc_array(&batch_rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>()),
+        Arc::new(Int64Array::from(
+            batch_rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            batch_rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+        )),
+    ])
+    .unwrap();
+    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+    ctx.register_table("batch", Arc::new(mem)).unwrap();
+    ctx
+}
+
+fn variant_merge_sql() -> String {
+    format!(
+        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING ( \
+             SELECT id, doc, _valid_from, CAST(NULL AS BIGINT) AS _valid_to, \
+                    true AS _is_current, _cdc_offset \
+             FROM batch \
+             UNION ALL \
+             SELECT t2.id, t2.doc, t2._valid_from, b.new_vf AS _valid_to, \
+                    false AS _is_current, t2._cdc_offset \
+             FROM {CATALOG}.{NS}.{TABLE} t2 \
+             JOIN (SELECT id, MIN(_valid_from) AS new_vf FROM batch GROUP BY id) b \
+               ON t2.id = b.id AND t2._is_current \
+         ) AS s \
+         ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+         WHEN MATCHED THEN UPDATE SET _valid_to = s._valid_to, _is_current = s._is_current \
+         WHEN NOT MATCHED THEN INSERT (id, doc, _valid_from, _valid_to, _is_current, _cdc_offset) \
+             VALUES (s.id, s.doc, s._valid_from, s._valid_to, s._is_current, s._cdc_offset)"
+    )
+}
+
+/// The `doc` arrow type of a written parquet file.
+async fn doc_type_of(table: &Table, path: &str) -> DataType {
+    let bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    reader
+        .schema()
+        .field_with_name("doc")
+        .unwrap()
+        .data_type()
+        .clone()
+}
+
+/// Under `write.parquet.shred-variants`, a merge into a table whose existing
+/// files are SHREDDED writes shredded output — object fields AND array
+/// elements carried forward — on both append paths (inserts and the
+/// late-materialized demote re-append), with the VARIANT annotation intact
+/// and values/null semantics unchanged through the fold.
+#[tokio::test]
+async fn merge_shred_write_preserves_shredded_layout() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = variant_table(
+        &warehouse,
+        HashMap::from([(
+            "write.parquet.shred-variants".to_string(),
+            "true".to_string(),
+        )]),
+    )
+    .await;
+
+    let plain = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+            true,
+        ),
+    ]));
+    // Seed: ids 1..=2 current, SHREDDED on {a, tags}.
+    seed_shredded(
+        &catalog,
+        variant_seed_batch(&[
+            (1, Some(doc_with_tags(1, &[10, 11]))),
+            (2, Some(doc_with_tags(9, &[90]))),
+        ]),
+        &plain,
+    )
+    .await;
+
+    // CDC batch: new version of id=1, a variant-null id=5, an SQL-null id=6.
+    let variant_null: (Vec<u8>, Vec<u8>) = (vec![0x11, 0x00, 0x00], vec![0x00]);
+    let ctx = variant_session(&catalog, &[
+        (1, Some(doc_with_tags(2, &[20, 21])), 20, 200),
+        (5, Some(variant_null), 20, 201),
+        (6, None, 20, 202),
+    ])
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+    ctx.sql(&variant_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+
+    // Every merge-written file is SHREDDED: typed_value subtree with the
+    // object field `a` (typed Int64) and the array `tags` (typed elements).
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    assert!(!merge_files.is_empty(), "merge appended data files");
+    for path in &merge_files {
+        let doc_type = doc_type_of(&table, path).await;
+        let DataType::Struct(children) = &doc_type else {
+            panic!("doc is not a struct in {path}: {doc_type:?}");
+        };
+        let tv = children
+            .iter()
+            .find(|c| c.name() == "typed_value")
+            .unwrap_or_else(|| panic!("merge output not shredded in {path}: {doc_type:?}"));
+        let DataType::Struct(obj) = tv.data_type() else {
+            panic!("typed_value is not an object node in {path}");
+        };
+        let a_node = obj.iter().find(|c| c.name() == "a").expect("a shredded");
+        let DataType::Struct(a_children) = a_node.data_type() else {
+            panic!("a is not a shred node");
+        };
+        assert!(
+            a_children
+                .iter()
+                .any(|c| c.name() == "typed_value" && c.data_type() == &DataType::Int64),
+            "a typed as Int64 in {path}"
+        );
+        let tags_node = obj
+            .iter()
+            .find(|c| c.name() == "tags")
+            .expect("tags shredded");
+        let DataType::Struct(tags_children) = tags_node.data_type() else {
+            panic!("tags is not a shred node");
+        };
+        let tags_tv = tags_children
+            .iter()
+            .find(|c| c.name() == "typed_value")
+            .expect("tags carries a typed_value");
+        assert!(
+            matches!(tags_tv.data_type(), DataType::List(_)),
+            "tags typed_value is a list in {path}: {:?}",
+            tags_tv.data_type()
+        );
+        // The annotation survives the shred override.
+        let bytes = table
+            .file_io()
+            .new_input(path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let doc_field = reader
+            .metadata()
+            .file_metadata()
+            .schema()
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == "doc")
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(
+                doc_field.get_basic_info().logical_type_ref(),
+                Some(LogicalType::Variant { .. })
+            ),
+            "shredded merge output keeps the VARIANT annotation: {path}"
+        );
+    }
+
+    // Values + null semantics through the fold (the read path reconstructs
+    // canonical from the shredded layout).
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id, variant_get_bigint(doc, '$.a') AS a, \
+                    variant_get_bigint(doc, '$.tags[0]') AS t0, \
+                    doc IS NULL AS doc_null \
+             FROM {CATALOG}.{NS}.{TABLE} WHERE _is_current ORDER BY id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows: Vec<(i32, Option<i64>, Option<i64>, bool)> = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let a = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let t0 = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let dn = b.column(3).as_any().downcast_ref::<BooleanArray>().unwrap();
+        for i in 0..b.num_rows() {
+            rows.push((
+                ids.value(i),
+                a.is_valid(i).then(|| a.value(i)),
+                t0.is_valid(i).then(|| t0.value(i)),
+                dn.value(i),
+            ));
+        }
+    }
+    assert_eq!(rows, vec![
+        (1, Some(2), Some(20), false),
+        (2, Some(9), Some(90), false),
+        (5, None, None, false), // variant-null VALUE, not SQL null
+        (6, None, None, true),  // SQL null
+    ]);
+}
+
+/// Under `write.parquet.shred-variants`, a table whose existing files are
+/// CANONICAL keeps writing canonical — the layout is preserved, never
+/// invented.
+#[tokio::test]
+async fn merge_shred_write_stays_canonical_on_canonical_estate() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = variant_table(
+        &warehouse,
+        HashMap::from([(
+            "write.parquet.shred-variants".to_string(),
+            "true".to_string(),
+        )]),
+    )
+    .await;
+
+    // Canonical seed (no typed_value anywhere).
+    let table = load_table(&catalog).await;
+    let data_files = write_one_data_file(
+        &table,
+        variant_seed_batch(&[(1, Some(doc_with_tags(1, &[10])))]),
+    )
+    .await;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+
+    let ctx = variant_session(&catalog, &[(1, Some(doc_with_tags(2, &[20])), 20, 200)]).await;
+    ctx.sql(&variant_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    assert!(!merge_files.is_empty(), "merge appended data files");
+    for path in &merge_files {
+        let doc_type = doc_type_of(&table, path).await;
+        let DataType::Struct(children) = &doc_type else {
+            panic!("doc is not a struct in {path}: {doc_type:?}");
+        };
+        assert!(
+            children.iter().all(|c| c.name() != "typed_value"),
+            "canonical estate stays canonical (never invented) in {path}: {doc_type:?}"
+        );
+    }
+    let state = read_state_ids(&ctx).await;
+    assert_eq!(state, vec![(1, false), (1, true)]);
+}
+
+/// Sorted (id, _is_current) projection — a minimal state read for the
+/// variant-table tests (val-less schema).
+async fn read_state_ids(ctx: &SessionContext) -> Vec<(i32, bool)> {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id, _is_current FROM {CATALOG}.{NS}.{TABLE} ORDER BY id, _valid_from"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let cur = b.column(1).as_any().downcast_ref::<BooleanArray>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((ids.value(i), cur.value(i)));
+        }
+    }
+    out
 }

@@ -62,10 +62,15 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
+use iceberg::arrow::variant_shred::{
+    shred_record_batch, shred_types_from_file_schema, shredded_output_type, variant_column_count,
+};
 use iceberg::arrow::{
-    PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
+    ArrowFileReader, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator,
+    schema_to_arrow_schema,
 };
 use iceberg::delete_vector::DeleteVector;
+use iceberg::io::FileMetadata;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
@@ -80,6 +85,7 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use roaring::RoaringTreemap;
 use uuid::Uuid;
 
@@ -97,6 +103,12 @@ pub(crate) const MOR_CLAUSE_COL: &str = "__mor_clause";
 /// evaluate / cast copy. Slicing is zero-copy; everything downstream then
 /// works on bounded rows.
 const MOR_WRITE_CHUNK_ROWS: usize = 8192;
+
+/// How many existing data files to probe (parquet footers) when deriving the
+/// variant shredding layout under `write.parquet.shred-variants`. First
+/// non-canonical derivation wins per column; probing stops early once every
+/// variant column has one.
+const MERGE_SHRED_PROBE_FILES: usize = 4;
 
 /// A WHEN clause with its expressions bound to the join output schema.
 #[derive(Debug, Clone)]
@@ -633,6 +645,65 @@ struct MatchedRow {
     update_row: usize,
 }
 
+/// Derive per-variant-column PLAIN shredding types for the merge output by
+/// probing existing data files' parquet footers (shred-preserving — the
+/// layout is carried forward from what the table already stores, never
+/// invented). An empty table, or one whose files are all canonical, derives
+/// nothing and the output stays canonical.
+async fn merge_shred_types(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> DFResult<HashMap<String, DataType>> {
+    let table_schema = table.metadata().current_schema();
+    let n_variant = variant_column_count(table_schema);
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(HashMap::new());
+    };
+    if n_variant == 0 {
+        return Ok(HashMap::new());
+    }
+    let scan = table
+        .scan()
+        .snapshot_id(snapshot_id)
+        .build()
+        .map_err(to_datafusion_error)?;
+    let mut tasks = scan.plan_files().await.map_err(to_datafusion_error)?;
+    let mut out: HashMap<String, DataType> = HashMap::new();
+    let mut probed = 0usize;
+    while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
+        let input = table
+            .file_io()
+            .new_input(task.data_file_path())
+            .map_err(to_datafusion_error)?;
+        let reader = input.reader().await.map_err(to_datafusion_error)?;
+        let mut reader = ArrowFileReader::new(
+            FileMetadata {
+                size: task.file_size_in_bytes,
+            },
+            reader,
+        );
+        let meta = ArrowReaderMetadata::load_async(&mut reader, Default::default())
+            .await
+            .map_err(|e| {
+                DataFusionError::External(
+                    format!(
+                        "loading parquet footer of {} for shred derivation: {e}",
+                        task.data_file_path()
+                    )
+                    .into(),
+                )
+            })?;
+        for (name, plain) in shred_types_from_file_schema(meta.schema(), table_schema) {
+            out.entry(name).or_insert(plain);
+        }
+        probed += 1;
+        if out.len() == n_variant || probed >= MERGE_SHRED_PROBE_FILES {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 async fn run_mor_write(
     table: Table,
     snapshot_id: Option<i64>,
@@ -658,11 +729,33 @@ async fn run_mor_write(
         )));
     }
 
+    // Shred-preserving output under `write.parquet.shred-variants`: derive
+    // each variant column's layout from the table's existing files, and give
+    // the writer the exact shredded arrow types the (shredded) batches will
+    // carry. Empty map = canonical output, the untouched default.
+    let shred_plain = if table_props.parquet_shred_variants {
+        merge_shred_types(&table, snapshot_id).await?
+    } else {
+        HashMap::new()
+    };
+    let shred_overrides: HashMap<String, DataType> = shred_plain
+        .iter()
+        .map(|(name, plain)| {
+            let idx = table_arrow
+                .index_of(name)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let out_type = shredded_output_type(table_arrow.field(idx).data_type(), plain)
+                .map_err(to_datafusion_error)?;
+            Ok((name.clone(), out_type))
+        })
+        .collect::<DFResult<_>>()?;
+
     // Derive writer properties from the table's write.parquet.* settings —
     // parquet-rs defaults are UNCOMPRESSED, which inflates real merge output
     // ~20x and was the bulk of an oversized single-file write at soak scale.
     let parquet_writer_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, table_schema.clone());
+        ParquetWriterBuilder::from_table_properties(&table_props, table_schema.clone())
+            .with_variant_shred_types(shred_overrides);
     let location_generator =
         DefaultLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -739,6 +832,8 @@ async fn run_mor_write(
                 match &clause.action {
                     MorActionPlan::Insert(assignments) => {
                         let out = build_full_rows(&subset, assignments, &table_arrow, None)?;
+                        let out =
+                            shred_record_batch(&out, &shred_plain).map_err(to_datafusion_error)?;
                         let out = with_partition_column(out, partition_calc.as_ref())?;
                         writer.write(out).await.map_err(to_datafusion_error)?;
                     }
@@ -940,6 +1035,7 @@ async fn run_mor_write(
                 }
                 let out = RecordBatch::try_new(Arc::clone(&table_arrow), columns)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                let out = shred_record_batch(&out, &shred_plain).map_err(to_datafusion_error)?;
                 let out = with_partition_column(out, partition_calc.as_ref())?;
                 writer.write(out).await.map_err(to_datafusion_error)?;
             }
