@@ -20,6 +20,7 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -53,6 +54,7 @@ impl ArrowReader {
     pub fn read(self, tasks: FileScanTaskStream) -> Result<ScanResult> {
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let scan_metrics = ScanMetrics::new();
+        let runtime = self.runtime.clone();
 
         let task_reader = FileScanTaskReader {
             batch_size: self.batch_size,
@@ -64,6 +66,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            shredded_passthrough: self.shredded_passthrough.clone(),
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -78,9 +81,40 @@ impl ArrowReader {
                     .try_flatten(),
             )
         } else {
+            // Each file's processing (parquet page decode, variant unshred
+            // fold, batch transform) is CPU-bound. `try_buffer_unordered` /
+            // `try_flatten_unordered` alone only OVERLAP the futures on the
+            // single consuming task — decode never uses more than one core.
+            // Spawn each file's producer onto the CPU runtime so files decode
+            // in PARALLEL; a small bounded channel per file provides
+            // backpressure (dropping the receiver aborts the producer).
             Box::pin(
                 tasks
-                    .map_ok(move |task| task_reader.clone().process(task))
+                    .map_ok(move |task| {
+                        let reader = task_reader.clone();
+                        let cpu = runtime.cpu().clone();
+                        async move {
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
+                            cpu.spawn(async move {
+                                match reader.process(task).await {
+                                    Ok(mut s) => {
+                                        while let Some(item) = s.next().await {
+                                            if tx.send(item).await.is_err() {
+                                                break; // consumer gone (limit/abort)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e)).await;
+                                    }
+                                }
+                            });
+                            let batches = futures::stream::unfold(rx, |mut rx| async move {
+                                rx.recv().await.map(|item| (item, rx))
+                            });
+                            Ok(Box::pin(batches) as ArrowRecordBatchStream)
+                        }
+                    })
                     .map_err(|err| {
                         Error::new(ErrorKind::Unexpected, "file scan task generate failed")
                             .with_source(err)
@@ -105,6 +139,12 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    /// Shredded variant passthrough: column name -> the EXACT shredded Arrow
+    /// type the consumer accepts verbatim. Per FILE, a variant column whose
+    /// physical type equals the expected type skips the unshred fold (and the
+    /// transformer targets the shredded type); any other layout — canonical,
+    /// or a different shredding — folds to canonical as usual.
+    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
 }
 
 impl FileScanTaskReader {
@@ -299,6 +339,26 @@ impl FileScanTaskReader {
                 record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
         }
 
+        // Shredded variant passthrough — decided PER FILE from its physical
+        // schema: only a column whose on-disk type is byte-for-byte the
+        // expected shredded type skips the fold; mixed estates (canonical
+        // files alongside shredded ones) keep folding file-by-file.
+        let mut fold_skip: HashSet<String> = HashSet::new();
+        if let Some(pass) = &self.shredded_passthrough {
+            let file_schema = record_batch_stream_builder.schema();
+            for (name, expected) in pass.iter() {
+                if let Ok(field) = file_schema.field_with_name(name)
+                    && field.data_type() == expected
+                    && let Some(iceberg_field) = task.schema.field_by_name(name)
+                {
+                    fold_skip.insert(name.clone());
+                    record_batch_transformer_builder = record_batch_transformer_builder
+                        .with_type_override(iceberg_field.id, expected.clone());
+                }
+            }
+        }
+        let fold_skip = Arc::new(fold_skip);
+
         let mut record_batch_transformer = record_batch_transformer_builder.build();
 
         if let Some(batch_size) = self.batch_size {
@@ -443,7 +503,9 @@ impl FileScanTaskReader {
                         // Fold any shredded variant columns (`typed_value`) back into a
                         // plain `{metadata, value}` variant before the transformer maps
                         // columns by field id (which expects the canonical variant type).
-                        let batch = unshred_variant_columns(batch)?;
+                        // Columns in `fold_skip` (shredded passthrough) stay in their
+                        // physical shredded shape; the transformer targets that type.
+                        let batch = unshred_variant_columns(batch, &fold_skip)?;
                         // Process the record batch (type promotion, column reordering, virtual fields, etc.)
                         record_batch_transformer.process_record_batch(batch)
                     }
@@ -519,12 +581,15 @@ impl ArrowReader {
 ///
 /// TODO: nested variant columns (a variant nested inside another Arrow struct/list)
 /// are not unshredded here — only top-level variant columns are handled.
-fn unshred_variant_columns(batch: RecordBatch) -> Result<RecordBatch> {
+fn unshred_variant_columns(batch: RecordBatch, skip: &HashSet<String>) -> Result<RecordBatch> {
     let schema = batch.schema();
 
     // Detect which columns need unshredding before allocating anything.
+    // A column in `skip` (shredded passthrough) is deliberately left in its
+    // physical shredded shape.
     let needs_unshred = |field: &Field| -> bool {
-        matches!(field.data_type(), DataType::Struct(sub)
+        !skip.contains(field.name())
+            && matches!(field.data_type(), DataType::Struct(sub)
             if sub.iter().any(|f| f.name() == "metadata")
                 && sub.iter().any(|f| f.name() == "typed_value"))
     };
@@ -603,7 +668,7 @@ fn unshred_variant_columns(batch: RecordBatch) -> Result<RecordBatch> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::sync::Arc;
 
@@ -1374,7 +1439,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![id_field, v_field]));
         let batch = RecordBatch::try_new(schema, vec![id, shredded]).unwrap();
 
-        let out = unshred_variant_columns(batch).expect("unshred must succeed");
+        let out = unshred_variant_columns(batch, &HashSet::new()).expect("unshred must succeed");
         assert_eq!(out.num_rows(), 2);
 
         // Sibling 'id' column passes through untouched.
@@ -1446,9 +1511,67 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![v_field, plain_field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![v, plain]).unwrap();
 
-        let out = unshred_variant_columns(batch).expect("passthrough must succeed");
+        let out =
+            unshred_variant_columns(batch, &HashSet::new()).expect("passthrough must succeed");
         // Schema is byte-for-byte identical: nothing was rewritten.
         assert_eq!(out.schema(), schema);
         assert_eq!(out.num_rows(), 1);
+    }
+
+    /// A SHREDDED variant column named in the skip set (shredded passthrough)
+    /// is NOT folded — it keeps its physical `{metadata, value, typed_value}`
+    /// shape byte-for-byte, while a sibling shredded column NOT in the skip
+    /// set still folds to canonical.
+    #[test]
+    fn test_unshred_variant_columns_skip_set_passthrough() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+        use parquet::variant::EMPTY_VARIANT_METADATA_BYTES;
+
+        use super::unshred_variant_columns;
+
+        let make_shredded = || {
+            let empty_meta = EMPTY_VARIANT_METADATA_BYTES;
+            let metadata = Arc::new(BinaryArray::from(vec![empty_meta])) as ArrayRef;
+            let value = Arc::new(BinaryArray::from(vec![None as Option<&[u8]>])) as ArrayRef;
+            let typed_value = Arc::new(Int32Array::from(vec![7])) as ArrayRef;
+            let fields = arrow_schema::Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, true),
+                Field::new("typed_value", DataType::Int32, true),
+            ]);
+            let arr = Arc::new(StructArray::new(
+                fields.clone(),
+                vec![metadata, value, typed_value],
+                None,
+            )) as ArrayRef;
+            (arr, fields)
+        };
+
+        let (kept, kept_fields) = make_shredded();
+        let (folded, folded_fields) = make_shredded();
+        let kept_field = Field::new("kept", DataType::Struct(kept_fields.clone()), false);
+        let folded_field = Field::new("folded", DataType::Struct(folded_fields), false);
+        let schema = Arc::new(ArrowSchema::new(vec![kept_field, folded_field]));
+        let batch = RecordBatch::try_new(schema, vec![kept, folded]).unwrap();
+
+        let skip: HashSet<String> = HashSet::from(["kept".to_string()]);
+        let out = unshred_variant_columns(batch, &skip).expect("skip fold must succeed");
+
+        // "kept" retains its shredded physical type.
+        let kept_out = out.schema().field_with_name("kept").unwrap().clone();
+        assert_eq!(kept_out.data_type(), &DataType::Struct(kept_fields));
+        assert!(
+            out.column_by_name("kept")
+                .unwrap()
+                .as_struct()
+                .column_by_name("typed_value")
+                .is_some(),
+            "skip-set column must keep typed_value"
+        );
+
+        // "folded" was folded to canonical {metadata, value}.
+        let folded_out = out.column_by_name("folded").unwrap().as_struct();
+        assert!(folded_out.column_by_name("typed_value").is_none());
+        assert_eq!(folded_out.fields().len(), 2);
     }
 }

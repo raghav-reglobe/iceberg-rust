@@ -46,7 +46,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::compute::{cast, concat, filter_record_batch, take};
 use datafusion::arrow::datatypes::{
-    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::common::{DataFusionError, NullEquality, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -107,8 +107,11 @@ const MOR_WRITE_CHUNK_ROWS: usize = 8192;
 /// How many existing data files to probe (parquet footers) when deriving the
 /// variant shredding layout under `write.parquet.shred-variants`. First
 /// non-canonical derivation wins per column; probing stops early once every
-/// variant column has one.
-const MERGE_SHRED_PROBE_FILES: usize = 4;
+/// variant column has one. Sized to survive MIXED estates: a run of canonical
+/// files (e.g. merges written before the property was set) at the head of the
+/// plan order must not exhaust the probe budget before a shredded file is
+/// seen — footer reads are cheap metadata GETs.
+const MERGE_SHRED_PROBE_FILES: usize = 16;
 
 /// Default writer-pool size when [`MorMergeOptions::write_workers`] is unset.
 /// Bounded low: each writer buffers its own parquet row groups, so memory
@@ -324,10 +327,31 @@ async fn writer_task(
                 &ctx.clauses,
                 &update_values,
                 &ctx.table_arrow,
+                &ctx.shred_overrides,
             )?,
         };
         for out in outs {
-            let out = shred_record_batch(&out, &ctx.shred_plain).map_err(to_datafusion_error)?;
+            // Shredded passthrough: columns already carrying the writer's
+            // shredded type (a passthrough late-fetch) skip the shred kernel;
+            // canonical columns (INSERT rows, or folded fetches from
+            // non-matching files) are shredded as usual.
+            let to_shred: HashMap<String, DataType> = ctx
+                .shred_plain
+                .iter()
+                .filter(|(name, _)| match out.schema().index_of(name.as_str()) {
+                    Ok(i) => {
+                        ctx.shred_overrides.get(name.as_str())
+                            != Some(out.schema().field(i).data_type())
+                    }
+                    Err(_) => true,
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let out = if to_shred.is_empty() {
+                out
+            } else {
+                shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?
+            };
             let out = with_partition_column(out, partition_calc.as_ref())?;
             if writer.is_none() {
                 let (builder, spec) = pending.take().expect("writer built once");
@@ -365,6 +389,7 @@ fn build_update_rows(
     clauses: &[MorClausePlan],
     update_values: &[Vec<ArrayRef>],
     table_arrow: &ArrowSchemaRef,
+    shred_overrides: &HashMap<String, DataType>,
 ) -> DFResult<Vec<RecordBatch>> {
     let fb_schema = fbatch.schema();
     let mut by_clause: HashMap<u32, (Vec<u32>, Vec<u64>)> = HashMap::new();
@@ -383,6 +408,7 @@ fn build_update_rows(
         let take_idx = UInt32Array::from(rows);
         let store_idx = UInt64Array::from(store_rows);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_arrow.fields().len());
+        let mut out_fields: Vec<FieldRef> = Vec::with_capacity(table_arrow.fields().len());
         for field in table_arrow.fields() {
             let assigned = assignments
                 .iter()
@@ -396,14 +422,33 @@ fn build_update_rows(
                     take(fbatch.column(src_idx).as_ref(), &take_idx, None)?
                 }
             };
-            let arr = if arr.data_type() == field.data_type() {
-                arr
+            // Shredded passthrough: a fetched variant column that already
+            // carries the writer's shredded type is adopted verbatim — the
+            // output field takes the shredded type instead of casting the
+            // column back to canonical.
+            let adopt_shredded = assigned.is_none()
+                && shred_overrides.get(field.name().as_str()) == Some(arr.data_type());
+            let (arr, out_field) = if adopt_shredded {
+                let f = Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(arr.data_type().clone()),
+                );
+                (arr, f)
+            } else if arr.data_type() == field.data_type() {
+                (arr, Arc::clone(field))
             } else {
-                cast(arr.as_ref(), field.data_type())?
+                (cast(arr.as_ref(), field.data_type())?, Arc::clone(field))
             };
             columns.push(arr);
+            out_fields.push(out_field);
         }
-        let out = RecordBatch::try_new(Arc::clone(table_arrow), columns)
+        let out_schema = Arc::new(ArrowSchema::new_with_metadata(
+            out_fields,
+            table_arrow.metadata().clone(),
+        ));
+        let out = RecordBatch::try_new(out_schema, columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         out_batches.push(out);
     }
@@ -1083,7 +1128,7 @@ async fn run_mor_write(
         run_id: Uuid::now_v7(),
         deadline,
     });
-    let mut pool = WriterPool::spawn(ctx, write_workers);
+    let mut pool = WriterPool::spawn(Arc::clone(&ctx), write_workers);
 
     let clause_idx_col = input_schema
         .index_of(MOR_CLAUSE_COL)
@@ -1242,7 +1287,27 @@ async fn run_mor_write(
 
         // Late materialization: read ONLY the affected files, full projection
         // + _file/_pos, prior deletes applied (alive rows only).
-        let reader = table.reader_builder().build();
+        //
+        // Shredded passthrough: when the writer outputs the SAME shredded
+        // layout (`write.parquet.shred-variants`), fetched rows carry their
+        // physical shredded variant columns straight through to the writer —
+        // skipping BOTH the per-row unshred fold at read and the per-row
+        // re-shred at write (the dominant merge cost on shredded estates).
+        // Per file: a non-matching file (canonical, or a different layout)
+        // still folds and re-shreds. Disabled when any SET assignment writes
+        // a variant column (assignments evaluate against the canonical type).
+        let passthrough_ok = !ctx.shred_overrides.is_empty()
+            && !clauses.iter().any(|c| match &c.action {
+                MorActionPlan::Update(assignments) => assignments
+                    .iter()
+                    .any(|(name, _)| ctx.shred_overrides.contains_key(name)),
+                _ => false,
+            });
+        let mut reader_builder = table.reader_builder();
+        if passthrough_ok {
+            reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
+        }
+        let reader = reader_builder.build();
         let task_stream = Box::pin(futures::stream::iter(
             fetch_tasks.iter().cloned().map(Ok).collect::<Vec<_>>(),
         )) as iceberg::scan::FileScanTaskStream;

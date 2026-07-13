@@ -193,6 +193,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
+    type_overrides: HashMap<i32, DataType>,
 }
 
 impl RecordBatchTransformerBuilder {
@@ -204,7 +205,19 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
+            type_overrides: HashMap::new(),
         }
+    }
+
+    /// Override the target Arrow type for a field id. Used by the shredded
+    /// variant passthrough: when the reader keeps a variant column in its
+    /// physical SHREDDED shape (skipping the unshred fold), the transformer's
+    /// target type for that column must be the shredded struct — not the
+    /// canonical `{metadata, value}` the snapshot schema converts to —
+    /// so the batch passes through instead of being coerced.
+    pub(crate) fn with_type_override(mut self, field_id: i32, data_type: DataType) -> Self {
+        self.type_overrides.insert(field_id, data_type);
+        self
     }
 
     /// Add a constant value for a specific field ID.
@@ -245,6 +258,7 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
+            type_overrides: self.type_overrides,
             batch_transform: None,
         }
     }
@@ -289,6 +303,9 @@ pub(crate) struct RecordBatchTransformer {
     // Datum holds both the Iceberg type and the value
     constant_fields: HashMap<i32, Datum>,
 
+    // Target Arrow-type overrides by field id (shredded variant passthrough).
+    type_overrides: HashMap<i32, DataType>,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -330,6 +347,7 @@ impl RecordBatchTransformer {
                     self.snapshot_schema.as_ref(),
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
+                    &self.type_overrides,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -349,10 +367,24 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
+        type_overrides: &HashMap<i32, DataType>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
-        let field_id_to_mapped_schema_map =
+        let mut field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
+
+        // Shredded-variant passthrough: replace the target type for overridden
+        // field ids so the (deliberately unfolded) source column compares
+        // equal and passes through everywhere downstream — the projected
+        // target schema, compare_schemas, and generate_transform_operations
+        // all read from this map.
+        for (field_id, data_type) in type_overrides {
+            if let Some((field, idx)) = field_id_to_mapped_schema_map.get(field_id) {
+                let overridden = Arc::new(field.as_ref().clone().with_data_type(data_type.clone()));
+                let idx = *idx;
+                field_id_to_mapped_schema_map.insert(*field_id, (overridden, idx));
+            }
+        }
 
         // Create a new arrow schema by selecting fields from mapped_unprojected,
         // in the order of the field ids in projected_iceberg_field_ids

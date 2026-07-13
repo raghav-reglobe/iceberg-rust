@@ -17,6 +17,11 @@
 
 //! Parquet file data reader
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow_schema::DataType;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -55,6 +60,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
 }
 
 impl ArrowReaderBuilder {
@@ -70,7 +76,21 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            shredded_passthrough: None,
         }
+    }
+
+    /// Shredded variant passthrough: keep the named variant columns in their
+    /// physical SHREDDED shape when a file's on-disk type equals the expected
+    /// type (map value), instead of folding them back to the canonical
+    /// `{metadata, value}` form. Decided per file — non-matching files still
+    /// fold. Consumers must accept the shredded struct type verbatim (the MoR
+    /// merge writer under `write.parquet.shred-variants` does: its writer
+    /// schema carries the same shredded layout, so the fold + re-shred
+    /// round-trip is skipped entirely).
+    pub fn with_shredded_passthrough(mut self, expected_types: HashMap<String, DataType>) -> Self {
+        self.shredded_passthrough = Some(Arc::new(expected_types));
+        self
     }
 
     /// Sets the max number of in flight data files that are being fetched
@@ -138,6 +158,8 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime: self.runtime,
+            shredded_passthrough: self.shredded_passthrough,
         }
     }
 }
@@ -155,4 +177,10 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    /// Runtime the per-file decode tasks are spawned onto (CPU handle) so
+    /// files decode in PARALLEL across cores, not merely overlapped on the
+    /// consuming task.
+    runtime: Runtime,
+    /// See [`ArrowReaderBuilder::with_shredded_passthrough`].
+    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
 }
