@@ -31,7 +31,7 @@
 //! remove the superseded DV in the same commit (the V3 invariant — never two
 //! live DVs per file).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -60,8 +60,8 @@ use iceberg::{
     Catalog, CatalogBuilder, MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder, NamespaceIdent,
     TableCreation, TableIdent,
 };
-use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_datafusion::functions::register_variant_functions;
+use iceberg_datafusion::{IcebergCatalogProvider, MorMergeOptions};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, LogicalType};
@@ -194,6 +194,16 @@ async fn setup_with_props(
     batch: &[(i32, &str, i64, i64)],
     props: HashMap<String, String>,
 ) -> (Arc<dyn Catalog>, SessionContext) {
+    setup_full(warehouse, seed, batch, props, None).await
+}
+
+async fn setup_full(
+    warehouse: &TempDir,
+    seed: &[(i32, &str, i64, Option<i64>, bool, i64)],
+    batch: &[(i32, &str, i64, i64)],
+    props: HashMap<String, String>,
+    options: Option<Arc<MorMergeOptions>>,
+) -> (Arc<dyn Catalog>, SessionContext) {
     let catalog: Arc<dyn Catalog> = Arc::new(
         MemoryCatalogBuilder::default()
             .load(
@@ -237,7 +247,11 @@ async fn setup_with_props(
         .await
         .unwrap();
 
-    let ctx = SessionContext::new();
+    let mut config = datafusion::execution::context::SessionConfig::new();
+    if let Some(options) = options {
+        config = config.with_extension(options);
+    }
+    let ctx = SessionContext::new_with_config(config);
     let provider = Arc::new(
         IcebergCatalogProvider::try_new(Arc::clone(&catalog))
             .await
@@ -1413,4 +1427,117 @@ async fn read_state_ids(ctx: &SessionContext) -> Vec<(i32, bool)> {
         }
     }
     out
+}
+
+/// With a writer pool, an insert-heavy merge fans its output across MULTIPLE
+/// writer tasks — distinct per-worker file prefixes — while still committing
+/// exactly ONE snapshot with the complete state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_writers_split_output_across_workers() {
+    let warehouse = TempDir::new().unwrap();
+    let rows: Vec<(i32, String, i64, i64)> = (10..30_010)
+        .map(|i| (i, format!("v{i}"), 20i64, 1_000 + i as i64))
+        .collect();
+    let batch: Vec<(i32, &str, i64, i64)> = rows
+        .iter()
+        .map(|(i, v, vf, off)| (*i, v.as_str(), *vf, *off))
+        .collect();
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &batch,
+        HashMap::new(),
+        Some(Arc::new(MorMergeOptions {
+            deadline: None,
+            write_workers: Some(3),
+        })),
+    )
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_before + 1,
+        "one snapshot regardless of writer-pool size"
+    );
+
+    // 30k rows = 4 input chunks round-robined over 3 workers — at least two
+    // distinct worker prefixes must appear among the merge-written files.
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    let workers: HashSet<String> = merge_files
+        .iter()
+        .filter_map(|p| {
+            let tail = p.split("merge-").nth(1)?;
+            tail.split('-')
+                .find(|seg| seg.starts_with('w'))
+                .map(|w| w.to_string())
+        })
+        .collect();
+    assert!(
+        workers.len() >= 2,
+        "output must span multiple writer tasks: {merge_files:?}"
+    );
+
+    // Complete state: the untouched seed current + all 30k inserts.
+    let state = read_state(&ctx).await;
+    assert_eq!(state.len(), 1 + 30_000, "all inserts present");
+    let currents = state.iter().filter(|r| r.4).count();
+    assert_eq!(currents, 1 + 30_000, "one current per pk");
+}
+
+/// A merge whose deadline has already passed aborts BEFORE commit: the
+/// statement errors with the deadline message and the table's snapshot
+/// ledger is untouched.
+#[tokio::test]
+async fn deadline_aborts_merge_before_commit() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[(1, "a2", 20, 200), (4, "d", 20, 203)],
+        HashMap::new(),
+        Some(Arc::new(MorMergeOptions {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            write_workers: None,
+        })),
+    )
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let err = ctx
+        .sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("expired deadline must abort the merge");
+    assert!(
+        err.to_string().contains("deadline"),
+        "unexpected error: {err}"
+    );
+
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_before,
+        "no snapshot may be committed past the deadline"
+    );
+    let state = read_state(&ctx).await;
+    assert_eq!(state, vec![(1, "a".to_string(), 10, None, true)]);
 }

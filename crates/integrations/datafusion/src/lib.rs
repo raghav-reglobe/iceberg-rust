@@ -24,6 +24,7 @@ pub use error::*;
 pub mod functions;
 
 pub mod physical_plan;
+pub use physical_plan::MorMergeOptions;
 mod schema;
 pub mod table;
 pub use table::table_provider_factory::IcebergTableProviderFactory;

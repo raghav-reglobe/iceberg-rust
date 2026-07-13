@@ -145,6 +145,7 @@ thrift = "0.17.0"
 tokio = { version = "1.47", default-features = false, features = [
   "sync",
   "rt-multi-thread",
+  "time",
 ] }
 toml = "0.8"
 tracing = "0.1.41"

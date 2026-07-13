@@ -110,6 +110,306 @@ const MOR_WRITE_CHUNK_ROWS: usize = 8192;
 /// variant column has one.
 const MERGE_SHRED_PROBE_FILES: usize = 4;
 
+/// Default writer-pool size when [`MorMergeOptions::write_workers`] is unset.
+/// Bounded low: each writer buffers its own parquet row groups, so memory
+/// scales with pool size on wide rows.
+const MOR_DEFAULT_WRITE_WORKERS: usize = 4;
+
+/// Concurrent deletion-vector (Puffin) uploads during DV construction.
+const MOR_DV_WRITE_CONCURRENCY: usize = 8;
+
+/// Session-level execution options for the MoR MERGE, set by the caller via
+/// `SessionConfig::with_extension(Arc<MorMergeOptions>)`.
+#[derive(Debug, Default)]
+pub struct MorMergeOptions {
+    /// Cooperative deadline for the scan/write phase. Enforced at every
+    /// await point of the write node BEFORE files are handed to the commit
+    /// node — a merge past its deadline aborts with an error and NO snapshot
+    /// is written. The commit itself is deliberately never cancelled
+    /// (aborting a REST commit in flight leaves the outcome unknown).
+    pub deadline: Option<std::time::Instant>,
+    /// Writer-pool size for the append paths. Appended batches (INSERT rows
+    /// and late-materialized updated rows) fan out round-robin to this many
+    /// writer tasks, each owning its own rolling file writer.
+    pub write_workers: Option<usize>,
+}
+
+fn deadline_error(what: &str) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "MERGE deadline exceeded while {what}; the merge was aborted before \
+         commit — no snapshot was written"
+    ))
+}
+
+/// Await `fut`, aborting with a deadline error when the merge deadline
+/// passes first.
+async fn with_deadline<T>(
+    deadline: Option<std::time::Instant>,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> DFResult<T> {
+    match deadline {
+        None => Ok(fut.await),
+        Some(d) => tokio::time::timeout_at(tokio::time::Instant::from_std(d), fut)
+            .await
+            .map_err(|_| deadline_error(what)),
+    }
+}
+
+/// Shared, immutable context each writer task works from.
+#[derive(Debug)]
+struct WriterCtx {
+    table: Table,
+    table_schema: iceberg::spec::SchemaRef,
+    table_arrow: ArrowSchemaRef,
+    clauses: Arc<Vec<MorClausePlan>>,
+    /// Plain shredding types per variant column (empty = canonical output).
+    shred_plain: HashMap<String, DataType>,
+    /// Writer schema overrides matching the shredded batches.
+    shred_overrides: HashMap<String, DataType>,
+    /// One id per merge — combined with the worker index for file names.
+    run_id: Uuid,
+    deadline: Option<std::time::Instant>,
+}
+
+/// One unit of append work, routed to a writer task.
+enum WriteItem {
+    /// A clause-filtered chunk of NOT MATCHED rows; the worker builds the
+    /// full-width rows from the clause's INSERT assignments.
+    Insert { subset: RecordBatch, clause: usize },
+    /// A late-fetch batch with its matched rows; the worker builds the
+    /// updated row versions (SET columns overridden) per clause.
+    Fetched {
+        batch: RecordBatch,
+        rows: Vec<u32>,
+        stored: Vec<MatchedRow>,
+        update_values: Arc<Vec<Vec<ArrayRef>>>,
+    },
+}
+
+/// Round-robin fan-out of append work to writer tasks. Each task owns its
+/// own writer chain (UNIQUE file-name prefix per worker — a shared prefix
+/// would collide file names across workers, every generator counting from
+/// zero, and silently overwrite output). Bounded channels keep memory flat
+/// under backpressure. Parallelizing here (not via input partitioning)
+/// keeps the matched-row bookkeeping — the double-match guard and the
+/// per-file DV consolidation — on the single consuming thread.
+struct WriterPool {
+    txs: Vec<tokio::sync::mpsc::Sender<WriteItem>>,
+    handles: Vec<tokio::task::JoinHandle<DFResult<Vec<DataFile>>>>,
+    next: usize,
+    deadline: Option<std::time::Instant>,
+}
+
+impl WriterPool {
+    fn spawn(ctx: Arc<WriterCtx>, workers: usize) -> Self {
+        let deadline = ctx.deadline;
+        let mut txs = Vec::with_capacity(workers);
+        let mut handles = Vec::with_capacity(workers);
+        for idx in 0..workers {
+            let (tx, rx) = tokio::sync::mpsc::channel::<WriteItem>(2);
+            handles.push(tokio::spawn(writer_task(Arc::clone(&ctx), idx, rx)));
+            txs.push(tx);
+        }
+        Self {
+            txs,
+            handles,
+            next: 0,
+            deadline,
+        }
+    }
+
+    async fn dispatch(&mut self, item: WriteItem) -> DFResult<()> {
+        let i = self.next % self.txs.len();
+        self.next += 1;
+        with_deadline(
+            self.deadline,
+            "dispatching merge output to a writer",
+            self.txs[i].send(item),
+        )
+        .await?
+        .map_err(|_| DataFusionError::Internal("merge writer task terminated early".to_string()))
+    }
+
+    /// Close every writer and collect the data files they produced.
+    async fn finish(self) -> DFResult<Vec<DataFile>> {
+        drop(self.txs);
+        let mut files = Vec::new();
+        for h in self.handles {
+            let joined = with_deadline(self.deadline, "closing merge writers", h)
+                .await?
+                .map_err(|e| {
+                    DataFusionError::Internal(format!("merge writer task panicked: {e}"))
+                })?;
+            files.extend(joined?);
+        }
+        Ok(files)
+    }
+}
+
+/// One writer task: builds full-width rows for its items, shreds/partitions
+/// them, and writes through its own rolling writer chain. The writer is
+/// created lazily so an idle worker leaves no file behind.
+async fn writer_task(
+    ctx: Arc<WriterCtx>,
+    idx: usize,
+    mut rx: tokio::sync::mpsc::Receiver<WriteItem>,
+) -> DFResult<Vec<DataFile>> {
+    let table_props = ctx
+        .table
+        .metadata()
+        .table_properties()
+        .map_err(to_datafusion_error)?;
+    let parquet_writer_builder =
+        ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())
+            .with_variant_shred_types(ctx.shred_overrides.clone());
+    let location_generator =
+        DefaultLocationGenerator::new(ctx.table.metadata()).map_err(to_datafusion_error)?;
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("merge-{}-w{idx}", ctx.run_id),
+        None,
+        DataFileFormat::Parquet,
+    );
+    let rolling_writer_builder = RollingFileWriterBuilder::new(
+        parquet_writer_builder,
+        table_props.write_target_file_size_bytes,
+        ctx.table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let partition_spec = ctx.table.metadata().default_partition_spec().clone();
+    let partition_calc = if partition_spec.is_unpartitioned() {
+        None
+    } else {
+        Some(
+            PartitionValueCalculator::try_new(&partition_spec, &ctx.table_schema)
+                .map_err(to_datafusion_error)?,
+        )
+    };
+    let mut pending = Some((
+        DataFileWriterBuilder::new(rolling_writer_builder),
+        partition_spec,
+    ));
+    let mut writer = None;
+
+    while let Some(item) = rx.recv().await {
+        if let Some(d) = ctx.deadline
+            && std::time::Instant::now() >= d
+        {
+            return Err(deadline_error("writing merge output"));
+        }
+        let outs: Vec<RecordBatch> = match item {
+            WriteItem::Insert { subset, clause } => {
+                let MorActionPlan::Insert(assignments) = &ctx.clauses[clause].action else {
+                    return Err(DataFusionError::Internal(
+                        "insert work routed to a non-insert clause".to_string(),
+                    ));
+                };
+                vec![build_full_rows(
+                    &subset,
+                    assignments,
+                    &ctx.table_arrow,
+                    None,
+                )?]
+            }
+            WriteItem::Fetched {
+                batch,
+                rows,
+                stored,
+                update_values,
+            } => build_update_rows(
+                &batch,
+                &rows,
+                &stored,
+                &ctx.clauses,
+                &update_values,
+                &ctx.table_arrow,
+            )?,
+        };
+        for out in outs {
+            let out = shred_record_batch(&out, &ctx.shred_plain).map_err(to_datafusion_error)?;
+            let out = with_partition_column(out, partition_calc.as_ref())?;
+            if writer.is_none() {
+                let (builder, spec) = pending.take().expect("writer built once");
+                writer = Some(
+                    TaskWriter::try_new(
+                        builder,
+                        table_props.write_datafusion_fanout_enabled,
+                        ctx.table_schema.clone(),
+                        spec,
+                    )
+                    .map_err(to_datafusion_error)?,
+                );
+            }
+            writer
+                .as_mut()
+                .expect("writer just created")
+                .write(out)
+                .await
+                .map_err(to_datafusion_error)?;
+        }
+    }
+    match writer {
+        Some(w) => w.close().await.map_err(to_datafusion_error),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Build the updated row versions for one late-fetch batch: the fetched row
+/// with the claiming clause's SET columns overridden, grouped by clause
+/// (different clauses assign different columns).
+fn build_update_rows(
+    fbatch: &RecordBatch,
+    fetch_rows: &[u32],
+    stored: &[MatchedRow],
+    clauses: &[MorClausePlan],
+    update_values: &[Vec<ArrayRef>],
+    table_arrow: &ArrowSchemaRef,
+) -> DFResult<Vec<RecordBatch>> {
+    let fb_schema = fbatch.schema();
+    let mut by_clause: HashMap<u32, (Vec<u32>, Vec<u64>)> = HashMap::new();
+    for (i, m) in stored.iter().enumerate() {
+        let e = by_clause.entry(m.clause).or_default();
+        e.0.push(fetch_rows[i]);
+        e.1.push(m.update_row as u64);
+    }
+    let mut out_batches = Vec::with_capacity(by_clause.len());
+    for (clause, (rows, store_rows)) in by_clause {
+        let MorActionPlan::Update(assignments) = &clauses[clause as usize].action else {
+            return Err(DataFusionError::Internal(
+                "only update clauses collect fetch rows".to_string(),
+            ));
+        };
+        let take_idx = UInt32Array::from(rows);
+        let store_idx = UInt64Array::from(store_rows);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_arrow.fields().len());
+        for field in table_arrow.fields() {
+            let assigned = assignments
+                .iter()
+                .position(|(name, _)| name == field.name());
+            let arr = match assigned {
+                Some(a) => take(update_values[clause as usize][a].as_ref(), &store_idx, None)?,
+                None => {
+                    let src_idx = fb_schema
+                        .index_of(field.name())
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    take(fbatch.column(src_idx).as_ref(), &take_idx, None)?
+                }
+            };
+            let arr = if arr.data_type() == field.data_type() {
+                arr
+            } else {
+                cast(arr.as_ref(), field.data_type())?
+            };
+            columns.push(arr);
+        }
+        let out = RecordBatch::try_new(Arc::clone(table_arrow), columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        out_batches.push(out);
+    }
+    Ok(out_batches)
+}
+
 /// A WHEN clause with its expressions bound to the join output schema.
 #[derive(Debug, Clone)]
 pub(crate) struct MorClausePlan {
@@ -608,6 +908,10 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
         let snapshot_id = self.snapshot_id;
         let clauses = Arc::clone(&self.clauses);
         let result_schema = Arc::clone(&self.result_schema);
+        let options = context
+            .session_config()
+            .get_extension::<MorMergeOptions>()
+            .unwrap_or_default();
         let input = execute_input_stream(
             Arc::clone(&self.input),
             self.input.schema(),
@@ -623,7 +927,8 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
                 snapshot_id,
                 input,
                 input_schema,
-                &clauses,
+                clauses,
+                options,
                 &run_schema,
             )
             .await
@@ -709,7 +1014,8 @@ async fn run_mor_write(
     snapshot_id: Option<i64>,
     mut input: SendableRecordBatchStream,
     input_schema: ArrowSchemaRef,
-    clauses: &[MorClausePlan],
+    clauses: Arc<Vec<MorClausePlan>>,
+    options: Arc<MorMergeOptions>,
     result_schema: &ArrowSchemaRef,
 ) -> DFResult<RecordBatch> {
     let table_schema = table.metadata().current_schema().clone();
@@ -728,13 +1034,17 @@ async fn run_mor_write(
             format!("File format {file_format} is not supported for MERGE"),
         )));
     }
+    let deadline = options.deadline;
 
     // Shred-preserving output under `write.parquet.shred-variants`: derive
     // each variant column's layout from the table's existing files, and give
     // the writer the exact shredded arrow types the (shredded) batches will
     // carry. Empty map = canonical output, the untouched default.
     let shred_plain = if table_props.parquet_shred_variants {
-        merge_shred_types(&table, snapshot_id).await?
+        with_deadline(deadline, "deriving the shredding layout", async {
+            merge_shred_types(&table, snapshot_id).await
+        })
+        .await??
     } else {
         HashMap::new()
     };
@@ -750,45 +1060,30 @@ async fn run_mor_write(
         })
         .collect::<DFResult<_>>()?;
 
-    // Derive writer properties from the table's write.parquet.* settings —
-    // parquet-rs defaults are UNCOMPRESSED, which inflates real merge output
-    // ~20x and was the bulk of an oversized single-file write at soak scale.
-    let parquet_writer_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, table_schema.clone())
-            .with_variant_shred_types(shred_overrides);
-    let location_generator =
-        DefaultLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
-    let file_name_generator = DefaultFileNameGenerator::new(
-        format!("merge-{}", Uuid::now_v7()),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let rolling_writer_builder = RollingFileWriterBuilder::new(
-        parquet_writer_builder,
-        table_props.write_target_file_size_bytes,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
-    let partition_spec = table.metadata().default_partition_spec().clone();
-    // Partitioned writes require the computed `_partition` column on every
-    // batch (the fanout splitter routes rows by it).
-    let partition_calc = if partition_spec.is_unpartitioned() {
-        None
-    } else {
-        Some(
-            PartitionValueCalculator::try_new(&partition_spec, &table_schema)
-                .map_err(to_datafusion_error)?,
-        )
-    };
-    let mut writer = TaskWriter::try_new(
-        data_file_writer_builder,
-        table_props.write_datafusion_fanout_enabled,
-        table_schema.clone(),
-        partition_spec,
-    )
-    .map_err(to_datafusion_error)?;
+    // Appended output fans out to a writer pool — the encode/compress/upload
+    // path is the write node's wall-clock at demote-heavy scale, and one
+    // writer serialized all of it. Matched-row bookkeeping stays here on the
+    // single consuming thread.
+    let write_workers = options
+        .write_workers
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(MOR_DEFAULT_WRITE_WORKERS)
+        })
+        .max(1);
+    let ctx = Arc::new(WriterCtx {
+        table: table.clone(),
+        table_schema: table_schema.clone(),
+        table_arrow: Arc::clone(&table_arrow),
+        clauses: Arc::clone(&clauses),
+        shred_plain,
+        shred_overrides,
+        run_id: Uuid::now_v7(),
+        deadline,
+    });
+    let mut pool = WriterPool::spawn(ctx, write_workers);
 
     let clause_idx_col = input_schema
         .index_of(MOR_CLAUSE_COL)
@@ -805,7 +1100,9 @@ async fn run_mor_write(
     // (file, pos) -> matched bookkeeping. Duplicate claims are an error.
     let mut matched: HashMap<(String, u64), MatchedRow> = HashMap::new();
 
-    while let Some(batch) = input.try_next().await? {
+    while let Some(batch) =
+        with_deadline(deadline, "reading the merge input", input.try_next()).await??
+    {
         let mut chunk_start = 0;
         while chunk_start < batch.num_rows() {
             let chunk_len = MOR_WRITE_CHUNK_ROWS.min(batch.num_rows() - chunk_start);
@@ -830,12 +1127,9 @@ async fn run_mor_write(
                 let subset = filter_record_batch(&chunk, &mask_arr)?;
 
                 match &clause.action {
-                    MorActionPlan::Insert(assignments) => {
-                        let out = build_full_rows(&subset, assignments, &table_arrow, None)?;
-                        let out =
-                            shred_record_batch(&out, &shred_plain).map_err(to_datafusion_error)?;
-                        let out = with_partition_column(out, partition_calc.as_ref())?;
-                        writer.write(out).await.map_err(to_datafusion_error)?;
+                    MorActionPlan::Insert(_) => {
+                        pool.dispatch(WriteItem::Insert { subset, clause: ci })
+                            .await?;
                     }
                     MorActionPlan::Update(assignments) => {
                         // Evaluate SET values now (they reference join columns);
@@ -880,6 +1174,7 @@ async fn run_mor_write(
                 .collect()
         })
         .collect::<DFResult<_>>()?;
+    let update_values: Arc<Vec<Vec<ArrayRef>>> = Arc::new(update_values);
 
     let mut new_delete_files: Vec<DataFile> = Vec::new();
     let mut removed_delete_files: Vec<DataFile> = Vec::new();
@@ -905,13 +1200,16 @@ async fn run_mor_write(
             .select(select)
             .build()
             .map_err(to_datafusion_error)?;
-        let tasks: Vec<FileScanTask> = scan
-            .plan_files()
-            .await
-            .map_err(to_datafusion_error)?
-            .try_collect()
-            .await
-            .map_err(to_datafusion_error)?;
+        let tasks: Vec<FileScanTask> =
+            with_deadline(deadline, "planning the late-materialization scan", async {
+                scan.plan_files()
+                    .await
+                    .map_err(to_datafusion_error)?
+                    .try_collect()
+                    .await
+                    .map_err(to_datafusion_error)
+            })
+            .await??;
         let fetch_tasks: Vec<FileScanTask> = tasks
             .into_iter()
             .filter(|t| affected.contains(t.data_file_path()))
@@ -954,7 +1252,14 @@ async fn run_mor_write(
             .stream();
 
         let mut alive: HashMap<String, RoaringTreemap> = HashMap::new();
-        while let Some(fbatch) = fetch_stream.try_next().await.map_err(to_datafusion_error)? {
+        while let Some(fbatch) = with_deadline(
+            deadline,
+            "reading matched rows for late materialization",
+            fetch_stream.try_next(),
+        )
+        .await?
+        .map_err(to_datafusion_error)?
+        {
             if fbatch.num_rows() == 0 {
                 continue;
             }
@@ -995,55 +1300,25 @@ async fn run_mor_write(
             if fetch_rows.is_empty() {
                 continue;
             }
-
-            // Build updated row versions: fetched row, SET columns overridden.
-            // Group by clause (different clauses assign different columns).
-            let mut by_clause: HashMap<u32, (Vec<u32>, Vec<u64>)> = HashMap::new();
-            for (i, m) in stored.iter().enumerate() {
-                let e = by_clause.entry(m.clause).or_default();
-                e.0.push(fetch_rows[i]);
-                e.1.push(m.update_row as u64);
-            }
-            for (clause, (rows, store_rows)) in by_clause {
-                let MorActionPlan::Update(assignments) = &clauses[clause as usize].action else {
-                    unreachable!("only update clauses collect fetch rows");
-                };
-                let take_idx = UInt32Array::from(rows);
-                let store_idx = UInt64Array::from(store_rows);
-                let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_arrow.fields().len());
-                for field in table_arrow.fields() {
-                    let assigned = assignments
-                        .iter()
-                        .position(|(name, _)| name == field.name());
-                    let arr = match assigned {
-                        Some(a) => {
-                            take(update_values[clause as usize][a].as_ref(), &store_idx, None)?
-                        }
-                        None => {
-                            let src_idx = fb_schema
-                                .index_of(field.name())
-                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                            take(fbatch.column(src_idx).as_ref(), &take_idx, None)?
-                        }
-                    };
-                    let arr = if arr.data_type() == field.data_type() {
-                        arr
-                    } else {
-                        cast(arr.as_ref(), field.data_type())?
-                    };
-                    columns.push(arr);
-                }
-                let out = RecordBatch::try_new(Arc::clone(&table_arrow), columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                let out = shred_record_batch(&out, &shred_plain).map_err(to_datafusion_error)?;
-                let out = with_partition_column(out, partition_calc.as_ref())?;
-                writer.write(out).await.map_err(to_datafusion_error)?;
-            }
+            // The updated row versions (fetched row, SET columns overridden)
+            // are built inside the writer task — the full-width copy is part
+            // of the parallelized write path.
+            pool.dispatch(WriteItem::Fetched {
+                batch: fbatch,
+                rows: fetch_rows,
+                stored,
+                update_values: Arc::clone(&update_values),
+            })
+            .await?;
         }
 
         // One consolidated DV per affected file: everything already deleted
-        // (full range minus alive) plus this merge's matched positions.
+        // (full range minus alive) plus this merge's matched positions. The
+        // bitmaps are built synchronously (they read the bookkeeping maps);
+        // the Puffin uploads are small independent PUTs, written concurrently
+        // from fully owned state.
         let location = table.metadata().location().to_string();
+        let mut dv_jobs = Vec::with_capacity(per_file.len());
         for (file, task) in &per_file {
             let record_count = task.record_count.ok_or_else(|| {
                 DataFusionError::Internal(format!("no record count for data file {file}"))
@@ -1066,12 +1341,29 @@ async fn run_mor_write(
                 .map(|s| s.spec_id())
                 .unwrap_or_else(|| table.metadata().default_partition_spec_id());
             let dv_path = format!("{location}/data/{}-deletes.puffin", Uuid::now_v7());
-            let dv_file = DeleteVector::new(bitmap)
-                .write_to_puffin_file(table.file_io(), dv_path, file.clone(), partition, spec_id)
-                .await
-                .map_err(to_datafusion_error)?;
-            new_delete_files.push(dv_file);
+            dv_jobs.push((file.clone(), bitmap, partition, spec_id, dv_path));
         }
+        let file_io = table.file_io().clone();
+        let dv_futs =
+            dv_jobs
+                .into_iter()
+                .map(move |(file, bitmap, partition, spec_id, dv_path)| {
+                    let file_io = file_io.clone();
+                    async move {
+                        DeleteVector::new(bitmap)
+                            .write_to_puffin_file(&file_io, dv_path, file, partition, spec_id)
+                            .await
+                            .map_err(to_datafusion_error)
+                    }
+                });
+        new_delete_files = with_deadline(
+            deadline,
+            "writing deletion vectors",
+            futures::stream::iter(dv_futs)
+                .buffer_unordered(MOR_DV_WRITE_CONCURRENCY)
+                .try_collect::<Vec<DataFile>>(),
+        )
+        .await??;
 
         // Resolve the prior delete files being superseded to their manifest
         // DataFile entries (sourced from the SCAN's per-file binding).
@@ -1080,11 +1372,16 @@ async fn run_mor_write(
             .flat_map(|t| t.deletes.iter().map(|d| d.file_path.clone()))
             .collect();
         if !prior_paths.is_empty() {
-            removed_delete_files = resolve_delete_files(&table, snapshot_id, &prior_paths).await?;
+            removed_delete_files = with_deadline(
+                deadline,
+                "resolving superseded delete files",
+                resolve_delete_files(&table, snapshot_id, &prior_paths),
+            )
+            .await??;
         }
     }
 
-    let data_files = writer.close().await.map_err(to_datafusion_error)?;
+    let data_files = pool.finish().await?;
 
     // Serialize the three lanes.
     let partition_type = table.metadata().default_partition_type().clone();

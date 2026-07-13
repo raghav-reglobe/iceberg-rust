@@ -34,8 +34,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
 use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_datafusion::functions::register_variant_functions;
+use iceberg_datafusion::{IcebergCatalogProvider, MorMergeOptions};
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -115,12 +115,16 @@ fn parse_scan_files(scan_files: Option<HashMap<String, Vec<String>>>) -> PyResul
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
     mut scan_files: ScanFiles,
+    options: Option<Arc<MorMergeOptions>>,
 ) -> PyResult<SessionContext> {
     // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
     // are mixed-case, and the in-flight MERGE planner drops the quote flag on
     // INSERT/SET column names, so normalization would lowercase them anyway.
-    let config = datafusion::execution::context::SessionConfig::new()
+    let mut config = datafusion::execution::context::SessionConfig::new()
         .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+    if let Some(options) = options {
+        config = config.with_extension(options);
+    }
     let ctx = SessionContext::new_with_config(config);
     register_variant_functions(&ctx);
     for (name, props) in catalogs {
@@ -150,6 +154,27 @@ async fn session_with_catalogs(
     Ok(ctx)
 }
 
+/// Await `fut`, raising when the merge deadline passes first. Only used for
+/// phases that perform no writes (mounting, planning) — the execution phase
+/// enforces the same deadline cooperatively inside the write node so the
+/// commit is never cancelled mid-flight.
+async fn doorway_deadline<T>(
+    deadline: Option<std::time::Instant>,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> PyResult<T> {
+    match deadline {
+        None => Ok(fut.await),
+        Some(d) => tokio::time::timeout_at(tokio::time::Instant::from_std(d), fut)
+            .await
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "merge timeout exceeded while {what} (no writes were performed)"
+                ))
+            }),
+    }
+}
+
 /// Execute one `MERGE INTO` statement and block until its snapshot commits.
 ///
 /// `catalogs` maps each SQL catalog name to Iceberg REST catalog properties
@@ -158,24 +183,44 @@ async fn session_with_catalogs(
 /// optionally restricts named tables' scans to an externally planned set of
 /// data-file paths: `{"catalog.namespace.table": ["s3://.../f.parquet", ...]}`
 /// (deletes still apply to the retained files; unknown identifiers raise).
-/// Returns a dict with `count` — the number of rows appended by the merge
-/// (inserts plus updated row versions). Raises `ValueError` on planning or
-/// execution failure.
+/// `timeout_s` bounds the merge: mounting, planning and the scan/write phase
+/// abort once it elapses (cooperatively inside the write node — the snapshot
+/// commit itself is never cancelled; a timed-out merge writes NO snapshot).
+/// `write_workers` sizes the writer pool for appended output (default:
+/// min(4, cores)). Returns a dict with `count` — the number of rows appended
+/// by the merge (inserts plus updated row versions). Raises `ValueError` on
+/// planning or execution failure, and on deadline expiry.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None))]
 fn merge_into(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
     scan_files: Option<HashMap<String, Vec<String>>>,
+    timeout_s: Option<u64>,
+    write_workers: Option<usize>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
+    // The deadline covers catalog mounting, planning and the scan/write
+    // phase (enforced cooperatively inside the merge write node). The
+    // snapshot COMMIT is deliberately outside it — cancelling a REST commit
+    // in flight leaves the outcome unknown; once the write phase finishes
+    // under deadline, the commit runs to completion.
+    let deadline = timeout_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files).await?;
-            let df = ctx
-                .sql(&sql)
-                .await
+            let options = Arc::new(MorMergeOptions {
+                deadline,
+                write_workers,
+            });
+            let ctx = doorway_deadline(
+                deadline,
+                "mounting catalogs",
+                session_with_catalogs(catalogs, scan_files, Some(options)),
+            )
+            .await??;
+            let df = doorway_deadline(deadline, "planning MERGE", ctx.sql(&sql))
+                .await?
                 .map_err(|e| PyValueError::new_err(format!("planning MERGE: {e}")))?;
             let batches = df
                 .collect()
@@ -212,7 +257,7 @@ fn dry_run_inspect(
     let scan_files = parse_scan_files(scan_files)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files, None).await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -253,7 +298,7 @@ fn sql_collect(
     let scan_files = parse_scan_files(scan_files)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files, None).await?;
             let df = ctx
                 .sql(&sql)
                 .await

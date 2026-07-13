@@ -18,6 +18,7 @@
 pub(crate) mod commit;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod merge_mor;
+pub use merge_mor::MorMergeOptions;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;
 pub(crate) mod repartition;
