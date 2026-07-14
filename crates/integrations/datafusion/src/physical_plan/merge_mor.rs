@@ -63,7 +63,8 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::variant_shred::{
-    shred_record_batch, shred_types_from_file_schema, shredded_output_type, variant_column_count,
+    conform_batch_variants, shred_record_batch, shred_shape_compatible,
+    shred_types_with_arrow_from_file_schema, shredded_output_type, variant_column_count,
 };
 use iceberg::arrow::{
     ArrowFileReader, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator,
@@ -350,7 +351,12 @@ async fn writer_task(
             let out = if to_shred.is_empty() {
                 out
             } else {
-                shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?
+                // The kernel's output layout differs from the file-derived
+                // writer layout (child order, BinaryView); conform it —
+                // columnar metadata shuffling, not row work.
+                let shredded = shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?;
+                conform_batch_variants(&shredded, &ctx.shred_overrides)
+                    .map_err(to_datafusion_error)?
             };
             let out = with_partition_column(out, partition_calc.as_ref())?;
             if writer.is_none() {
@@ -1003,7 +1009,7 @@ struct MatchedRow {
 async fn merge_shred_types(
     table: &Table,
     snapshot_id: Option<i64>,
-) -> DFResult<HashMap<String, DataType>> {
+) -> DFResult<HashMap<String, (DataType, DataType)>> {
     let table_schema = table.metadata().current_schema();
     let n_variant = variant_column_count(table_schema);
     let Some(snapshot_id) = snapshot_id else {
@@ -1018,7 +1024,7 @@ async fn merge_shred_types(
         .build()
         .map_err(to_datafusion_error)?;
     let mut tasks = scan.plan_files().await.map_err(to_datafusion_error)?;
-    let mut out: HashMap<String, DataType> = HashMap::new();
+    let mut out: HashMap<String, (DataType, DataType)> = HashMap::new();
     let mut probed = 0usize;
     while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
         let input = table
@@ -1043,8 +1049,8 @@ async fn merge_shred_types(
                     .into(),
                 )
             })?;
-        for (name, plain) in shred_types_from_file_schema(meta.schema(), table_schema) {
-            out.entry(name).or_insert(plain);
+        for (name, pair) in shred_types_with_arrow_from_file_schema(meta.schema(), table_schema) {
+            out.entry(name).or_insert(pair);
         }
         probed += 1;
         if out.len() == n_variant || probed >= MERGE_SHRED_PROBE_FILES {
@@ -1085,7 +1091,7 @@ async fn run_mor_write(
     // each variant column's layout from the table's existing files, and give
     // the writer the exact shredded arrow types the (shredded) batches will
     // carry. Empty map = canonical output, the untouched default.
-    let shred_plain = if table_props.parquet_shred_variants {
+    let shred_pairs = if table_props.parquet_shred_variants {
         with_deadline(deadline, "deriving the shredding layout", async {
             merge_shred_types(&table, snapshot_id).await
         })
@@ -1093,15 +1099,33 @@ async fn run_mor_write(
     } else {
         HashMap::new()
     };
-    let shred_overrides: HashMap<String, DataType> = shred_plain
+    // The writer layout is the FILE's own arrow type (not the shred kernel's
+    // probe output): late-fetched columns from same-layout files then compare
+    // equal and PASS THROUGH; kernel-shredded batches are conformed to it
+    // (child reorder + view->binary) in the writer task.
+    let shred_plain: HashMap<String, DataType> = shred_pairs
         .iter()
-        .map(|(name, plain)| {
+        .map(|(name, (plain, _))| (name.clone(), plain.clone()))
+        .collect();
+    let shred_overrides: HashMap<String, DataType> = shred_pairs
+        .into_iter()
+        .map(|(name, (plain, file_type))| {
             let idx = table_arrow
-                .index_of(name)
+                .index_of(&name)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let out_type = shredded_output_type(table_arrow.field(idx).data_type(), plain)
+            let kernel_type = shredded_output_type(table_arrow.field(idx).data_type(), &plain)
                 .map_err(to_datafusion_error)?;
-            Ok((name.clone(), out_type))
+            // Only adopt the file layout when the kernel's output can be
+            // conformed onto it (same child sets, order/view aside); a
+            // value-only shred node in the file would make the kernel output
+            // unconformable -> keep the kernel layout for that column (no
+            // passthrough, PQ-1 behavior).
+            let target = if shred_shape_compatible(&kernel_type, &file_type) {
+                file_type
+            } else {
+                kernel_type
+            };
+            Ok((name, target))
         })
         .collect::<DFResult<_>>()?;
 

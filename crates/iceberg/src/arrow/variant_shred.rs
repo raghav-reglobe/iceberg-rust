@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StructArray, new_empty_array};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, new_empty_array};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
 use parquet::variant::{VariantArray, shred_variant};
 
@@ -106,6 +106,24 @@ pub fn shred_types_from_file_schema(
     file_schema: &ArrowSchema,
     table_schema: &Schema,
 ) -> HashMap<String, DataType> {
+    shred_types_with_arrow_from_file_schema(file_schema, table_schema)
+        .into_iter()
+        .map(|(name, (plain, _))| (name, plain))
+        .collect()
+}
+
+/// Like [`shred_types_from_file_schema`], but ALSO returns the file's OWN
+/// full arrow type for each shredded variant column (verbatim, as the scan
+/// will produce it raw). The file type — not the shred kernel's probe output
+/// — is the writer layout that makes shredded PASSTHROUGH possible: a
+/// late-fetched column from a same-layout file compares equal byte-for-byte
+/// (the kernel's output differs in child ORDER and uses BinaryView where
+/// files carry Binary, so exact equality against a kernel-derived layout
+/// never holds).
+pub fn shred_types_with_arrow_from_file_schema(
+    file_schema: &ArrowSchema,
+    table_schema: &Schema,
+) -> HashMap<String, (DataType, DataType)> {
     let mut out = HashMap::new();
     for field in file_schema.fields() {
         let Some(iceberg_field) = table_schema.field_by_name(field.name()) else {
@@ -121,10 +139,138 @@ pub fn shred_types_from_file_schema(
             continue; // canonical in the input -> canonical in the output
         };
         if let Some(plain) = unwrap_typed_value(tv.data_type()) {
-            out.insert(field.name().to_string(), plain);
+            out.insert(field.name().to_string(), (plain, field.data_type().clone()));
         }
     }
     out
+}
+
+/// Are two shredded layouts the SAME SHAPE modulo child order and
+/// Binary/BinaryView leaves — i.e. can [`conform_variant_to_type`] map one
+/// onto the other losslessly? False when either side has a child the other
+/// lacks (e.g. a value-only shred node the plain derivation skips).
+pub fn shred_shape_compatible(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        (DataType::Struct(ac), DataType::Struct(bc)) => {
+            if ac.len() != bc.len() {
+                return false;
+            }
+            ac.iter().all(|af| {
+                bc.iter()
+                    .find(|bf| bf.name() == af.name())
+                    .is_some_and(|bf| shred_shape_compatible(af.data_type(), bf.data_type()))
+            })
+        }
+        (DataType::List(ae), DataType::List(be))
+        | (DataType::LargeList(ae), DataType::LargeList(be)) => {
+            shred_shape_compatible(ae.data_type(), be.data_type())
+        }
+        (DataType::Binary, DataType::BinaryView)
+        | (DataType::BinaryView, DataType::Binary)
+        | (DataType::Utf8, DataType::Utf8View)
+        | (DataType::Utf8View, DataType::Utf8) => true,
+        (x, y) => x == y,
+    }
+}
+
+/// Structurally conform a (shredded) variant array to `target`: match struct
+/// children BY NAME (the shred kernel orders object fields differently than
+/// files do), recurse through lists, and cast BinaryView <-> Binary leaves
+/// (the kernel emits views; files carry plain binary). This is COLUMNAR
+/// metadata shuffling — child arrays are moved, not row-decoded; the only
+/// buffer work is the view->binary cast. Errors loudly on a child the target
+/// has that the source lacks (a genuine layout mismatch — the caller should
+/// have folded + re-shredded that column instead).
+pub fn conform_variant_to_type(arr: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
+    if arr.data_type() == target {
+        return Ok(Arc::clone(arr));
+    }
+    match (arr.data_type(), target) {
+        (DataType::Struct(_), DataType::Struct(tchildren)) => {
+            let src = arr
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct type is a StructArray");
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(tchildren.len());
+            for tf in tchildren.iter() {
+                let child = src.column_by_name(tf.name()).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "conforming variant layout: source struct lacks child `{}`",
+                            tf.name()
+                        ),
+                    )
+                })?;
+                cols.push(conform_variant_to_type(child, tf.data_type())?);
+            }
+            Ok(Arc::new(StructArray::new(
+                tchildren.clone(),
+                cols,
+                src.nulls().cloned(),
+            )) as ArrayRef)
+        }
+        (DataType::List(_), DataType::List(tel)) => {
+            let src = arr
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .expect("list type is a ListArray");
+            let values = conform_variant_to_type(src.values(), tel.data_type())?;
+            Ok(Arc::new(arrow_array::ListArray::new(
+                Arc::clone(tel),
+                src.offsets().clone(),
+                values,
+                src.nulls().cloned(),
+            )) as ArrayRef)
+        }
+        // Leaf conversions the kernel-vs-file split produces (BinaryView vs
+        // Binary); any other leaf difference is a real mismatch -> cast()
+        // errors loudly.
+        _ => arrow_cast::cast(arr.as_ref(), target).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("conforming variant leaf {} -> {target}", arr.data_type()),
+            )
+            .with_source(e)
+        }),
+    }
+}
+
+/// Conform the named (already shredded) variant columns of a batch to the
+/// writer's target layouts. Columns already matching pass through untouched.
+pub fn conform_batch_variants(
+    batch: &RecordBatch,
+    targets: &HashMap<String, DataType>,
+) -> Result<RecordBatch> {
+    if targets.is_empty() {
+        return Ok(batch.clone());
+    }
+    let schema = batch.schema();
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut changed = false;
+    for (name, target) in targets {
+        let Ok(idx) = schema.index_of(name) else {
+            continue;
+        };
+        if columns[idx].data_type() == target {
+            continue;
+        }
+        let conformed = conform_variant_to_type(&columns[idx], target)?;
+        fields[idx] = Arc::new(fields[idx].as_ref().clone().with_data_type(target.clone()));
+        columns[idx] = conformed;
+        changed = true;
+    }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    let new_schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, columns).map_err(|e| {
+        Error::new(ErrorKind::DataInvalid, "rebuilding conformed batch").with_source(e)
+    })
 }
 
 /// The number of variant columns in an iceberg schema — the derivation's
