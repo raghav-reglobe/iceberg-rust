@@ -71,6 +71,7 @@ use iceberg::arrow::{
     schema_to_arrow_schema,
 };
 use iceberg::delete_vector::DeleteVector;
+use iceberg::expr::Predicate as IcebergPredicate;
 use iceberg::io::FileMetadata;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::scan::FileScanTask;
@@ -497,6 +498,12 @@ pub(crate) struct IcebergMorTargetScanExec {
     columns: Vec<String>,
     schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
+    /// Iceberg predicate from target-only ON residuals — partition/file
+    /// PRUNING only (best-effort; may be None when unconvertible).
+    predicate: Option<IcebergPredicate>,
+    /// The same residuals bound row-exactly against the scan output schema;
+    /// the semantics guarantee (applied to every batch).
+    residual: Option<Arc<dyn PhysicalExpr>>,
 }
 
 impl IcebergMorTargetScanExec {
@@ -505,6 +512,8 @@ impl IcebergMorTargetScanExec {
         snapshot_id: Option<i64>,
         columns: Vec<String>,
         data_fields: Vec<Field>,
+        predicate: Option<IcebergPredicate>,
+        residual: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
         let mut fields = data_fields;
         fields.push(Field::new(RESERVED_COL_NAME_FILE, DataType::Utf8, false));
@@ -522,6 +531,8 @@ impl IcebergMorTargetScanExec {
             columns,
             schema,
             plan_properties,
+            predicate,
+            residual,
         }
     }
 }
@@ -532,7 +543,14 @@ impl DisplayAs for IcebergMorTargetScanExec {
             f,
             "IcebergMorTargetScanExec: columns=[{}]",
             self.columns.join(",")
-        )
+        )?;
+        if let Some(p) = &self.predicate {
+            write!(f, " prune:[{p}]")?;
+        }
+        if let Some(r) = &self.residual {
+            write!(f, " residual:[{r}]")?;
+        }
+        Ok(())
     }
 }
 
@@ -567,12 +585,17 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
         select.push(RESERVED_COL_NAME_FILE.to_string());
         select.push(RESERVED_COL_NAME_POS.to_string());
         let out_schema = Arc::clone(&self.schema);
+        let predicate = self.predicate.clone();
+        let residual = self.residual.clone();
 
         let stream_schema = Arc::clone(&out_schema);
         let fut = async move {
             let mut builder = table.scan();
             if let Some(id) = snapshot_id {
                 builder = builder.snapshot_id(id);
+            }
+            if let Some(pred) = predicate {
+                builder = builder.with_filter(pred);
             }
             let scan = builder
                 .select(select)
@@ -581,7 +604,24 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
             let stream = scan.to_arrow().await.map_err(to_datafusion_error)?;
             let out = stream.map(move |batch| {
                 let batch = batch.map_err(to_datafusion_error)?;
-                plain_cast_batch(&batch, &stream_schema)
+                let batch = plain_cast_batch(&batch, &stream_schema)?;
+                match &residual {
+                    None => Ok(batch),
+                    Some(expr) => {
+                        let mask = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+                        let mask = mask
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "target residual must evaluate to boolean".to_string(),
+                                )
+                            })?
+                            .clone();
+                        filter_record_batch(&batch, &mask)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    }
+                }
             });
             Ok::<_, DataFusionError>(Box::pin(out))
         };

@@ -39,6 +39,7 @@ use iceberg::Catalog;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::merge_mor::{
     IcebergMorMergeCommitExec, IcebergMorMergeExec, IcebergMorMergeWriteExec,
     IcebergMorTargetScanExec, MorActionPlan, MorClausePlan,
@@ -145,10 +146,29 @@ pub(crate) async fn build_mor_merge_plan(
     let target_df = DFSchema::try_from_qualified_schema(target_ref.clone(), &narrow_arrow)?;
     let combined_df = source_schema.join(&target_df)?;
 
-    // ON condition: a conjunction of source-side = target-side equalities.
+    // ON condition: a conjunction of source-side = target-side equalities,
+    // plus optional TARGET-ONLY residual conjuncts (e.g. the SCD2 demote
+    // prune `t._is_current = true`). A residual filters the target scan —
+    // pushed as an iceberg predicate for partition/file pruning AND
+    // re-applied row-exactly on the scan output, so MERGE semantics hold
+    // even where the iceberg pushdown is inexact.
     let mut join_on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = Vec::new();
+    let mut residuals: Vec<Expr> = Vec::new();
     for conjunct in split_conjunction(&on) {
-        let Expr::BinaryExpr(binary) = unalias_ref(conjunct) else {
+        let unaliased = unalias_ref(conjunct);
+        // Target-only (or column-free) conjunct -> target scan residual.
+        let mut only_target = true;
+        for col in unaliased.column_refs() {
+            if classify(col)? != Side::Target {
+                only_target = false;
+                break;
+            }
+        }
+        if only_target {
+            residuals.push(strip_qualifiers(unaliased.clone()));
+            continue;
+        }
+        let Expr::BinaryExpr(binary) = unaliased else {
             return Err(DataFusionError::NotImplemented(format!(
                 "MERGE ON condition must be a conjunction of equalities, got: {conjunct}"
             )));
@@ -180,6 +200,24 @@ pub(crate) async fn build_mor_merge_plan(
             "MERGE ON condition requires at least one equality".to_string(),
         ));
     }
+
+    // Bind the residuals for row-exact filtering (against the UNQUALIFIED
+    // narrow scan schema) and convert them to an iceberg predicate for
+    // scan pruning (best-effort; the row filter is what guarantees
+    // semantics).
+    let (target_residual, target_predicate) = if residuals.is_empty() {
+        (None, None)
+    } else {
+        let combined = residuals
+            .iter()
+            .cloned()
+            .reduce(|a, b| a.and(b))
+            .expect("non-empty residuals");
+        let narrow_unqualified = DFSchema::try_from(narrow_arrow.clone())?;
+        let bound = state.create_physical_expr(combined, &narrow_unqualified)?;
+        let predicate = convert_filters_to_predicate(&narrow_arrow, &residuals);
+        (Some(bound), predicate)
+    };
 
     // Bind the WHEN clauses to the join output schema.
     let mut mor_clauses: Vec<MorClausePlan> = Vec::with_capacity(clauses.len());
@@ -242,6 +280,8 @@ pub(crate) async fn build_mor_merge_plan(
         snapshot_id,
         narrow_names,
         narrow_fields,
+        target_predicate,
+        target_residual,
     )) as Arc<dyn ExecutionPlan>;
     let merge = Arc::new(IcebergMorMergeExec::new(
         source,
@@ -262,6 +302,23 @@ pub(crate) async fn build_mor_merge_plan(
         snapshot_id,
         coalesce,
     )))
+}
+
+/// Rewrite every column reference to its UNQUALIFIED form so a target-side
+/// residual (`t._is_current = true`) binds against the unqualified narrow
+/// scan schema and converts to an iceberg predicate by plain column name.
+fn strip_qualifiers(expr: Expr) -> Expr {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    expr.transform(|e| {
+        Ok(match e {
+            Expr::Column(c) if c.relation.is_some() => Transformed::yes(Expr::Column(
+                datafusion::common::Column::new_unqualified(c.name),
+            )),
+            other => Transformed::no(other),
+        })
+    })
+    .expect("infallible transform")
+    .data
 }
 
 fn unalias_ref(expr: &Expr) -> &Expr {

@@ -125,7 +125,36 @@ async fn session_with_catalogs(
     if let Some(options) = options {
         config = config.with_extension(options);
     }
-    let ctx = SessionContext::new_with_config(config);
+    // Memory safety: an explicit memory pool makes DataFusion's sort/window/
+    // aggregate operators SPILL instead of OOM-killing the process (the
+    // merge's union sort is the big resident; a row cap alone cannot bound
+    // memory — width varies per table). Env-configured so the worker sizes
+    // it to the pod: MERGE_DF_MEMORY_LIMIT_MB (unset = unbounded, the
+    // previous behavior) + MERGE_DF_SPILL_DIR (unset = OS temp dir).
+    let ctx = match std::env::var("MERGE_DF_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        None => SessionContext::new_with_config(config),
+        Some(limit_mb) => {
+            let mut rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_limit(limit_mb * 1024 * 1024, 1.0);
+            if let Ok(dir) = std::env::var("MERGE_DF_SPILL_DIR") {
+                rt = rt.with_disk_manager_builder(
+                    datafusion::execution::disk_manager::DiskManagerBuilder::default()
+                        .with_mode(
+                            datafusion::execution::disk_manager::DiskManagerMode::Directories(
+                                vec![dir.into()],
+                            ),
+                        ),
+                );
+            }
+            let rt = rt
+                .build_arc()
+                .map_err(|e| PyValueError::new_err(format!("building runtime env: {e}")))?;
+            SessionContext::new_with_config_rt(config, rt)
+        }
+    };
     register_variant_functions(&ctx);
     for (name, props) in catalogs {
         let catalog = get_or_build_catalog(&name, props).await?;

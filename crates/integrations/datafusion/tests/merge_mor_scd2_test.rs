@@ -414,6 +414,55 @@ async fn scd2_merge_demotes_via_dv_and_inserts_in_one_snapshot() {
     assert_eq!(dvs[0].1, 1, "seed DV covers exactly the demoted row");
 }
 
+/// The demote-prune form: bare `AND t._is_current` as a TARGET-ONLY ON
+/// residual (bare truthy — `= true` trips the boolean-simplify rule against
+/// the source-only Dml schema; the bare column passes the logical optimizer)
+/// must plan (pushed to the target scan as a prune + row filter)
+/// and produce byte-identical SCD2 state to the unpruned statement — no
+/// batch or demote row can ever match a non-current target row (the
+/// idempotency/SCD2 invariants), so filtering the scan changes nothing.
+#[tokio::test]
+async fn target_only_on_residual_prunes_target_scan() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup(
+        &warehouse,
+        &[
+            (1, "a", 10, None, true, 100),
+            (2, "b", 10, None, true, 101),
+            (3, "c", 10, None, true, 102),
+        ],
+        &[(1, "a2", 20, 200), (4, "d", 20, 203)],
+    )
+    .await;
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let pruned = scd2_merge_sql().replace(
+        "ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset",
+        "ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+         AND t._is_current",
+    );
+    assert_ne!(pruned, scd2_merge_sql(), "replacement must have applied");
+    ctx.sql(&pruned).await.unwrap().collect().await.unwrap();
+
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+
+    let state = read_state(&ctx).await;
+    assert_eq!(state, vec![
+        (1, "a".to_string(), 10, Some(20), false),
+        (1, "a2".to_string(), 20, None, true),
+        (2, "b".to_string(), 10, None, true),
+        (3, "c".to_string(), 10, None, true),
+        (4, "d".to_string(), 20, None, true),
+    ]);
+
+    let dvs = live_dvs(&table).await;
+    assert_eq!(dvs.len(), 1, "one DV total: {dvs:?}");
+    assert_eq!(dvs[0].1, 1, "seed DV covers exactly the demoted row");
+}
+
 #[tokio::test]
 async fn second_merge_consolidates_dvs_per_file() {
     let warehouse = TempDir::new().unwrap();
