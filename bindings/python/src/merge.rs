@@ -122,6 +122,17 @@ async fn session_with_catalogs(
     // INSERT/SET column names, so normalization would lowercase them anyway.
     let mut config = datafusion::execution::context::SessionConfig::new()
         .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+    // Plan-level parallelism: DataFusion defaults target_partitions to the
+    // HOST core count, which on an over-subscribed container multiplies every
+    // per-partition buffer (sorts, repartitions, join builds) past the pod's
+    // memory for zero extra throughput. Env-tunable alongside the pool.
+    if let Some(n) = std::env::var("MERGE_DF_TARGET_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        config = config.with_target_partitions(n);
+    }
     if let Some(options) = options {
         config = config.with_extension(options);
     }
@@ -141,12 +152,11 @@ async fn session_with_catalogs(
                 .with_memory_limit(limit_mb * 1024 * 1024, 1.0);
             if let Ok(dir) = std::env::var("MERGE_DF_SPILL_DIR") {
                 rt = rt.with_disk_manager_builder(
-                    datafusion::execution::disk_manager::DiskManagerBuilder::default()
-                        .with_mode(
-                            datafusion::execution::disk_manager::DiskManagerMode::Directories(
-                                vec![dir.into()],
-                            ),
-                        ),
+                    datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(
+                        datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
+                            dir.into(),
+                        ]),
+                    ),
                 );
             }
             let rt = rt
