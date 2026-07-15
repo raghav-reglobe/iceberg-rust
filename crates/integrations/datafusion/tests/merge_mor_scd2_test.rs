@@ -43,9 +43,9 @@ use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchem
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList,
-    NestedField, PartitionKey, PrimitiveType, Schema, Struct as IcebergStruct, Transform, Type,
-    UnboundPartitionSpec, VariantType,
+    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, ManifestContentType,
+    ManifestList, NestedField, PartitionKey, PrimitiveType, Schema, Struct as IcebergStruct,
+    Transform, Type, UnboundPartitionSpec, VariantType,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -157,12 +157,24 @@ fn cdc_batch(rows: &[(i32, &str, i64, i64)]) -> RecordBatch {
 }
 
 async fn write_one_data_file(table: &Table, batch: RecordBatch) -> Vec<iceberg::spec::DataFile> {
+    write_one_data_file_prefixed(table, batch, "seed").await
+}
+
+/// `DefaultFileNameGenerator` is deterministic per instance (prefix-00000...),
+/// so a SECOND file written to the same table needs its own prefix or it
+/// silently OVERWRITES the first (and any DV on that path then applies to
+/// the new rows by position).
+async fn write_one_data_file_prefixed(
+    table: &Table,
+    batch: RecordBatch,
+    prefix: &str,
+) -> Vec<iceberg::spec::DataFile> {
     let schema = table.metadata().current_schema().clone();
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         ParquetWriterBuilder::new(WriterProperties::builder().build(), schema),
         table.file_io().clone(),
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
-        DefaultFileNameGenerator::new("seed".to_string(), None, DataFileFormat::Parquet),
+        DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet),
     );
     // Every seed row is `_is_current = true` — one identity partition.
     let partition_key = PartitionKey::new(
@@ -1589,4 +1601,141 @@ async fn deadline_aborts_merge_before_commit() {
     );
     let state = read_state(&ctx).await;
     assert_eq!(state, vec![(1, "a".to_string(), 10, None, true)]);
+}
+
+// ── Commit-time OCC validation (SnapshotValidator) against doorway state ────
+//
+// These reproduce the optimistic-concurrency rebase deterministically: a
+// writer holds a STALE table handle (planned at S1), a doorway MERGE commits
+// S2 in between, and the stale writer's commit must be validated against the
+// REAL manifests/DVs the doorway wrote into the skipped range. The genuinely
+// parallel two-merge race is exercised in the in-cluster shadow gate.
+
+/// Metadata-only DV DataFile referencing `referenced` (commit-path test only).
+fn stale_dv(table: &Table, path: &str, referenced: &str) -> iceberg::spec::DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::PositionDeletes)
+        .file_path(path.to_string())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(50)
+        .record_count(1)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(IcebergStruct::from_iter(vec![Some(Literal::bool(true))]))
+        .referenced_data_file(Some(referenced.to_string()))
+        .build()
+        .unwrap()
+}
+
+/// serializable (default): a stale-based commit must abort after a doorway
+/// merge landed in its skipped range — validated on the doorway's own
+/// manifest-list output.
+#[tokio::test]
+async fn test_occ_stale_commit_conflicts_after_doorway_merge_serializable() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(1, "b", 20, 2)]).await;
+
+    let stale = load_table(&catalog).await; // handle pinned at S1
+    let s1 = stale.metadata().current_snapshot_id().unwrap();
+
+    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2
+
+    let current = load_table(&catalog).await;
+    let seed_path = live_dvs(&current).await[0].0.clone();
+
+    let tx = Transaction::new(&stale);
+    let action = tx
+        .row_delta()
+        .add_delete_files(vec![stale_dv(&stale, "test/stale-dv.parquet", &seed_path)])
+        .validate_from_snapshot(s1);
+    let err = match action.apply(tx).unwrap().commit(catalog.as_ref()).await {
+        Ok(_) => panic!("stale commit must conflict under serializable isolation"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("Found conflicting concurrent commit"),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("serializable isolation violation"), "got: {err}");
+}
+
+/// snapshot isolation: a stale-based DV on the SAME data file the doorway
+/// merge already covered (the V3 multi-DV hazard) must abort.
+#[tokio::test]
+async fn test_occ_stale_dv_same_file_conflicts_snapshot_isolation() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup_with_props(
+        &warehouse,
+        &[(1, "a", 10, None, true, 1)],
+        &[(1, "b", 20, 2)],
+        HashMap::from([(
+            "write.merge.isolation-level".to_string(),
+            "snapshot".to_string(),
+        )]),
+    )
+    .await;
+
+    let stale = load_table(&catalog).await;
+    let s1 = stale.metadata().current_snapshot_id().unwrap();
+
+    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2: DV on seed file
+
+    let current = load_table(&catalog).await;
+    let seed_path = live_dvs(&current).await[0].0.clone();
+
+    let tx = Transaction::new(&stale);
+    let action = tx
+        .row_delta()
+        .add_delete_files(vec![stale_dv(&stale, "test/stale-dv.parquet", &seed_path)])
+        .validate_from_snapshot(s1);
+    let err = match action.apply(tx).unwrap().commit(catalog.as_ref()).await {
+        Ok(_) => panic!("double-DV commit must conflict even at snapshot isolation"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("Found conflicting concurrent commit"),
+        "got: {err}"
+    );
+}
+
+/// snapshot isolation: a stale-based PURE APPEND is a legal rebase over a
+/// doorway merge — no false positive.
+#[tokio::test]
+async fn test_occ_stale_pure_append_allowed_snapshot_isolation() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup_with_props(
+        &warehouse,
+        &[(1, "a", 10, None, true, 1)],
+        &[(1, "b", 20, 2)],
+        HashMap::from([(
+            "write.merge.isolation-level".to_string(),
+            "snapshot".to_string(),
+        )]),
+    )
+    .await;
+
+    let stale = load_table(&catalog).await;
+    let s1 = stale.metadata().current_snapshot_id().unwrap();
+
+    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2
+
+    let files =
+        write_one_data_file_prefixed(&stale, scd2_batch(&[(9, "z", 30, None, true, 9)]), "occ-append")
+            .await;
+    let tx = Transaction::new(&stale);
+    let action = tx
+        .row_delta()
+        .add_data_files(files)
+        .validate_from_snapshot(s1);
+    action
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .expect("pure append must rebase cleanly at snapshot isolation");
+
+    // The rebase preserved the doorway merge: id=1 has demoted v10 + current v20.
+    let state = read_state(&ctx).await;
+    assert!(state.contains(&(1, "b".to_string(), 20, None, true)), "state: {state:?}");
+    assert!(state.contains(&(1, "a".to_string(), 10, Some(20), false)), "state: {state:?}");
+    assert!(state.contains(&(9, "z".to_string(), 30, None, true)), "state: {state:?}");
 }

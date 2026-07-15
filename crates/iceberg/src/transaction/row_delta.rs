@@ -15,19 +15,51 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, Operation,
+};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+
+/// Commit-time conflict-validation mode, resolved from the table's
+/// `write.merge.isolation-level` property (Java `IsolationLevel` parity).
+/// Any value other than `snapshot` — including absent or unrecognized —
+/// resolves to `Serializable` (fail closed; serializable is also the Java
+/// default for row-level operations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolationLevel {
+    Serializable,
+    SnapshotIsolation,
+}
+
+fn isolation_level(props: &HashMap<String, String>) -> IsolationLevel {
+    match props.get("write.merge.isolation-level") {
+        Some(v) if v.trim().eq_ignore_ascii_case("snapshot") => IsolationLevel::SnapshotIsolation,
+        _ => IsolationLevel::Serializable,
+    }
+}
+
+/// A conflicting concurrent commit. Deliberately NON-retryable: retrying
+/// would rebase-and-commit a semantically wrong result (e.g. a second
+/// deletion vector on a data file another writer already covered — the V3
+/// multi-DV corruption class). The caller must fail its run and re-plan
+/// from its cursor against the new table state.
+fn conflict(msg: String) -> crate::Error {
+    crate::Error::new(
+        crate::ErrorKind::DataInvalid,
+        format!("Found conflicting concurrent commit: {msg}"),
+    )
+}
 
 /// Transaction action for Copy-on-Write row-level modifications (UPDATE, DELETE, MERGE INTO).
 ///
@@ -43,6 +75,12 @@ pub struct RowDeltaAction {
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     starting_snapshot_id: Option<i64>,
+    /// Set when the action was PLANNED against an empty table (no current
+    /// snapshot): any snapshot present at commit time appeared concurrently
+    /// and must be validated. Distinct from "no validation requested"
+    /// (neither this nor `starting_snapshot_id` set — Java parity: a
+    /// RowDelta without `validateFromSnapshot` performs no base validation).
+    validate_empty_base: bool,
 }
 
 impl RowDeltaAction {
@@ -55,6 +93,7 @@ impl RowDeltaAction {
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
+            validate_empty_base: false,
         }
     }
 
@@ -105,22 +144,196 @@ impl RowDeltaAction {
         self.starting_snapshot_id = Some(snapshot_id);
         self
     }
+
+    /// Declare that this action was planned against an EMPTY table (no
+    /// current snapshot). Any snapshot present at commit time then appeared
+    /// concurrently and is validated like a skipped range. Use this when the
+    /// plan-time snapshot id is None; without it, an action carrying no
+    /// `validate_from_snapshot` performs no concurrency validation at all.
+    pub fn validate_from_empty_table(mut self) -> Self {
+        self.validate_empty_base = true;
+        self
+    }
+
+    /// Validate the snapshots committed AFTER this action's base snapshot —
+    /// the range an optimistic-concurrency rebase would silently skip. Mirrors
+    /// Java's `MergingSnapshotProducer` validations driven by
+    /// `write.merge.isolation-level`:
+    ///
+    /// - `serializable` (default, and the fail-closed fallback): ANY skipped
+    ///   snapshot that added or removed files is a conflict. Manifest-
+    ///   reorganization-only snapshots (`rewrite_manifests`: EXISTING entries
+    ///   only) are allowed — they cannot change merge semantics.
+    /// - `snapshot`: concurrent pure data APPENDS are allowed. Conflicts:
+    ///   a new delete file (incl. V3 DV) whose `referenced_data_file` is a
+    ///   file this commit also targets with a DV (double-DV) or that carries
+    ///   no reference (equality delete — undecidable, fail closed); and any
+    ///   concurrent REMOVAL of a file this commit references (DV target,
+    ///   removed data file, or reabsorbed delete file).
+    ///
+    /// `base = None` means the action was planned against an empty table —
+    /// every current snapshot is "skipped". Errors are NON-retryable (see
+    /// `conflict`): the engine's backoff retry must not rebase across a
+    /// semantic conflict.
+    async fn validate_skipped_range(&self, table: &Table, base: Option<i64>) -> Result<()> {
+        let meta = table.metadata();
+
+        // 1. Collect the skipped snapshot ids, current -> base (base exclusive).
+        let mut skipped: Vec<i64> = Vec::new();
+        let mut cursor = meta.current_snapshot_id();
+        loop {
+            match cursor {
+                None => {
+                    if let Some(b) = base {
+                        return Err(conflict(format!(
+                            "base snapshot {b} is not an ancestor of the current snapshot \
+                             (concurrent rollback, branch reset, or expired lineage)"
+                        )));
+                    }
+                    break;
+                }
+                Some(id) if Some(id) == base => break,
+                Some(id) => {
+                    let snap = meta.snapshot_by_id(id).ok_or_else(|| {
+                        conflict(format!(
+                            "ancestor snapshot {id} is missing from table metadata — \
+                             cannot validate the skipped range"
+                        ))
+                    })?;
+                    skipped.push(id);
+                    cursor = snap.parent_snapshot_id();
+                }
+            }
+        }
+        if skipped.is_empty() {
+            return Ok(());
+        }
+
+        let isolation = isolation_level(meta.properties());
+
+        // 2. This commit's conflict sets.
+        let our_dv_targets: HashSet<String> = self
+            .added_delete_files
+            .iter()
+            .filter_map(|f| f.referenced_data_file())
+            .collect();
+        // An added delete file WITHOUT a referenced data file (equality
+        // delete) can apply to any file — treat as a wildcard.
+        let our_wildcard_delete = self
+            .added_delete_files
+            .iter()
+            .any(|f| f.referenced_data_file().is_none());
+        let our_removed_data: HashSet<&str> = self
+            .removed_data_files
+            .iter()
+            .map(|f| f.file_path())
+            .collect();
+        let our_removed_deletes: HashSet<&str> = self
+            .removed_delete_files
+            .iter()
+            .map(|f| f.file_path())
+            .collect();
+
+        // 3. Walk each skipped snapshot's DELTA manifests (added_snapshot_id
+        //    == that snapshot). Removals are visible here too: a removal
+        //    rewrites the affected manifest under the removing snapshot's id
+        //    with DELETED entries.
+        for id in skipped {
+            let snap = meta
+                .snapshot_by_id(id)
+                .expect("skipped snapshot resolved above");
+            let manifest_list = table.manifest_list_reader(snap).load().await?;
+            for mf in manifest_list
+                .entries()
+                .iter()
+                .filter(|m| m.added_snapshot_id == id)
+            {
+                // Unknown counts read as "has files" (fail closed).
+                let mutating = mf.has_added_files() || mf.has_deleted_files();
+                if !mutating {
+                    continue; // manifest reorganization only — semantics unchanged
+                }
+
+                if isolation == IsolationLevel::Serializable {
+                    return Err(conflict(format!(
+                        "serializable isolation violation — concurrent snapshot {id} \
+                         mutated files (manifest {}, content {:?}, added={:?} deleted={:?}) \
+                         in the range skipped since base {base:?}",
+                        mf.manifest_path, mf.content, mf.added_files_count, mf.deleted_files_count,
+                    )));
+                }
+
+                // Snapshot isolation: pure data appends are allowed; anything
+                // touching files this commit references needs the file-level check.
+                let added_deletes = mf.content == ManifestContentType::Deletes && mf.has_added_files();
+                if !added_deletes && !mf.has_deleted_files() {
+                    continue;
+                }
+                let manifest = mf.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    match entry.status() {
+                        ManifestStatus::Added if mf.content == ManifestContentType::Deletes => {
+                            let refd = entry.data_file().referenced_data_file();
+                            let collides = match refd.as_deref() {
+                                Some(p) => our_wildcard_delete || our_dv_targets.contains(p),
+                                // Concurrent equality delete — could apply to
+                                // any of our rows. Fail closed.
+                                None => true,
+                            };
+                            if collides {
+                                return Err(conflict(format!(
+                                    "concurrent snapshot {id} added delete file {} \
+                                     (referenced_data_file={refd:?}) conflicting with this \
+                                     commit's delete targets",
+                                    entry.data_file().file_path(),
+                                )));
+                            }
+                        }
+                        ManifestStatus::Deleted => {
+                            let p = entry.data_file().file_path();
+                            let hit = match mf.content {
+                                ManifestContentType::Data => {
+                                    our_dv_targets.contains(p) || our_removed_data.contains(p)
+                                }
+                                ManifestContentType::Deletes => our_removed_deletes.contains(p),
+                            };
+                            if hit {
+                                return Err(conflict(format!(
+                                    "concurrent snapshot {id} removed {} which this commit \
+                                     references (DV target, removed file, or reabsorbed delete)",
+                                    p,
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if let Some(expected_snapshot_id) = self.starting_snapshot_id
-            && table.metadata().current_snapshot_id() != Some(expected_snapshot_id)
-        {
-            return Err(crate::Error::new(
-                crate::ErrorKind::DataInvalid,
-                format!(
-                    "Cannot commit RowDelta based on stale snapshot. Expected: {}, Current: {:?}",
-                    expected_snapshot_id,
-                    table.metadata().current_snapshot_id()
-                ),
-            ));
+        // Optimistic-concurrency validation (Java SnapshotValidator parity).
+        // Fast path: table still at the action's base — nothing was skipped.
+        // Otherwise validate the skipped range instead of the previous
+        // unconditional stale-snapshot abort: a benign rebase (manifest
+        // reorganization; concurrent appends under snapshot isolation) is
+        // allowed, a semantic conflict aborts NON-retryably.
+        let current = table.metadata().current_snapshot_id();
+        match self.starting_snapshot_id {
+            Some(base) if current == Some(base) => {}
+            Some(base) => self.validate_skipped_range(table, Some(base)).await?,
+            // Planned against an empty table (explicit opt-in): any current
+            // snapshot appeared concurrently — the whole history is skipped.
+            None if self.validate_empty_base && current.is_some() => {
+                self.validate_skipped_range(table, None).await?
+            }
+            // No validation requested (Java parity).
+            None => {}
         }
 
         let mut snapshot_producer = SnapshotProducer::new(
@@ -312,6 +525,215 @@ mod tests {
             Ok(_) => panic!("expected DataInvalid error for stale snapshot"),
             Err(e) => assert_eq!(e.kind(), crate::ErrorKind::DataInvalid),
         }
+    }
+
+    // ── SnapshotValidator (skipped-range validation) tests ──────────────
+
+    /// Rebuild `base`'s table with the given properties merged in.
+    fn table_with_properties(
+        base: &Table,
+        props: std::collections::HashMap<String, String>,
+    ) -> Table {
+        let updated_metadata =
+            TableMetadataBuilder::new_from_metadata(base.metadata_ref().as_ref().clone(), None)
+                .set_properties(props)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+        Table::builder()
+            .metadata(updated_metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v2.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(base.file_io().clone())
+            .runtime(crate::test_utils::test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    /// Commit `action_table` → one snapshot via fast_append of `paths`,
+    /// returning the table advanced to that snapshot.
+    async fn append_snapshot(table: &Table, paths: &[&str]) -> Table {
+        let files: Vec<DataFile> = paths
+            .iter()
+            .map(|p| make_data_file(table, p, 100))
+            .collect();
+        let mut c = Arc::new(Transaction::new(table).fast_append().add_data_files(files))
+            .commit(table)
+            .await
+            .unwrap();
+        let snap = if let TableUpdate::AddSnapshot { snapshot } =
+            c.take_updates().into_iter().next().unwrap()
+        {
+            snapshot
+        } else {
+            panic!("expected AddSnapshot");
+        };
+        table_with_snapshot(table, snap).await
+    }
+
+    fn make_dv(table: &Table, path: &str, referenced: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(3)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .referenced_data_file(Some(referenced.to_string()))
+            .build()
+            .unwrap()
+    }
+
+    /// Commit a RowDelta adding `dv` and return the table advanced to it.
+    async fn dv_snapshot(table: &Table, dv: DataFile) -> Table {
+        let mut c = Arc::new(Transaction::new(table).row_delta().add_delete_files(vec![dv]))
+            .commit(table)
+            .await
+            .unwrap();
+        let snap = if let TableUpdate::AddSnapshot { snapshot } =
+            c.take_updates().into_iter().next().unwrap()
+        {
+            snapshot
+        } else {
+            panic!("expected AddSnapshot");
+        };
+        table_with_snapshot(table, snap).await
+    }
+
+    #[tokio::test]
+    async fn test_serializable_conflicts_on_concurrent_append_from_empty_base() {
+        // Planned against an empty table; a concurrent append landed first.
+        let base = make_v2_minimal_table(); // no isolation prop -> serializable
+        let table_s1 = append_snapshot(&base, &["test/concurrent.parquet"]).await;
+
+        let action = Transaction::new(&table_s1)
+            .row_delta()
+            .add_data_files(vec![make_data_file(&table_s1, "test/mine.parquet", 100)])
+            .validate_from_empty_table();
+        let err = match Arc::new(action).commit(&table_s1).await {
+            Ok(_) => panic!("expected conflict"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("serializable isolation violation"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_fast_path_base_equals_current() {
+        let base = make_v2_minimal_table();
+        let table_s1 = append_snapshot(&base, &["test/data.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+
+        let action = Transaction::new(&table_s1)
+            .row_delta()
+            .add_data_files(vec![make_data_file(&table_s1, "test/mine.parquet", 100)])
+            .validate_from_snapshot(s1);
+        assert!(Arc::new(action).commit(&table_s1).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_isolation_allows_concurrent_data_append() {
+        let base = table_with_properties(
+            &make_v2_minimal_table(),
+            std::collections::HashMap::from([(
+                "write.merge.isolation-level".to_string(),
+                "snapshot".to_string(),
+            )]),
+        );
+        let table_s1 = append_snapshot(&base, &["test/data.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+        // Concurrent append lands after our plan-time snapshot S1.
+        let table_s2 = append_snapshot(&table_s1, &["test/concurrent.parquet"]).await;
+
+        let action = Transaction::new(&table_s2)
+            .row_delta()
+            .add_data_files(vec![make_data_file(&table_s2, "test/mine.parquet", 100)])
+            .validate_from_snapshot(s1);
+        assert!(
+            Arc::new(action).commit(&table_s2).await.is_ok(),
+            "snapshot isolation must allow a rebase over a pure data append"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serializable_conflicts_on_concurrent_data_append() {
+        // Same shape as above but WITHOUT the snapshot-isolation prop.
+        let base = make_v2_minimal_table();
+        let table_s1 = append_snapshot(&base, &["test/data.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+        let table_s2 = append_snapshot(&table_s1, &["test/concurrent.parquet"]).await;
+
+        let action = Transaction::new(&table_s2)
+            .row_delta()
+            .add_data_files(vec![make_data_file(&table_s2, "test/mine.parquet", 100)])
+            .validate_from_snapshot(s1);
+        let err = match Arc::new(action).commit(&table_s2).await {
+            Ok(_) => panic!("expected conflict"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("serializable isolation violation"));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_isolation_conflicts_on_concurrent_dv_same_file() {
+        // The V3 multi-DV hazard: a concurrent commit added a DV for the SAME
+        // data file our commit targets — must abort even at snapshot isolation.
+        let base = table_with_properties(
+            &make_v2_minimal_table(),
+            std::collections::HashMap::from([(
+                "write.merge.isolation-level".to_string(),
+                "snapshot".to_string(),
+            )]),
+        );
+        let table_s1 = append_snapshot(&base, &["test/data.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+        let table_s2 = dv_snapshot(
+            &table_s1,
+            make_dv(&table_s1, "test/concurrent-dv.parquet", "test/data.parquet"),
+        )
+        .await;
+
+        let action = Transaction::new(&table_s2)
+            .row_delta()
+            .add_delete_files(vec![make_dv(&table_s2, "test/my-dv.parquet", "test/data.parquet")])
+            .validate_from_snapshot(s1);
+        let err = match Arc::new(action).commit(&table_s2).await {
+            Ok(_) => panic!("expected conflict"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("conflicting"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_isolation_allows_concurrent_dv_other_file() {
+        let base = table_with_properties(
+            &make_v2_minimal_table(),
+            std::collections::HashMap::from([(
+                "write.merge.isolation-level".to_string(),
+                "snapshot".to_string(),
+            )]),
+        );
+        let table_s1 =
+            append_snapshot(&base, &["test/data.parquet", "test/other.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+        let table_s2 = dv_snapshot(
+            &table_s1,
+            make_dv(&table_s1, "test/concurrent-dv.parquet", "test/other.parquet"),
+        )
+        .await;
+
+        let action = Transaction::new(&table_s2)
+            .row_delta()
+            .add_delete_files(vec![make_dv(&table_s2, "test/my-dv.parquet", "test/data.parquet")])
+            .validate_from_snapshot(s1);
+        assert!(
+            Arc::new(action).commit(&table_s2).await.is_ok(),
+            "snapshot isolation must allow DVs on disjoint data files"
+        );
     }
 
     #[tokio::test]

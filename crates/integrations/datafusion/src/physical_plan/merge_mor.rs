@@ -1841,9 +1841,12 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             if !removed.is_empty() {
                 action = action.remove_delete_files(removed);
             }
-            if let Some(snap) = snapshot_id {
-                action = action.validate_from_snapshot(snap);
-            }
+            action = match snapshot_id {
+                Some(snap) => action.validate_from_snapshot(snap),
+                // Planned against an empty table — a concurrent first
+                // writer must fail this commit, not be rebased over.
+                None => action.validate_from_empty_table(),
+            };
             action
                 .apply(tx)
                 .map_err(to_datafusion_error)?
