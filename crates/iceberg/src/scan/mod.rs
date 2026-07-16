@@ -23,7 +23,7 @@ mod context;
 use context::*;
 mod task;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -63,6 +63,7 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     data_file_path_filter: Option<Arc<HashSet<String>>>,
+    data_file_path_ranges: Option<Arc<HashMap<String, (u64, u64)>>>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -82,6 +83,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             data_file_path_filter: None,
+            data_file_path_ranges: None,
         }
     }
 
@@ -92,6 +94,21 @@ impl<'a> TableScanBuilder<'a> {
     /// [`FileScanTask::data_file_path`] exactly.
     pub fn with_data_file_path_filter(mut self, paths: impl IntoIterator<Item = String>) -> Self {
         self.data_file_path_filter = Some(Arc::new(paths.into_iter().collect()));
+        self
+    }
+
+    /// Clip matching data files to a byte range (`start`, `length`): the
+    /// produced [`FileScanTask`]s carry the range, and the reader's
+    /// midpoint-ownership row-group filter turns disjoint ranges into a
+    /// disjoint, complete row-group cover of the file — externally-planned
+    /// sub-file splitting (the same semantics as Iceberg split planning).
+    /// Composes with [`Self::with_data_file_path_filter`]; paths listed here
+    /// must also pass that filter when it is set.
+    pub fn with_data_file_path_ranges(
+        mut self,
+        ranges: impl IntoIterator<Item = (String, (u64, u64))>,
+    ) -> Self {
+        self.data_file_path_ranges = Some(Arc::new(ranges.into_iter().collect()));
         self
     }
 
@@ -224,7 +241,8 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
-                        data_file_path_filter: self.data_file_path_filter,
+                        data_file_path_filter: self.data_file_path_filter.clone(),
+                        data_file_path_ranges: self.data_file_path_ranges.clone(),
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -340,6 +358,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             data_file_path_filter: self.data_file_path_filter,
+            data_file_path_ranges: self.data_file_path_ranges,
             runtime: self.table.runtime().clone(),
         })
     }
@@ -372,6 +391,7 @@ pub struct TableScan {
     /// When set, only data files whose path is in the set are scanned
     /// (externally planned file subset); deletes still apply.
     data_file_path_filter: Option<Arc<HashSet<String>>>,
+    data_file_path_ranges: Option<Arc<HashMap<String, (u64, u64)>>>,
 
     runtime: Runtime,
 }
@@ -495,16 +515,31 @@ impl TableScan {
             });
         }
 
-        match &self.data_file_path_filter {
+        let filtered = match &self.data_file_path_filter {
             Some(paths) => {
                 let paths = Arc::clone(paths);
-                Ok(file_scan_task_rx
+                file_scan_task_rx
                     .try_filter(move |task| {
                         futures::future::ready(paths.contains(task.data_file_path()))
                     })
+                    .boxed()
+            }
+            None => file_scan_task_rx.boxed(),
+        };
+        match &self.data_file_path_ranges {
+            Some(ranges) => {
+                let ranges = Arc::clone(ranges);
+                Ok(filtered
+                    .map_ok(move |mut task| {
+                        if let Some((start, length)) = ranges.get(task.data_file_path()) {
+                            task.start = *start;
+                            task.length = *length;
+                        }
+                        task
+                    })
                     .boxed())
             }
-            None => Ok(file_scan_task_rx.boxed()),
+            None => Ok(filtered),
         }
     }
 

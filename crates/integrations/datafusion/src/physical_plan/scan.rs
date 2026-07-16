@@ -234,7 +234,29 @@ async fn get_batch_stream(
         scan_builder = scan_builder.with_filter(pred);
     }
     if let Some(files) = file_allowlist {
-        scan_builder = scan_builder.with_data_file_path_filter(files.iter().cloned());
+        // Entries are either a plain data-file path or `path@<start>+<length>`
+        // — a byte-range clip (externally-planned sub-file split; the reader's
+        // midpoint-ownership row-group filter makes disjoint ranges a disjoint,
+        // complete cover). The suffix is unambiguous: object-store paths never
+        // contain `@<digits>+<digits>` terminally.
+        let mut plain: Vec<String> = Vec::new();
+        let mut ranges: Vec<(String, (u64, u64))> = Vec::new();
+        for f in files.iter() {
+            if let Some((path, spec)) = f.rsplit_once('@') {
+                if let Some((st, ln)) = spec.split_once('+') {
+                    if let (Ok(st), Ok(ln)) = (st.parse::<u64>(), ln.parse::<u64>()) {
+                        plain.push(path.to_string());
+                        ranges.push((path.to_string(), (st, ln)));
+                        continue;
+                    }
+                }
+            }
+            plain.push(f.clone());
+        }
+        scan_builder = scan_builder.with_data_file_path_filter(plain);
+        if !ranges.is_empty() {
+            scan_builder = scan_builder.with_data_file_path_ranges(ranges);
+        }
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
