@@ -112,9 +112,37 @@ fn parse_scan_files(scan_files: Option<HashMap<String, Vec<String>>>) -> PyResul
     Ok(out)
 }
 
+type ScopedTables = HashMap<String, HashMap<String, Vec<String>>>;
+
+/// `{catalog: ["namespace.table", ...]}` -> catalog -> namespace -> tables.
+/// A catalog WITH an entry mounts scoped (zero list calls, one load_table
+/// per named table — the per-call latency floor + Polaris-stampede fix);
+/// a catalog WITHOUT one keeps the full eager mount.
+fn parse_scoped_tables(
+    scoped: Option<HashMap<String, Vec<String>>>,
+) -> PyResult<ScopedTables> {
+    let mut out: ScopedTables = HashMap::new();
+    for (catalog, idents) in scoped.unwrap_or_default() {
+        for ident in idents {
+            let (ns, tbl) = ident.rsplit_once('.').ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "scoped_tables entry `{ident}` must be `namespace.table`"
+                ))
+            })?;
+            out.entry(catalog.clone())
+                .or_default()
+                .entry(ns.to_string())
+                .or_default()
+                .push(tbl.to_string());
+        }
+    }
+    Ok(out)
+}
+
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
     mut scan_files: ScanFiles,
+    mut scoped_tables: ScopedTables,
     options: Option<Arc<MorMergeOptions>>,
 ) -> PyResult<SessionContext> {
     // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
@@ -168,9 +196,11 @@ async fn session_with_catalogs(
     register_variant_functions(&ctx);
     for (name, props) in catalogs {
         let catalog = get_or_build_catalog(&name, props).await?;
-        let provider = IcebergCatalogProvider::try_new(catalog)
-            .await
-            .map_err(|e| PyValueError::new_err(format!("mount catalog `{name}`: {e}")))?;
+        let provider = match scoped_tables.remove(&name) {
+            Some(scope) => IcebergCatalogProvider::try_new_scoped(catalog, scope).await,
+            None => IcebergCatalogProvider::try_new(catalog).await,
+        }
+        .map_err(|e| PyValueError::new_err(format!("mount catalog `{name}`: {e}")))?;
         // Scan-file allowlists (externally planned file subsets) are applied
         // per call — providers are rebuilt per session; only the catalog
         // handle above is memoized.
@@ -188,6 +218,11 @@ async fn session_with_catalogs(
     if let Some(unmatched) = scan_files.keys().next() {
         return Err(PyValueError::new_err(format!(
             "scan_files references catalog `{unmatched}` which is not in `catalogs`"
+        )));
+    }
+    if let Some(unmatched) = scoped_tables.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "scoped_tables references catalog `{unmatched}` which is not in `catalogs`"
         )));
     }
     Ok(ctx)
@@ -230,7 +265,7 @@ async fn doorway_deadline<T>(
 /// by the merge (inserts plus updated row versions). Raises `ValueError` on
 /// planning or execution failure, and on deadline expiry.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None))]
 fn merge_into(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -238,8 +273,10 @@ fn merge_into(
     scan_files: Option<HashMap<String, Vec<String>>>,
     timeout_s: Option<u64>,
     write_workers: Option<usize>,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
+    let scoped_tables = parse_scoped_tables(scoped_tables)?;
     // The deadline covers catalog mounting, planning and the scan/write
     // phase (enforced cooperatively inside the merge write node). The
     // snapshot COMMIT is deliberately outside it — cancelling a REST commit
@@ -255,7 +292,7 @@ fn merge_into(
             let ctx = doorway_deadline(
                 deadline,
                 "mounting catalogs",
-                session_with_catalogs(catalogs, scan_files, Some(options)),
+                session_with_catalogs(catalogs, scan_files, scoped_tables, Some(options)),
             )
             .await??;
             let df = doorway_deadline(deadline, "planning MERGE", ctx.sql(&sql))
@@ -286,17 +323,19 @@ fn merge_into(
 /// only, no data IO, no commit), so a failing or suspicious merge can be
 /// inspected with zero writes.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, scoped_tables=None))]
 fn dry_run_inspect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
     scan_files: Option<HashMap<String, Vec<String>>>,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
+    let scoped_tables = parse_scoped_tables(scoped_tables)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files, None).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, None).await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -324,20 +363,22 @@ fn dry_run_inspect(
 /// JSON-serializable by the arrow JSON writer — wrap variant/binary columns
 /// in `variant_to_json(...)` in the statement.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None))]
 fn sql_collect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
     scan_files: Option<HashMap<String, Vec<String>>>,
     max_rows: usize,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
 ) -> PyResult<String> {
     use datafusion::logical_expr::LogicalPlan;
 
     let scan_files = parse_scan_files(scan_files)?;
+    let scoped_tables = parse_scoped_tables(scoped_tables)?;
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files, None).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, None).await?;
             let df = ctx
                 .sql(&sql)
                 .await

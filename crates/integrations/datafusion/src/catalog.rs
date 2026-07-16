@@ -81,6 +81,42 @@ impl IcebergCatalogProvider {
         Ok(IcebergCatalogProvider { schemas })
     }
 
+    /// Scoped mount: providers for ONLY the given `namespace -> table names`
+    /// map — zero `list_namespaces`/`list_tables` calls and exactly one
+    /// `load_table` per named table. Use when the SQL references a known
+    /// table set (the merge doorway: one bronze source + one silver target);
+    /// a full `try_new` of a production catalog loads EVERY table's metadata
+    /// per call. A reference to any table outside the scope fails at
+    /// planning ("table not found") — deliberately loud.
+    pub async fn try_new_scoped(
+        client: Arc<dyn Catalog>,
+        scope: HashMap<String, Vec<String>>,
+    ) -> Result<Self> {
+        let entries: Vec<(String, Vec<String>)> = scope.into_iter().collect();
+        let providers = try_join_all(
+            entries
+                .iter()
+                .map(|(ns, tables)| {
+                    IcebergSchemaProvider::try_new_scoped(
+                        client.clone(),
+                        NamespaceIdent::new(ns.clone()),
+                        tables.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = entries
+            .into_iter()
+            .map(|(ns, _)| ns)
+            .zip(providers)
+            .map(|(name, provider)| (name, Arc::new(provider) as Arc<dyn SchemaProvider>))
+            .collect();
+
+        Ok(IcebergCatalogProvider { schemas })
+    }
+
     /// Restrict `namespace.table`'s scans to the given data-file paths
     /// (externally planned file subset; deletes still apply). Errors if the
     /// namespace or table is not mounted — a mistyped identifier must fail

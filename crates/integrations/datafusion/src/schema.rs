@@ -92,6 +92,38 @@ impl IcebergSchemaProvider {
         })
     }
 
+    /// Build a provider for ONLY the named tables — no `list_tables` call
+    /// and no `load_table` for anything else. The scoped-mount path for
+    /// callers whose statement references a known table set (the SCD2 merge
+    /// doorway): a full mount costs one catalog `load_table` per table in
+    /// the namespace (a catalog-side metadata read each), which on a
+    /// production-sized namespace is both the per-call latency floor and a
+    /// catalog stampede.
+    pub(crate) async fn try_new_scoped(
+        client: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+        table_names: Vec<String>,
+    ) -> Result<Self> {
+        let providers = try_join_all(
+            table_names
+                .iter()
+                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        let tables = Arc::new(DashMap::new());
+        for (name, provider) in table_names.into_iter().zip(providers) {
+            tables.insert(name, Arc::new(provider));
+        }
+
+        Ok(IcebergSchemaProvider {
+            catalog: client,
+            namespace,
+            tables,
+        })
+    }
+
     /// Replace `table`'s provider with a clone whose scans read ONLY the
     /// given data-file paths (externally planned file subset; deletes still
     /// apply). Errors if the table is not present in this namespace.

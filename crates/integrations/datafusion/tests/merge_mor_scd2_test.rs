@@ -1739,3 +1739,42 @@ async fn test_occ_stale_pure_append_allowed_snapshot_isolation() {
     assert!(state.contains(&(1, "a".to_string(), 10, Some(20), false)), "state: {state:?}");
     assert!(state.contains(&(9, "z".to_string(), 30, None, true)), "state: {state:?}");
 }
+
+/// Scoped mount: the merge works when the catalog provider is built for ONLY
+/// the referenced table (zero list calls, one load_table); anything outside
+/// the scope fails loudly at planning.
+#[tokio::test]
+async fn test_scoped_mount_merge_and_out_of_scope_fails() {
+    use std::collections::HashMap as Map;
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, _full_ctx) =
+        setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(1, "b", 20, 2)]).await;
+
+    // fresh session with a SCOPED provider: db -> [t] only
+    let ctx = SessionContext::new();
+    register_variant_functions(&ctx);
+    let provider = iceberg_datafusion::IcebergCatalogProvider::try_new_scoped(
+        Arc::clone(&catalog),
+        Map::from([(NS.to_string(), vec![TABLE.to_string()])]),
+    )
+    .await
+    .unwrap();
+    ctx.register_catalog(CATALOG, Arc::new(provider));
+    let cdc = cdc_batch(&[(1, "b", 20, 2)]);
+    let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+    ctx.register_table("batch", Arc::new(mem)).unwrap();
+
+    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap();
+    let state = read_state(&ctx).await;
+    assert!(state.contains(&(1, "b".to_string(), 20, None, true)), "state: {state:?}");
+    assert!(state.contains(&(1, "a".to_string(), 10, Some(20), false)), "state: {state:?}");
+
+    // out-of-scope reference fails at planning, loudly
+    let err = ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{NS}.not_mounted"))
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("not found") || err.contains("not_mounted"), "got: {err}");
+}
