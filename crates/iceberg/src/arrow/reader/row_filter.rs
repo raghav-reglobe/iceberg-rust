@@ -189,12 +189,30 @@ impl ArrowReader {
         let mut selected = Vec::new();
         let end = start + length;
 
-        // Row groups are stored sequentially after the 4-byte magic header.
-        let mut current_byte_offset = 4u64;
-
+        // Row-group START = its ACTUAL file offset from the metadata — never
+        // an assumed sequential-from-byte-4 accumulation of compressed sizes.
+        // Real writers diverge from that assumption (observed: DuckDB-written
+        // files, where accumulated compressed_size drifts from the physical
+        // layout and every midpoint landed outside the requested ranges — a
+        // split scan silently read ZERO rows). Prefer the row group's
+        // file_offset; fall back to the first column chunk's dictionary/data
+        // page offset (the earliest byte the group occupies).
+        let mut fallback_offset = 4u64;
         for (idx, row_group) in row_groups.iter().enumerate() {
             let row_group_size = row_group.compressed_size() as u64;
-            let row_group_midpoint = current_byte_offset + row_group_size / 2;
+            let group_start = row_group
+                .file_offset()
+                .filter(|v| *v > 0)
+                .map(|v| v as u64)
+                .or_else(|| {
+                    row_group.columns().first().map(|c| {
+                        let dp = c.data_page_offset();
+                        let start = c.dictionary_page_offset().map_or(dp, |d| d.min(dp));
+                        start as u64
+                    })
+                })
+                .unwrap_or(fallback_offset);
+            let row_group_midpoint = group_start + row_group_size / 2;
 
             // Half-open ownership: a midpoint on a task boundary belongs to the upper task,
             // so exactly one task ever claims a given row group.
@@ -202,7 +220,7 @@ impl ArrowReader {
                 selected.push(idx);
             }
 
-            current_byte_offset += row_group_size;
+            fallback_offset = group_start + row_group_size;
         }
 
         Ok(selected)
@@ -1279,5 +1297,64 @@ mod tests {
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
         );
+    }
+}
+
+#[cfg(test)]
+mod byte_range_offset_tests {
+    use parquet::basic::Type as PhysicalType;
+    use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+    use parquet::schema::types::{SchemaDescriptor, Type};
+    use std::sync::Arc;
+
+    use crate::arrow::ArrowReader;
+
+    /// Row-group ownership must key on the group's ACTUAL file offset, not a
+    /// sequential-from-byte-4 accumulation of compressed sizes. Real writers
+    /// drift from that assumption (observed on DuckDB-written files: the
+    /// accumulated midpoints bunched low, so equal byte ranges produced
+    /// LOPSIDED buckets — several empty, one owning ~everything, which blew
+    /// the downstream join's memory pool).
+    #[test]
+    fn midpoints_use_actual_file_offsets() {
+        let message = "message m { required int32 id; }";
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            parquet::schema::parser::parse_message_type(message).unwrap(),
+        )));
+        let _ = PhysicalType::INT32;
+
+        // Two groups of compressed_size 100 each, but PHYSICALLY located at
+        // offsets 4 and 10_000 (a gap the accumulation model cannot see).
+        let mk = |offset: i64| {
+            let col = ColumnChunkMetaData::builder(schema.column(0))
+                .set_data_page_offset(offset)
+                .set_total_compressed_size(100)
+                .build()
+                .unwrap();
+            RowGroupMetaData::builder(schema.clone())
+                .set_num_rows(10)
+                .set_total_byte_size(100)
+                .set_column_metadata(vec![col])
+                .set_file_offset(offset)
+                .build()
+                .unwrap()
+        };
+        let meta = parquet::file::metadata::ParquetMetaDataBuilder::new(
+            parquet::file::metadata::FileMetaData::new(
+                2, 20, None, None, schema.clone(), None,
+            ),
+        )
+        .add_row_group(mk(4))
+        .add_row_group(mk(10_000))
+        .build();
+        let meta = Arc::new(meta);
+
+        // Range [0, 5000): owns ONLY the group at offset 4. Under the old
+        // accumulation model group 2's midpoint would be 4+100+50=154 — both
+        // groups would (wrongly) land in the low range.
+        let low = ArrowReader::filter_row_groups_by_byte_range(&meta, 0, 5_000).unwrap();
+        assert_eq!(low, vec![0]);
+        let high = ArrowReader::filter_row_groups_by_byte_range(&meta, 5_000, 15_000).unwrap();
+        assert_eq!(high, vec![1]);
     }
 }
