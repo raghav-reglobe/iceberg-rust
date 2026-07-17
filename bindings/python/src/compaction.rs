@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::maintenance::{PrefixMismatchMode, RemoveOrphanFilesAction};
+use iceberg::maintenance::{
+    ExpireSnapshotsWithCleanupAction, PrefixMismatchMode, RemoveOrphanFilesAction,
+};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
@@ -271,11 +273,112 @@ fn remove_orphan_files(
     Ok(out.into_any().unbind())
 }
 
+/// Expire snapshots strictly older than `older_than_ms` (always keeping the
+/// current snapshot, each branch's `retain_last` most recent snapshots, and
+/// any snapshot referenced by a branch or tag), then delete the files only
+/// the expired snapshots referenced.
+///
+/// Ordering is the crash-safety mechanism: the `remove-snapshots` metadata
+/// commit lands FIRST (with rebase-per-attempt retry on commit conflicts —
+/// every attempt refetches metadata and recomputes the selection); files are
+/// deleted only after it succeeds, best-effort. A crash mid-cleanup leaves
+/// plain orphans for `remove_orphan_files` — never a referenced-but-deleted
+/// file. A file shared between an expired and a retained snapshot always
+/// survives (exclusive-file diff against the post-commit metadata).
+///
+/// `dry_run=True` computes the selection + diff and returns the report
+/// without committing or deleting; `cleanup=False` commits the metadata
+/// change but skips the delete phase (candidates still reported).
+///
+/// Returns a dict — `removed_snapshots` (`{"count", "ids"}`), `removed_refs`,
+/// `dry_run`, `deleted_files` / `failed_deletes` (counts), and per-category
+/// candidate counts (`manifest_lists`, `manifests`, `data_files`,
+/// `delete_files`, `stats_files`) — or `None` when there is nothing to
+/// expire (same no-op convention as `rewrite_manifests`). Raises `ValueError`
+/// on any real failure.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, older_than_ms, retain_last, cleanup=true, dry_run=false, delete_concurrency=None))]
+fn expire_snapshots(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    older_than_ms: i64,
+    retain_last: usize,
+    cleanup: bool,
+    dry_run: bool,
+    delete_concurrency: Option<usize>,
+) -> PyResult<Option<Py<PyAny>>> {
+    if older_than_ms <= 0 {
+        return Err(PyValueError::new_err(
+            "older_than_ms must be a positive epoch-milliseconds cutoff",
+        ));
+    }
+    if retain_last == 0 {
+        return Err(PyValueError::new_err("retain_last must be at least 1"));
+    }
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+
+    let result = py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .load(catalog_name.clone(), catalog_props)
+                .await
+                .map_err(|e| {
+                    PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}"))
+                })?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let ident = TableIdent::new(namespace, table_name);
+            let table = catalog
+                .load_table(&ident)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("load table {fqn}: {e}")))?;
+
+            let mut action = ExpireSnapshotsWithCleanupAction::new(table)
+                .older_than_ms(older_than_ms)
+                .retain_last(retain_last)
+                .cleanup(cleanup)
+                .dry_run(dry_run);
+            if let Some(c) = delete_concurrency {
+                action = action.delete_concurrency(c);
+            }
+            action
+                .execute(&catalog)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("expiring snapshots of {fqn}: {e}")))
+        })
+    })?;
+
+    // Nothing to expire -> clean no-op for callers (rewrite_manifests parity).
+    if result.is_noop() {
+        return Ok(None);
+    }
+
+    let removed = pyo3::types::PyDict::new(py);
+    removed.set_item("count", result.removed_snapshot_ids.len())?;
+    removed.set_item("ids", result.removed_snapshot_ids)?;
+
+    let out = pyo3::types::PyDict::new(py);
+    out.set_item("removed_snapshots", removed)?;
+    out.set_item("removed_refs", result.removed_ref_names)?;
+    out.set_item("dry_run", result.dry_run)?;
+    out.set_item("deleted_files", result.deleted_files.len())?;
+    out.set_item("failed_deletes", result.failed_deletes.len())?;
+    out.set_item("manifest_lists", result.candidate_manifest_lists.len())?;
+    out.set_item("manifests", result.candidate_manifests.len())?;
+    out.set_item("data_files", result.candidate_data_files.len())?;
+    out.set_item("delete_files", result.candidate_delete_files.len())?;
+    out.set_item("stats_files", result.candidate_stats_files.len())?;
+    Ok(Some(out.into_any().unbind()))
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "compaction")?;
     this.add_function(wrap_pyfunction!(compact, &this)?)?;
     this.add_function(wrap_pyfunction!(rewrite_manifests, &this)?)?;
     this.add_function(wrap_pyfunction!(remove_orphan_files, &this)?)?;
+    this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }

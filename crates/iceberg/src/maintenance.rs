@@ -15,17 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Table maintenance operations that are NOT snapshot commits.
+//! Table maintenance operations built on top of (or beside) the snapshot
+//! commit path.
 //!
-//! Currently: [`RemoveOrphanFilesAction`] — delete files under the table
-//! location that no retained snapshot or table metadata references. Modeled on
-//! iceberg-go's `Table.DeleteOrphanFiles` (itself modeled on Java's
-//! `DeleteOrphanFiles` action): dry-run support, an `older_than` age guard
-//! (protects in-flight commits), and prefix-mismatch handling with optional
-//! scheme/authority equivalence.
+//! - [`RemoveOrphanFilesAction`] — delete files under the table location that
+//!   no retained snapshot or table metadata references. Modeled on
+//!   iceberg-go's `Table.DeleteOrphanFiles` (itself modeled on Java's
+//!   `DeleteOrphanFiles` action): dry-run support, an `older_than` age guard
+//!   (protects in-flight commits), and prefix-mismatch handling with optional
+//!   scheme/authority equivalence.
+//! - [`ExpireSnapshotsWithCleanupAction`] — expire snapshots (a
+//!   `remove-snapshots` metadata commit via the transaction machinery) and
+//!   then delete the files only the expired snapshots referenced, mirroring
+//!   Java's `ExpireSnapshots` action with reachable-file cleanup.
+
+mod expire_snapshots;
 
 use std::collections::{HashMap, HashSet};
 
+pub use expire_snapshots::{ExpireSnapshotsResult, ExpireSnapshotsWithCleanupAction};
 use futures::{StreamExt, stream};
 
 use crate::io::ListEntry;
@@ -289,62 +297,83 @@ impl RemoveOrphanFilesAction {
 
     /// The referenced-file set: everything reachable from table metadata.
     async fn collect_referenced_files(&self) -> Result<HashSet<String>> {
-        let metadata = self.table.metadata_ref();
-        let file_io = self.table.file_io();
-        let mut referenced: HashSet<String> = HashSet::new();
-
-        // Metadata files: current + historical + version hint (harmless if absent).
-        if let Some(loc) = self.table.metadata_location() {
-            referenced.insert(loc.to_string());
-        }
-        referenced.extend(
-            metadata
-                .metadata_log()
-                .iter()
-                .map(|e| e.metadata_file.clone()),
-        );
-        referenced.insert(format!(
-            "{}/metadata/version-hint.text",
-            metadata.location().trim_end_matches('/')
-        ));
-
-        // Statistics + partition statistics (Puffin).
-        referenced.extend(
-            metadata
-                .statistics_iter()
-                .map(|s| s.statistics_path.clone()),
-        );
-        referenced.extend(
-            metadata
-                .partition_statistics_iter()
-                .map(|s| s.statistics_path.clone()),
-        );
-
-        // Every retained snapshot: manifest list, manifests, and ALL entries'
-        // file paths (any status — see the struct doc for why deleted-status
-        // entries stay in the referenced set).
-        let mut manifests_to_load = Vec::new();
-        for snapshot in metadata.snapshots() {
-            if !snapshot.manifest_list().is_empty() {
-                referenced.insert(snapshot.manifest_list().to_string());
-            }
-            let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
-            for manifest_file in manifest_list.entries() {
-                // insert() returning true = first sighting -> load once.
-                if referenced.insert(manifest_file.manifest_path.clone()) {
-                    manifests_to_load.push(manifest_file.clone());
-                }
-            }
-        }
-        for manifest_file in manifests_to_load {
-            let manifest = manifest_file.load_manifest(file_io).await?;
-            for entry in manifest.entries() {
-                referenced.insert(entry.data_file().file_path().to_string());
-            }
-        }
-
-        Ok(referenced)
+        reachable_files(&self.table, None).await
     }
+}
+
+/// Every file reachable from `table`'s metadata: current + historical metadata
+/// files, the version hint, statistics + partition statistics (Puffin), and
+/// every snapshot's manifest list, manifests, and ALL entries' file paths
+/// regardless of entry status (see the [`RemoveOrphanFilesAction`] docs for
+/// why deleted-status entries stay in the referenced set).
+///
+/// Snapshots whose id is in `skip_snapshots` are excluded, along with their
+/// statistics entries — the "still reachable AFTER expiring those snapshots"
+/// view used by [`ExpireSnapshotsWithCleanupAction`]'s dry run.
+pub(crate) async fn reachable_files(
+    table: &Table,
+    skip_snapshots: Option<&HashSet<i64>>,
+) -> Result<HashSet<String>> {
+    let metadata = table.metadata_ref();
+    let file_io = table.file_io();
+    let skip = |id: i64| skip_snapshots.is_some_and(|skipped| skipped.contains(&id));
+    let mut referenced: HashSet<String> = HashSet::new();
+
+    // Metadata files: current + historical + version hint (harmless if absent).
+    if let Some(loc) = table.metadata_location() {
+        referenced.insert(loc.to_string());
+    }
+    referenced.extend(
+        metadata
+            .metadata_log()
+            .iter()
+            .map(|e| e.metadata_file.clone()),
+    );
+    referenced.insert(format!(
+        "{}/metadata/version-hint.text",
+        metadata.location().trim_end_matches('/')
+    ));
+
+    // Statistics + partition statistics (Puffin).
+    referenced.extend(
+        metadata
+            .statistics_iter()
+            .filter(|s| !skip(s.snapshot_id))
+            .map(|s| s.statistics_path.clone()),
+    );
+    referenced.extend(
+        metadata
+            .partition_statistics_iter()
+            .filter(|s| !skip(s.snapshot_id))
+            .map(|s| s.statistics_path.clone()),
+    );
+
+    // Every retained snapshot: manifest list, manifests, and ALL entries'
+    // file paths (any status).
+    let mut manifests_to_load = Vec::new();
+    for snapshot in metadata.snapshots() {
+        if skip(snapshot.snapshot_id()) {
+            continue;
+        }
+        if !snapshot.manifest_list().is_empty() {
+            referenced.insert(snapshot.manifest_list().to_string());
+        }
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+        for manifest_file in manifest_list.entries() {
+            // insert() returning true = first sighting -> load once.
+            if referenced.insert(manifest_file.manifest_path.clone()) {
+                manifests_to_load.push(manifest_file.clone());
+            }
+        }
+    }
+    for manifest_file in manifests_to_load {
+        let manifest = manifest_file.load_manifest(file_io).await?;
+        for entry in manifest.entries() {
+            referenced.insert(entry.data_file().file_path().to_string());
+        }
+    }
+
+    Ok(referenced)
 }
 
 enum Classification {
