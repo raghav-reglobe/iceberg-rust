@@ -258,6 +258,17 @@ async fn get_batch_stream(
             scan_builder = scan_builder.with_data_file_path_ranges(ranges);
         }
     }
+    // In-flight data-file read concurrency: the scan default couples this to
+    // num_cpus, which under-drives many-tiny-file reads (network-RTT-bound,
+    // not CPU-bound — 50 trickle files at concurrency 4 = ~13 sequential RTT
+    // waves). Async I/O tasks, not threads; CPU/memory footprint is unchanged.
+    if let Ok(v) = std::env::var("ICEBERG_SCAN_DATA_FILE_CONCURRENCY") {
+        if let Ok(limit) = v.parse::<usize>() {
+            if limit > 0 {
+                scan_builder = scan_builder.with_data_file_concurrency_limit(limit);
+            }
+        }
+    }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
