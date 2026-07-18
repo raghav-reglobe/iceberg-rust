@@ -169,9 +169,20 @@ async fn write_one_data_file_prefixed(
     batch: RecordBatch,
     prefix: &str,
 ) -> Vec<iceberg::spec::DataFile> {
+    write_one_data_file_with_props(table, batch, prefix, WriterProperties::builder().build()).await
+}
+
+/// Seed writer with explicit parquet writer properties (e.g. a small
+/// `max_row_group_row_count` to force a multi-row-group seed file).
+async fn write_one_data_file_with_props(
+    table: &Table,
+    batch: RecordBatch,
+    prefix: &str,
+    props: WriterProperties,
+) -> Vec<iceberg::spec::DataFile> {
     let schema = table.metadata().current_schema().clone();
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), schema),
+        ParquetWriterBuilder::new(props, schema),
         table.file_io().clone(),
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
         DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet),
@@ -1511,6 +1522,7 @@ async fn parallel_writers_split_output_across_workers() {
         Some(Arc::new(MorMergeOptions {
             deadline: None,
             write_workers: Some(3),
+            ..Default::default()
         })),
     )
     .await;
@@ -1574,6 +1586,7 @@ async fn deadline_aborts_merge_before_commit() {
         Some(Arc::new(MorMergeOptions {
             deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
             write_workers: None,
+            ..Default::default()
         })),
     )
     .await;
@@ -1632,12 +1645,20 @@ fn stale_dv(table: &Table, path: &str, referenced: &str) -> iceberg::spec::DataF
 #[tokio::test]
 async fn test_occ_stale_commit_conflicts_after_doorway_merge_serializable() {
     let warehouse = TempDir::new().unwrap();
-    let (catalog, ctx) = setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(1, "b", 20, 2)]).await;
+    let (catalog, ctx) = setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(
+        1, "b", 20, 2,
+    )])
+    .await;
 
     let stale = load_table(&catalog).await; // handle pinned at S1
     let s1 = stale.metadata().current_snapshot_id().unwrap();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap(); // S2
 
     let current = load_table(&catalog).await;
     let seed_path = live_dvs(&current).await[0].0.clone();
@@ -1652,10 +1673,14 @@ async fn test_occ_stale_commit_conflicts_after_doorway_merge_serializable() {
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("Found conflicting concurrent commit"),
+        err.to_string()
+            .contains("Found conflicting concurrent commit"),
         "got: {err}"
     );
-    assert!(err.to_string().contains("serializable isolation violation"), "got: {err}");
+    assert!(
+        err.to_string().contains("serializable isolation violation"),
+        "got: {err}"
+    );
 }
 
 /// snapshot isolation: a stale-based DV on the SAME data file the doorway
@@ -1677,7 +1702,12 @@ async fn test_occ_stale_dv_same_file_conflicts_snapshot_isolation() {
     let stale = load_table(&catalog).await;
     let s1 = stale.metadata().current_snapshot_id().unwrap();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2: DV on seed file
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap(); // S2: DV on seed file
 
     let current = load_table(&catalog).await;
     let seed_path = live_dvs(&current).await[0].0.clone();
@@ -1692,7 +1722,8 @@ async fn test_occ_stale_dv_same_file_conflicts_snapshot_isolation() {
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("Found conflicting concurrent commit"),
+        err.to_string()
+            .contains("Found conflicting concurrent commit"),
         "got: {err}"
     );
 }
@@ -1716,11 +1747,19 @@ async fn test_occ_stale_pure_append_allowed_snapshot_isolation() {
     let stale = load_table(&catalog).await;
     let s1 = stale.metadata().current_snapshot_id().unwrap();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap(); // S2
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap(); // S2
 
-    let files =
-        write_one_data_file_prefixed(&stale, scd2_batch(&[(9, "z", 30, None, true, 9)]), "occ-append")
-            .await;
+    let files = write_one_data_file_prefixed(
+        &stale,
+        scd2_batch(&[(9, "z", 30, None, true, 9)]),
+        "occ-append",
+    )
+    .await;
     let tx = Transaction::new(&stale);
     let action = tx
         .row_delta()
@@ -1735,9 +1774,18 @@ async fn test_occ_stale_pure_append_allowed_snapshot_isolation() {
 
     // The rebase preserved the doorway merge: id=1 has demoted v10 + current v20.
     let state = read_state(&ctx).await;
-    assert!(state.contains(&(1, "b".to_string(), 20, None, true)), "state: {state:?}");
-    assert!(state.contains(&(1, "a".to_string(), 10, Some(20), false)), "state: {state:?}");
-    assert!(state.contains(&(9, "z".to_string(), 30, None, true)), "state: {state:?}");
+    assert!(
+        state.contains(&(1, "b".to_string(), 20, None, true)),
+        "state: {state:?}"
+    );
+    assert!(
+        state.contains(&(1, "a".to_string(), 10, Some(20), false)),
+        "state: {state:?}"
+    );
+    assert!(
+        state.contains(&(9, "z".to_string(), 30, None, true)),
+        "state: {state:?}"
+    );
 }
 
 /// Scoped mount: the merge works when the catalog provider is built for ONLY
@@ -1747,8 +1795,10 @@ async fn test_occ_stale_pure_append_allowed_snapshot_isolation() {
 async fn test_scoped_mount_merge_and_out_of_scope_fails() {
     use std::collections::HashMap as Map;
     let warehouse = TempDir::new().unwrap();
-    let (catalog, _full_ctx) =
-        setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(1, "b", 20, 2)]).await;
+    let (catalog, _full_ctx) = setup(&warehouse, &[(1, "a", 10, None, true, 1)], &[(
+        1, "b", 20, 2,
+    )])
+    .await;
 
     // fresh session with a SCOPED provider: db -> [t] only
     let ctx = SessionContext::new();
@@ -1764,10 +1814,21 @@ async fn test_scoped_mount_merge_and_out_of_scope_fails() {
     let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
     ctx.register_table("batch", Arc::new(mem)).unwrap();
 
-    ctx.sql(&scd2_merge_sql()).await.unwrap().collect().await.unwrap();
+    ctx.sql(&scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let state = read_state(&ctx).await;
-    assert!(state.contains(&(1, "b".to_string(), 20, None, true)), "state: {state:?}");
-    assert!(state.contains(&(1, "a".to_string(), 10, Some(20), false)), "state: {state:?}");
+    assert!(
+        state.contains(&(1, "b".to_string(), 20, None, true)),
+        "state: {state:?}"
+    );
+    assert!(
+        state.contains(&(1, "a".to_string(), 10, Some(20), false)),
+        "state: {state:?}"
+    );
 
     // out-of-scope reference fails at planning, loudly
     let err = ctx
@@ -1776,5 +1837,334 @@ async fn test_scoped_mount_merge_and_out_of_scope_fails() {
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
-    assert!(err.contains("not found") || err.contains("not_mounted"), "got: {err}");
+    assert!(
+        err.contains("not found") || err.contains("not_mounted"),
+        "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Late materialization (row-group-ranged fetch) — state equality, wide rows,
+// idempotent replay, narrow plan shape
+// ---------------------------------------------------------------------------
+
+/// A distinct multi-KB string per row (the wide TEXT payload shape).
+fn wide_val(id: i32, len: usize) -> String {
+    let unit = format!("{id:06}-");
+    unit.repeat(len / unit.len() + 1)[..len].to_string()
+}
+
+/// (Re-)register the `batch` MemTable with new CDC rows.
+fn register_batch(ctx: &SessionContext, rows: &[(i32, &str, i64, i64)]) {
+    let _ = ctx.deregister_table("batch");
+    let cdc = cdc_batch(rows);
+    let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+    ctx.register_table("batch", Arc::new(mem)).unwrap();
+}
+
+/// The SCD2 merge with the production-shaped IDEMPOTENCY guard: batch rows
+/// already present in the target (same id + _valid_from + _cdc_offset) are
+/// filtered out of the USING source, so replaying the same batch produces an
+/// EMPTY source and the merge commits nothing (+0 snapshots).
+fn guarded_scd2_merge_sql() -> String {
+    format!(
+        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING ( \
+             WITH b AS ( \
+                 SELECT id, val, _valid_from, _cdc_offset FROM batch bb \
+                 WHERE NOT EXISTS (SELECT 1 FROM {CATALOG}.{NS}.{TABLE} si \
+                                   WHERE si.id = bb.id \
+                                     AND si._valid_from = bb._valid_from \
+                                     AND si._cdc_offset = bb._cdc_offset) \
+             ), unioned AS ( \
+                 SELECT id, val, _valid_from, CAST(NULL AS BIGINT) AS _valid_to, \
+                        true AS _is_current, _cdc_offset \
+                 FROM b \
+                 UNION ALL \
+                 SELECT t2.id, t2.val, t2._valid_from, x.new_vf AS _valid_to, \
+                        false AS _is_current, t2._cdc_offset \
+                 FROM {CATALOG}.{NS}.{TABLE} t2 \
+                 JOIN (SELECT id, MIN(_valid_from) AS new_vf FROM b GROUP BY id) x \
+                   ON t2.id = x.id AND t2._is_current \
+             ) SELECT * FROM unioned \
+         ) AS s \
+         ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+            AND t._is_current \
+         WHEN MATCHED THEN UPDATE SET _valid_to = s._valid_to, _is_current = s._is_current \
+         WHEN NOT MATCHED THEN INSERT (id, val, _valid_from, _valid_to, _is_current, _cdc_offset) \
+             VALUES (s.id, s.val, s._valid_from, s._valid_to, s._is_current, s._cdc_offset)"
+    )
+}
+
+/// Build the wide-row table: 24 seed rows with multi-KB values, forced into
+/// 4-row parquet row groups (6 groups), plus a session pinned to the given
+/// fetch path.
+async fn setup_wide(
+    warehouse: &TempDir,
+    late_materialization: bool,
+) -> (Arc<dyn Catalog>, SessionContext) {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap(),
+    );
+    let ns = NamespaceIdent::new(NS.to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let spec = UnboundPartitionSpec::builder()
+        .add_partition_field(5, "_is_current", Transform::Identity)
+        .unwrap()
+        .build();
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name(TABLE.to_string())
+                .schema(scd2_iceberg_schema())
+                .partition_spec(spec)
+                .format_version(FormatVersion::V3)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let vals: Vec<String> = (1..=24).map(|id| wide_val(id, 8_000)).collect();
+    let seed: Vec<(i32, &str, i64, Option<i64>, bool, i64)> = (1..=24)
+        .map(|id| {
+            (
+                id,
+                vals[(id - 1) as usize].as_str(),
+                10,
+                None,
+                true,
+                100 + id as i64,
+            )
+        })
+        .collect();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let data_files = write_one_data_file_with_props(&table, scd2_batch(&seed), "seed", props).await;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+
+    let config = datafusion::execution::context::SessionConfig::new().with_extension(Arc::new(
+        MorMergeOptions {
+            late_materialization,
+            ..Default::default()
+        },
+    ));
+    let ctx = SessionContext::new_with_config(config);
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+            .await
+            .unwrap(),
+    );
+    ctx.register_catalog(CATALOG, provider);
+    (catalog, ctx)
+}
+
+/// Two chained wide-row merges + an idempotent replay under one fetch path.
+/// Returns (final state, sorted live-DV cardinalities, snapshot count).
+async fn run_wide_row_scenario(
+    late_materialization: bool,
+) -> (Vec<(i32, String, i64, Option<i64>, bool)>, Vec<u64>, usize) {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup_wide(&warehouse, late_materialization).await;
+
+    // Merge 1: new versions for ids 2 (row group 0) and 22 (row group 5) +
+    // a brand-new id 100 carrying a ~38KB value (the wide-string INSERT).
+    let v2a = wide_val(2, 8_500);
+    let v22a = wide_val(22, 8_500);
+    let v100 = wide_val(100, 38_000);
+    register_batch(&ctx, &[
+        (2, v2a.as_str(), 20, 202),
+        (22, v22a.as_str(), 20, 222),
+        (100, v100.as_str(), 20, 300),
+    ]);
+    ctx.sql(&guarded_scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Merge 2: id 3 + id 23 (seed file, which ALREADY carries a DV — the
+    // prior-DV union / consolidation path) and id 2 again (current row now
+    // lives in merge 1's appended file).
+    let v3b = wide_val(3, 9_000);
+    let v2b = wide_val(2, 9_000);
+    let v23b = wide_val(23, 9_000);
+    register_batch(&ctx, &[
+        (3, v3b.as_str(), 30, 203),
+        (2, v2b.as_str(), 30, 204),
+        (23, v23b.as_str(), 30, 223),
+    ]);
+    ctx.sql(&guarded_scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    let snaps_after = table.metadata().snapshots().count();
+
+    // Idempotent replay of merge 2: the guard empties the USING source, so
+    // NOTHING commits — +0 snapshots, state unchanged.
+    let state_before_replay = read_state(&ctx).await;
+    ctx.sql(&guarded_scd2_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_after,
+        "idempotent replay must commit no snapshot (late={late_materialization})"
+    );
+    let state = read_state(&ctx).await;
+    assert_eq!(
+        state, state_before_replay,
+        "idempotent replay must not change state (late={late_materialization})"
+    );
+
+    let mut dv_cards: Vec<u64> = live_dvs(&table).await.into_iter().map(|(_, n)| n).collect();
+    dv_cards.sort_unstable();
+    (state, dv_cards, snaps_after)
+}
+
+/// Wide-row (multi-KB TEXT) merge through BOTH fetch paths: the row-group-
+/// ranged late materialization (default ON) and the whole-file legacy path
+/// (the OFF escape hatch) must produce identical table state, identical DV
+/// cardinalities and identical snapshot shape — including the +0-snapshot
+/// idempotent replay. Also the multi-KB string regression: values up to
+/// ~38KB survive the insert and late-fetch paths byte-for-byte.
+#[tokio::test]
+async fn wide_row_merge_state_equal_across_fetch_paths_and_replay_idempotent() {
+    let (state_late, dvs_late, snaps_late) = run_wide_row_scenario(true).await;
+    let (state_legacy, dvs_legacy, snaps_legacy) = run_wide_row_scenario(false).await;
+
+    // Cross-path equality.
+    assert_eq!(
+        state_late, state_legacy,
+        "fetch paths must be byte-identical"
+    );
+    assert_eq!(dvs_late, dvs_legacy, "DV cardinalities must match");
+    assert_eq!(snaps_late, snaps_legacy, "snapshot shape must match");
+
+    // And both must equal the EXPECTED truth (not merely each other).
+    // Seed append + merge 1 + merge 2 (replay adds nothing).
+    assert_eq!(snaps_late, 3);
+    // Seed-file DV consolidates ids {2, 3, 22, 23}; merge-1's appended file
+    // carries one DV for id 2's superseded second version.
+    assert_eq!(dvs_late, vec![1, 4]);
+
+    let mut expected: Vec<(i32, String, i64, Option<i64>, bool)> = Vec::new();
+    for id in 1..=24 {
+        let seed_val = wide_val(id, 8_000);
+        match id {
+            2 => {
+                expected.push((2, seed_val, 10, Some(20), false));
+                expected.push((2, wide_val(2, 8_500), 20, Some(30), false));
+                expected.push((2, wide_val(2, 9_000), 30, None, true));
+            }
+            3 => {
+                expected.push((3, seed_val, 10, Some(30), false));
+                expected.push((3, wide_val(3, 9_000), 30, None, true));
+            }
+            22 => {
+                expected.push((22, seed_val, 10, Some(20), false));
+                expected.push((22, wide_val(22, 8_500), 20, None, true));
+            }
+            23 => {
+                expected.push((23, seed_val, 10, Some(30), false));
+                expected.push((23, wide_val(23, 9_000), 30, None, true));
+            }
+            _ => expected.push((id, seed_val, 10, None, true)),
+        }
+    }
+    expected.push((100, wide_val(100, 38_000), 20, None, true));
+    assert_eq!(state_late, expected);
+}
+
+/// Plan-shape proof of the narrow decide phase: the merge target scan's
+/// projected schema carries ONLY the columns the merge expressions reference
+/// plus the `_file`/`_pos` row identity — the wide payload column (`val`)
+/// must NOT be scanned before the join decides.
+#[tokio::test]
+async fn late_materialization_target_scan_projects_narrow_schema() {
+    use datafusion::physical_plan::ExecutionPlan;
+
+    fn find_node(plan: &Arc<dyn ExecutionPlan>, name: &str) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.name() == name {
+            return Some(Arc::clone(plan));
+        }
+        for child in plan.children() {
+            if let Some(found) = find_node(child, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let warehouse = TempDir::new().unwrap();
+    let (_catalog, ctx) = setup(&warehouse, &[(1, "a", 10, None, true, 100)], &[
+        (1, "a2", 20, 200),
+        (4, "d", 20, 203),
+    ])
+    .await;
+
+    let pruned = scd2_merge_sql().replace(
+        "ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset",
+        "ON t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset \
+         AND t._is_current",
+    );
+    let plan = ctx
+        .sql(&pruned)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    let target_scan = find_node(&plan, "IcebergMorTargetScanExec")
+        .expect("merge plan must contain the narrow target scan");
+    let scan_schema = target_scan.schema();
+    let names: Vec<&str> = scan_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    // Narrow projection is emitted in TABLE-SCHEMA order (id=1,
+    // _valid_from=3, _is_current=5, _cdc_offset=6) + the row identity.
+    assert_eq!(
+        names,
+        vec![
+            "id",
+            "_valid_from",
+            "_is_current",
+            "_cdc_offset",
+            "_file",
+            "_pos"
+        ],
+        "target scan must project ONLY the decide columns + row identity"
+    );
+    assert!(
+        !names.contains(&"val"),
+        "the wide payload column must not be materialized by the decide-phase scan"
+    );
 }

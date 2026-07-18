@@ -29,7 +29,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
@@ -224,6 +224,115 @@ impl ArrowReader {
         }
 
         Ok(selected)
+    }
+
+    /// Byte ranges `(start, length)` that select EXACTLY the row groups
+    /// containing the given file row positions, under
+    /// [`ArrowReader::filter_row_groups_by_byte_range`]'s midpoint-ownership
+    /// rule. Contiguous runs of needed row groups collapse into one range.
+    ///
+    /// This is the planning half of a late-materialization / point-lookup
+    /// read: a caller holding exact row positions (e.g. from a previous scan
+    /// of the `_pos` metadata column) can turn them into sub-file
+    /// `FileScanTask` byte ranges so only the owning row groups are decoded;
+    /// the `_pos` virtual column stays file-absolute under row-group pruning,
+    /// so the fetched rows can be matched back by position.
+    ///
+    /// `positions` must be sorted ascending. Returns:
+    /// - `Ok(Some(ranges))` — ranges are `[midpoint(first), midpoint(last)+1)`
+    ///   per run, which the ownership rule maps back to exactly that run;
+    /// - `Ok(None)` — the metadata's row-group midpoints are not strictly
+    ///   increasing (malformed/degenerate layout), so no exact sub-file range
+    ///   can be guaranteed; the caller should fall back to a whole-file read;
+    /// - `Err` — a position lies beyond the file's total row count (the
+    ///   positions and the file disagree; reading anyway would silently drop
+    ///   rows).
+    pub fn byte_ranges_for_row_positions(
+        parquet_metadata: &Arc<ParquetMetaData>,
+        positions: &[u64],
+    ) -> Result<Option<Vec<(u64, u64)>>> {
+        if positions.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let row_groups = parquet_metadata.row_groups();
+
+        // Per row group: [row_start, row_end) + the midpoint byte offset,
+        // using the SAME start-offset resolution as
+        // `filter_row_groups_by_byte_range` (actual file offsets, never an
+        // assumed sequential accumulation).
+        let mut row_start = 0u64;
+        let mut fallback_offset = 4u64;
+        let mut groups: Vec<(u64, u64, u64)> = Vec::with_capacity(row_groups.len());
+        for row_group in row_groups {
+            let row_group_size = row_group.compressed_size() as u64;
+            let group_start = row_group
+                .file_offset()
+                .filter(|v| *v > 0)
+                .map(|v| v as u64)
+                .or_else(|| {
+                    row_group.columns().first().map(|c| {
+                        let dp = c.data_page_offset();
+                        let start = c.dictionary_page_offset().map_or(dp, |d| d.min(dp));
+                        start as u64
+                    })
+                })
+                .unwrap_or(fallback_offset);
+            let midpoint = group_start + row_group_size / 2;
+            let num_rows = row_group.num_rows() as u64;
+            groups.push((row_start, row_start + num_rows, midpoint));
+            row_start += num_rows;
+            fallback_offset = group_start + row_group_size;
+        }
+        // The exact-selection guarantee requires strictly increasing
+        // midpoints; a degenerate layout (zero-size groups, overlapping
+        // offsets) cannot be ranged safely.
+        if groups.windows(2).any(|w| w[1].2 <= w[0].2) {
+            return Ok(None);
+        }
+
+        // Sorted positions -> ascending needed row-group indices.
+        let mut needed: Vec<usize> = Vec::new();
+        let mut group_idx = 0usize;
+        for &pos in positions {
+            while group_idx < groups.len() && pos >= groups[group_idx].1 {
+                group_idx += 1;
+            }
+            if group_idx >= groups.len() {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("row position {pos} is beyond the file's {row_start} total rows"),
+                ));
+            }
+            debug_assert!(pos >= groups[group_idx].0, "positions must be sorted");
+            if needed.last() != Some(&group_idx) {
+                needed.push(group_idx);
+            }
+        }
+
+        // Contiguous index runs -> [midpoint(first), midpoint(last) + 1).
+        // Ownership checks only midpoints, so this selects the run exactly:
+        // every in-run midpoint is inside, the previous group's midpoint is
+        // below `start`, the next group's is at/above `end`.
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut run_start = needed[0];
+        let mut run_end = needed[0];
+        for &idx in &needed[1..] {
+            if idx == run_end + 1 {
+                run_end = idx;
+            } else {
+                ranges.push((
+                    groups[run_start].2,
+                    groups[run_end].2 - groups[run_start].2 + 1,
+                ));
+                run_start = idx;
+                run_end = idx;
+            }
+        }
+        ranges.push((
+            groups[run_start].2,
+            groups[run_end].2 - groups[run_start].2 + 1,
+        ));
+        Ok(Some(ranges))
     }
 }
 
@@ -1302,10 +1411,11 @@ mod tests {
 
 #[cfg(test)]
 mod byte_range_offset_tests {
+    use std::sync::Arc;
+
     use parquet::basic::Type as PhysicalType;
     use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
     use parquet::schema::types::{SchemaDescriptor, Type};
-    use std::sync::Arc;
 
     use crate::arrow::ArrowReader;
 
@@ -1340,9 +1450,7 @@ mod byte_range_offset_tests {
                 .unwrap()
         };
         let meta = parquet::file::metadata::ParquetMetaDataBuilder::new(
-            parquet::file::metadata::FileMetaData::new(
-                2, 20, None, None, schema.clone(), None,
-            ),
+            parquet::file::metadata::FileMetaData::new(2, 20, None, None, schema.clone(), None),
         )
         .add_row_group(mk(4))
         .add_row_group(mk(10_000))
@@ -1356,5 +1464,175 @@ mod byte_range_offset_tests {
         assert_eq!(low, vec![0]);
         let high = ArrowReader::filter_row_groups_by_byte_range(&meta, 5_000, 15_000).unwrap();
         assert_eq!(high, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod row_position_range_tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Int32Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::basic::Compression;
+    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use tempfile::TempDir;
+
+    use crate::Runtime;
+    use crate::arrow::{ArrowReader, ArrowReaderBuilder};
+    use crate::io::FileIO;
+    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+    use crate::scan::{FileScanTask, FileScanTaskStream};
+    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    /// Three row groups of 100 rows each (ids 0..300); returns the file path,
+    /// its metadata, and the iceberg schema.
+    fn multi_row_group_file(tmp_dir: &TempDir) -> (String, Arc<ParquetMetaData>, SchemaRef) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let file_path = format!("{}/pos_ranges.parquet", tmp_dir.path().to_str().unwrap());
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        for chunk in [0..100, 100..200, 200..300] {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from(chunk.collect::<Vec<i32>>()),
+            )])
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+        let meta = Arc::new(
+            SerializedFileReader::new(File::open(&file_path).unwrap())
+                .unwrap()
+                .metadata()
+                .clone(),
+        );
+        (file_path, meta, schema)
+    }
+
+    /// The computed byte ranges must map back — through the SAME midpoint
+    /// ownership rule the reader applies — to exactly the row groups that
+    /// contain the requested positions.
+    #[test]
+    fn ranges_select_exactly_owning_row_groups() {
+        let tmp_dir = TempDir::new().unwrap();
+        let (_, meta, _) = multi_row_group_file(&tmp_dir);
+
+        let owned = |positions: &[u64]| -> Vec<Vec<usize>> {
+            ArrowReader::byte_ranges_for_row_positions(&meta, positions)
+                .unwrap()
+                .expect("well-formed layout must range")
+                .into_iter()
+                .map(|(start, length)| {
+                    ArrowReader::filter_row_groups_by_byte_range(&meta, start, length).unwrap()
+                })
+                .collect()
+        };
+
+        // Disjoint groups -> one exact range per group.
+        assert_eq!(owned(&[5, 250, 299]), vec![vec![0], vec![2]]);
+        // A contiguous run collapses into one range.
+        assert_eq!(owned(&[99, 100]), vec![vec![0, 1]]);
+        // Positions in every group -> one whole-span range.
+        assert_eq!(owned(&[0, 150, 299]), vec![vec![0, 1, 2]]);
+        // Middle group only.
+        assert_eq!(owned(&[100, 199]), vec![vec![1]]);
+        // No positions -> no ranges.
+        assert_eq!(
+            ArrowReader::byte_ranges_for_row_positions(&meta, &[]).unwrap(),
+            Some(Vec::new())
+        );
+        // A position beyond the file's rows is an inconsistency, not a
+        // silent partial read.
+        assert!(ArrowReader::byte_ranges_for_row_positions(&meta, &[300]).is_err());
+    }
+
+    /// Reading the computed ranges must return ONLY the owning row groups'
+    /// rows, with the `_pos` virtual column staying file-absolute — the
+    /// contract the MoR merge's ranged late-materialization fetch depends on
+    /// to match fetched rows back to `(file, position)`.
+    #[tokio::test]
+    async fn ranged_read_returns_absolute_positions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let (file_path, meta, schema) = multi_row_group_file(&tmp_dir);
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+
+        // Positions in the first and last row groups only.
+        let positions: Vec<u64> = vec![7, 42, 210, 299];
+        let ranges = ArrowReader::byte_ranges_for_row_positions(&meta, &positions)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges.len(), 2, "two disjoint runs: {ranges:?}");
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks: Vec<_> = ranges
+            .into_iter()
+            .map(|(start, length)| {
+                Ok(FileScanTask::builder()
+                    .with_file_size_in_bytes(file_size)
+                    .with_start(start)
+                    .with_length(length)
+                    .with_data_file_path(file_path.clone())
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(schema.clone())
+                    .with_project_field_ids(vec![1, RESERVED_FIELD_ID_POS])
+                    .with_case_sensitive(false)
+                    .build())
+            })
+            .collect();
+        let batches = reader
+            .read(Box::pin(futures::stream::iter(tasks)) as FileScanTaskStream)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut rows: Vec<(i32, i64)> = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            let pos = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((ids.value(i), pos.value(i)));
+            }
+        }
+        rows.sort_unstable();
+
+        // Exactly the first + last groups' rows, and _pos == id (the file was
+        // written with id == position) — i.e. positions stay ABSOLUTE even
+        // though the middle group was never decoded.
+        assert_eq!(rows.len(), 200);
+        let expected: Vec<(i32, i64)> =
+            (0i64..100).chain(200..300).map(|v| (v as i32, v)).collect();
+        assert_eq!(rows, expected);
     }
 }

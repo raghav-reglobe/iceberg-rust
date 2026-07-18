@@ -44,7 +44,7 @@ pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenc
 
 /// A set of deleted row positions backed by a 64-bit roaring bitmap — the in-memory
 /// form of an Iceberg V3 `deletion-vector-v1`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
 }
@@ -56,6 +56,12 @@ impl DeleteVector {
         DeleteVector {
             inner: roaring_treemap,
         }
+    }
+
+    /// Consumes the delete vector, returning the underlying roaring treemap
+    /// of deleted row positions.
+    pub fn into_inner(self) -> RoaringTreemap {
+        self.inner
     }
 
     /// Returns an iterator over the deleted row positions in ascending order.

@@ -118,9 +118,7 @@ type ScopedTables = HashMap<String, HashMap<String, Vec<String>>>;
 /// A catalog WITH an entry mounts scoped (zero list calls, one load_table
 /// per named table — the per-call latency floor + Polaris-stampede fix);
 /// a catalog WITHOUT one keeps the full eager mount.
-fn parse_scoped_tables(
-    scoped: Option<HashMap<String, Vec<String>>>,
-) -> PyResult<ScopedTables> {
+fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult<ScopedTables> {
     let mut out: ScopedTables = HashMap::new();
     for (catalog, idents) in scoped.unwrap_or_default() {
         for ident in idents {
@@ -261,11 +259,16 @@ async fn doorway_deadline<T>(
 /// abort once it elapses (cooperatively inside the write node — the snapshot
 /// commit itself is never cancelled; a timed-out merge writes NO snapshot).
 /// `write_workers` sizes the writer pool for appended output (default:
-/// min(4, cores)). Returns a dict with `count` — the number of rows appended
-/// by the merge (inserts plus updated row versions). Raises `ValueError` on
-/// planning or execution failure, and on deadline expiry.
+/// min(4, cores)). `late_materialization` (default True) keeps the
+/// matched-row fetch row-group-ranged — only the row groups containing
+/// matched positions are decoded, and prior deletion-vector state is loaded
+/// from the delete files; pass False as the kill switch restoring the
+/// whole-file fetch (both produce identical commits). Returns a dict with
+/// `count` — the number of rows appended by the merge (inserts plus updated
+/// row versions). Raises `ValueError` on planning or execution failure, and
+/// on deadline expiry.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None, late_materialization=None))]
 fn merge_into(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -274,6 +277,7 @@ fn merge_into(
     timeout_s: Option<u64>,
     write_workers: Option<usize>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
+    late_materialization: Option<bool>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
@@ -288,6 +292,7 @@ fn merge_into(
             let options = Arc::new(MorMergeOptions {
                 deadline,
                 write_workers,
+                late_materialization: late_materialization.unwrap_or(true),
             });
             let ctx = doorway_deadline(
                 deadline,

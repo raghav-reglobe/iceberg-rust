@@ -126,6 +126,51 @@ impl ArrowReader {
 
         Ok(ScanResult::new(stream, scan_metrics))
     }
+
+    /// Load the aggregated POSITIONAL delete state (V3 deletion vectors and
+    /// V2 position-delete files) applying to each task's data file, WITHOUT
+    /// reading any data rows.
+    ///
+    /// Returns the per-data-file delete vector for every task whose delete
+    /// entries yield one; data files with no positional deletes are absent
+    /// from the map. Equality deletes are loaded as predicates by the read
+    /// path and never surface here — callers that must reason about them
+    /// should inspect `task.deletes` themselves.
+    ///
+    /// The loads share this reader's delete-file cache: a subsequent
+    /// [`ArrowReader::read`] over the same tasks reuses the already-loaded
+    /// state instead of re-fetching the delete files.
+    pub async fn load_positional_deletes(
+        &self,
+        tasks: &[FileScanTask],
+    ) -> Result<HashMap<String, crate::delete_vector::DeleteVector>> {
+        let mut out = HashMap::new();
+        for task in tasks {
+            if task.deletes.is_empty() {
+                continue;
+            }
+            let delete_filter = self
+                .delete_file_loader
+                .load_deletes(&task.deletes, Arc::clone(&task.schema))
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "delete-file loading task was cancelled",
+                    )
+                })??;
+            if let Some(dv) = delete_filter.get_delete_vector(task) {
+                let dv = dv.lock().map_err(|_| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "delete-vector lock poisoned during load",
+                    )
+                })?;
+                out.insert(task.data_file_path().to_string(), dv.clone());
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Per-scan state for processing [`FileScanTask`]s. Created once per

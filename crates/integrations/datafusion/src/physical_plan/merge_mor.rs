@@ -33,7 +33,12 @@
 //! `(_file, _pos)`; UPDATE additionally appends the new row version, with the
 //! unreferenced columns fetched late — only data files that actually contain
 //! matched rows are read for full-row materialization, never the whole
-//! current set. A file that already carries a deletion vector gets ONE
+//! current set. Under [`MorMergeOptions::late_materialization`] (default ON)
+//! the fetch is clipped further: matched positions are grouped per file and
+//! only the row groups that contain them are decoded (sub-file byte-range
+//! tasks against the SAME pinned snapshot), with the prior deletion-vector
+//! state loaded from the delete files instead of reconstructed from a
+//! whole-file scan. A file that already carries a deletion vector gets ONE
 //! superseding DV (prior deleted positions unioned in, prior DV removed in
 //! the same commit) — never a second live DV per data file.
 
@@ -67,8 +72,8 @@ use iceberg::arrow::variant_shred::{
     shred_types_with_arrow_from_file_schema, shredded_output_type, variant_column_count,
 };
 use iceberg::arrow::{
-    ArrowFileReader, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator,
-    schema_to_arrow_schema,
+    ArrowFileReader, ArrowReader as IcebergArrowReader, PROJECTED_PARTITION_VALUE_COLUMN,
+    PartitionValueCalculator, schema_to_arrow_schema,
 };
 use iceberg::delete_vector::DeleteVector;
 use iceberg::expr::Predicate as IcebergPredicate;
@@ -123,9 +128,13 @@ const MOR_DEFAULT_WRITE_WORKERS: usize = 4;
 /// Concurrent deletion-vector (Puffin) uploads during DV construction.
 const MOR_DV_WRITE_CONCURRENCY: usize = 8;
 
+/// Concurrent parquet-footer reads while planning the row-group-ranged
+/// late-materialization fetch (metadata GETs only).
+const MOR_FETCH_FOOTER_CONCURRENCY: usize = 8;
+
 /// Session-level execution options for the MoR MERGE, set by the caller via
 /// `SessionConfig::with_extension(Arc<MorMergeOptions>)`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MorMergeOptions {
     /// Cooperative deadline for the scan/write phase. Enforced at every
     /// await point of the write node BEFORE files are handed to the commit
@@ -137,6 +146,26 @@ pub struct MorMergeOptions {
     /// and late-materialized updated rows) fan out round-robin to this many
     /// writer tasks, each owning its own rolling file writer.
     pub write_workers: Option<usize>,
+    /// Row-group-ranged late materialization of the matched-row fetch
+    /// (default ON). Matched positions are grouped by data file and only the
+    /// row groups containing them are decoded — sub-file byte-range tasks
+    /// against the same pinned snapshot — while the prior deletion-vector
+    /// state comes from loading the delete files directly (no data rows).
+    /// OFF is the kill switch restoring the previous behavior: every
+    /// affected file is decoded in full (all alive rows, full width) and the
+    /// prior-delete state is reconstructed by inverting that scan. Both
+    /// paths commit byte-identical results.
+    pub late_materialization: bool,
+}
+
+impl Default for MorMergeOptions {
+    fn default() -> Self {
+        Self {
+            deadline: None,
+            write_workers: None,
+            late_materialization: true,
+        }
+    }
 }
 
 fn deadline_error(what: &str) -> DataFusionError {
@@ -1349,8 +1378,24 @@ async fn run_mor_write(
             .map(|t| (t.data_file_path().to_string(), t))
             .collect();
 
+        // Matched positions per file, ascending — drives the consolidated-DV
+        // union and (late path) the row-group-ranged fetch planning.
+        let mut positions_by_file: HashMap<String, Vec<u64>> = HashMap::new();
+        for (file, pos) in matched.keys() {
+            positions_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(*pos);
+        }
+        for positions in positions_by_file.values_mut() {
+            positions.sort_unstable();
+        }
+        let late = options.late_materialization;
+
         // Late materialization: read ONLY the affected files, full projection
-        // + _file/_pos, prior deletes applied (alive rows only).
+        // + _file/_pos — and with `late_materialization` (default ON) only
+        // the ROW GROUPS containing matched positions, via sub-file
+        // byte-range tasks over the same pinned snapshot.
         //
         // Shredded passthrough: when the writer outputs the SAME shredded
         // layout (`write.parquet.shred-variants`), fetched rows carry their
@@ -1372,8 +1417,40 @@ async fn run_mor_write(
             reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
         }
         let reader = reader_builder.build();
+
+        // Prior positional-delete state per affected file:
+        // - late path: loaded straight from the delete files (no data rows);
+        //   the load shares the reader's delete cache, so the fetch below
+        //   reuses it instead of re-fetching.
+        // - legacy path: reconstructed from the whole-file alive scan below.
+        let mut prior_deletes: HashMap<String, DeleteVector> = if late {
+            with_deadline(
+                deadline,
+                "loading the prior delete state",
+                reader.load_positional_deletes(&fetch_tasks),
+            )
+            .await?
+            .map_err(to_datafusion_error)?
+        } else {
+            HashMap::new()
+        };
+
+        // The fetch task list: late -> sub-file byte-range tasks covering
+        // only the row groups holding matched positions (whole-file fallback
+        // per file when its layout cannot be ranged exactly); legacy -> the
+        // whole affected files.
+        let read_tasks: Vec<FileScanTask> = if late {
+            with_deadline(
+                deadline,
+                "planning the ranged late-materialization fetch",
+                plan_ranged_fetch_tasks(&table, &fetch_tasks, &positions_by_file),
+            )
+            .await??
+        } else {
+            fetch_tasks.clone()
+        };
         let task_stream = Box::pin(futures::stream::iter(
-            fetch_tasks.iter().cloned().map(Ok).collect::<Vec<_>>(),
+            read_tasks.into_iter().map(Ok).collect::<Vec<_>>(),
         )) as iceberg::scan::FileScanTaskStream;
         let mut fetch_stream = reader
             .read(task_stream)
@@ -1416,7 +1493,11 @@ async fn run_mor_write(
             for row in 0..fbatch.num_rows() {
                 let file = file_arr.value(row);
                 let pos = pos_arr.value(row) as u64;
-                alive.entry(file.to_string()).or_default().insert(pos);
+                if !late {
+                    // Legacy whole-file fetch: the prior-deleted set is
+                    // reconstructed by inverting the alive positions.
+                    alive.entry(file.to_string()).or_default().insert(pos);
+                }
                 if let Some(m) = matched.get(&(file.to_string(), pos))
                     && clauses
                         .get(m.clause as usize)
@@ -1442,25 +1523,34 @@ async fn run_mor_write(
         }
 
         // One consolidated DV per affected file: everything already deleted
-        // (full range minus alive) plus this merge's matched positions. The
-        // bitmaps are built synchronously (they read the bookkeeping maps);
-        // the Puffin uploads are small independent PUTs, written concurrently
-        // from fully owned state.
+        // plus this merge's matched positions. The prior-deleted set comes
+        // from the loaded delete state (late path) or from inverting the
+        // whole-file alive scan (legacy path) — identical by construction.
+        // The bitmaps are built synchronously (they read the bookkeeping
+        // maps); the Puffin uploads are small independent PUTs, written
+        // concurrently from fully owned state.
         let location = table.metadata().location().to_string();
         let mut dv_jobs = Vec::with_capacity(per_file.len());
         for (file, task) in &per_file {
-            let record_count = task.record_count.ok_or_else(|| {
-                DataFusionError::Internal(format!("no record count for data file {file}"))
-            })?;
-            let alive_set = alive.remove(file).unwrap_or_default();
-            let mut bitmap = RoaringTreemap::new();
-            for pos in 0..record_count {
-                if !alive_set.contains(pos) {
-                    bitmap.insert(pos);
+            let mut bitmap = if late {
+                prior_deletes
+                    .remove(file)
+                    .map(DeleteVector::into_inner)
+                    .unwrap_or_default()
+            } else {
+                let record_count = task.record_count.ok_or_else(|| {
+                    DataFusionError::Internal(format!("no record count for data file {file}"))
+                })?;
+                let alive_set = alive.remove(file).unwrap_or_default();
+                let mut inverted = RoaringTreemap::new();
+                for pos in 0..record_count {
+                    if !alive_set.contains(pos) {
+                        inverted.insert(pos);
+                    }
                 }
-            }
-            for ((f, pos), _) in matched.iter().filter(|((f, _), _)| f == file) {
-                debug_assert_eq!(f, file);
+                inverted
+            };
+            for pos in positions_by_file.get(file).into_iter().flatten() {
                 bitmap.insert(*pos);
             }
             let partition = task.partition.clone().unwrap_or(Struct::empty());
@@ -1540,6 +1630,86 @@ async fn run_mor_write(
         pad(removed_lane),
     ])
     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Plan the row-group-ranged late-materialization fetch: for each affected
+/// file, read the parquet footer and clip its task to byte ranges covering
+/// ONLY the row groups that contain matched positions — the reader's
+/// byte-range row-group ownership then decodes just those groups, and the
+/// `_pos` virtual column stays file-absolute, so matched rows resolve
+/// exactly as under a whole-file read. A file whose layout cannot be ranged
+/// exactly falls back to its whole-file task. Footer reads are cheap
+/// metadata GETs, issued with bounded concurrency.
+async fn plan_ranged_fetch_tasks(
+    table: &Table,
+    fetch_tasks: &[FileScanTask],
+    positions_by_file: &HashMap<String, Vec<u64>>,
+) -> DFResult<Vec<FileScanTask>> {
+    let mut plans = Vec::with_capacity(fetch_tasks.len());
+    for task in fetch_tasks {
+        let positions = positions_by_file
+            .get(task.data_file_path())
+            .cloned()
+            .unwrap_or_default();
+        plans.push(plan_one_ranged_fetch(
+            table.clone(),
+            task.clone(),
+            positions,
+        ));
+    }
+    let nested: Vec<Vec<FileScanTask>> = futures::stream::iter(plans)
+        .buffered(MOR_FETCH_FOOTER_CONCURRENCY)
+        .try_collect()
+        .await?;
+    Ok(nested.into_iter().flatten().collect())
+}
+
+/// Clip ONE affected file's task to the byte ranges owning its matched
+/// positions (whole-file fallback when the layout cannot be ranged exactly).
+async fn plan_one_ranged_fetch(
+    table: Table,
+    task: FileScanTask,
+    positions: Vec<u64>,
+) -> DFResult<Vec<FileScanTask>> {
+    let input = table
+        .file_io()
+        .new_input(task.data_file_path())
+        .map_err(to_datafusion_error)?;
+    let reader = input.reader().await.map_err(to_datafusion_error)?;
+    let mut reader = ArrowFileReader::new(
+        FileMetadata {
+            size: task.file_size_in_bytes,
+        },
+        reader,
+    );
+    let meta = ArrowReaderMetadata::load_async(&mut reader, Default::default())
+        .await
+        .map_err(|e| {
+            DataFusionError::External(
+                format!(
+                    "loading parquet footer of {} for the ranged fetch: {e}",
+                    task.data_file_path()
+                )
+                .into(),
+            )
+        })?;
+    let ranges = IcebergArrowReader::byte_ranges_for_row_positions(meta.metadata(), &positions)
+        .map_err(to_datafusion_error)?;
+    Ok(match ranges {
+        Some(ranges) => ranges
+            .into_iter()
+            .map(|(start, length)| {
+                let mut clipped = task.clone();
+                clipped.start = start;
+                clipped.length = length;
+                // Sub-file read: the manifest record count no longer
+                // describes what this task reads.
+                clipped.record_count = None;
+                clipped
+            })
+            .collect(),
+        None => vec![task],
+    })
 }
 
 /// Append the computed `_partition` column for partitioned tables; pass
