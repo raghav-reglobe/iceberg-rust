@@ -61,7 +61,7 @@ fn catalog_cache_key(name: &str, props: &HashMap<String, String>) -> String {
     key
 }
 
-async fn get_or_build_catalog(
+pub(crate) async fn get_or_build_catalog(
     name: &str,
     props: HashMap<String, String>,
 ) -> PyResult<Arc<dyn Catalog>> {

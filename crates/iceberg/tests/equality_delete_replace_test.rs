@@ -477,3 +477,361 @@ async fn atomic_replace_via_partition_scoped_equality_deletes() {
     );
     assert_eq!(rows.len(), 6, "{rows:?}");
 }
+
+// ---------------------------------------------------------------------------
+// The atomic_partition_replace API (the doorway's core)
+// ---------------------------------------------------------------------------
+
+mod replace_api {
+    use arrow_array::{Array, BinaryArray};
+    use iceberg::atomic_replace::{ReplaceOutcome, atomic_partition_replace};
+    use iceberg::spec::VariantType;
+
+    use super::*;
+
+    async fn setup(warehouse: &TempDir) -> (impl Catalog, TableIdent) {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let ns = NamespaceIdent::new("db".to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(FIELD_ID_IS_BACKFILL, "_is_backfill", Transform::Identity)
+            .unwrap()
+            .build();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("bronze_api".to_string())
+                    .schema(table_schema())
+                    .partition_spec(spec)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let ident = TableIdent::new(ns, "bronze_api".to_string());
+
+        // Seed both partitions: full-load rows + CDC rows (id 2 in both).
+        let mut seed = write_data(
+            &table,
+            "seed-backfill",
+            Some(true),
+            batch(&table, &[
+                (1, "r-old-1", "r", Some(true)),
+                (2, "r-old-2", "r", Some(true)),
+                (6, "r-old-6", "r", Some(true)),
+            ]),
+        )
+        .await;
+        seed.extend(
+            write_data(
+                &table,
+                "seed-cdc",
+                None,
+                batch(&table, &[(2, "c-2", "c", None)]),
+            )
+            .await,
+        );
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(seed)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        (catalog, ident)
+    }
+
+    /// A batch WITHOUT field-id metadata and with columns out of order — the
+    /// doorway input shape (external Arrow producers carry no parquet ids).
+    fn external_batch(table: &Table, rows: &[(i32, &str, &str, Option<bool>)]) -> RecordBatch {
+        let plain = |name: &str, dt: DataType, nullable: bool| Field::new(name, dt, nullable);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            plain("payload", DataType::Utf8, true),
+            plain("_is_backfill", DataType::Boolean, true),
+            plain(
+                "_cdc",
+                DataType::Struct(Fields::from(vec![plain("op", DataType::Utf8, false)])),
+                false,
+            ),
+            plain("id", DataType::Int32, false),
+        ]));
+        let _ = table;
+        let ops: Vec<&str> = rows.iter().map(|r| r.2).collect();
+        let cdc = StructArray::from(vec![(
+            Arc::new(plain("op", DataType::Utf8, false)),
+            Arc::new(StringArray::from(ops)) as arrow_array::ArrayRef,
+        )]);
+        RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(cdc),
+            Arc::new(Int32Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_conforms_commits_once_and_is_rerunnable() {
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = setup(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        let snaps_before = table.metadata().snapshots().count();
+
+        // Dry run: counts only, no snapshot.
+        let out = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            vec![external_batch(&table, &[
+                (1, "r-new-1", "r", Some(true)),
+                (2, "r-new-2", "r", Some(true)),
+            ])],
+            6,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (out.rows_appended, out.delete_tuples, out.attempts),
+            (2, 2, 0)
+        );
+        assert_eq!(
+            catalog
+                .load_table(&ident)
+                .await
+                .unwrap()
+                .metadata()
+                .snapshots()
+                .count(),
+            snaps_before,
+            "dry run must not commit"
+        );
+
+        // Real replace: out-of-order, id-less input conforms; ONE snapshot.
+        let out: ReplaceOutcome = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            vec![external_batch(&table, &[
+                (1, "r-new-1", "r", Some(true)),
+                (2, "r-new-2", "r", Some(true)),
+            ])],
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.attempts, 1);
+        assert_eq!(out.rows_appended, 2);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+        assert_eq!(table.metadata().current_snapshot_id(), out.snapshot_id);
+        assert_eq!(read_rows(&table).await, vec![
+            (1, "r-new-1".to_string(), "r".to_string()),
+            (2, "c-2".to_string(), "c".to_string()),
+            (2, "r-new-2".to_string(), "r".to_string()),
+            (6, "r-old-6".to_string(), "r".to_string()),
+        ]);
+
+        // RERUN of the same chunk with fresher payloads: idempotent replace
+        // semantics — the latest run's rows win, no duplicates.
+        atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            vec![external_batch(&table, &[
+                (1, "r-newer-1", "r", Some(true)),
+                (2, "r-newer-2", "r", Some(true)),
+            ])],
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_rows(&table).await, vec![
+            (1, "r-newer-1".to_string(), "r".to_string()),
+            (2, "c-2".to_string(), "c".to_string()),
+            (2, "r-newer-2".to_string(), "r".to_string()),
+            (6, "r-old-6".to_string(), "r".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_nested_equality_and_wrong_spec() {
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = setup(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        let rows = vec![external_batch(&table, &[(1, "x", "r", Some(true))])];
+
+        // Nested equality column -> loud error.
+        let err = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["_cdc.op".to_string()],
+            rows.clone(),
+            6,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("TOP-LEVEL"), "{err}");
+
+        // Wrong partition column -> loud error.
+        let err = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "payload",
+            Literal::string("x"),
+            &["id".to_string()],
+            rows,
+            6,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("IDENTITY partition"), "{err}");
+    }
+
+    /// The mongo-shaped path: a VARIANT column fed as JSON strings.
+    #[tokio::test]
+    async fn replace_converts_json_strings_to_variant() {
+        let warehouse = TempDir::new().unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let ns = NamespaceIdent::new("db".to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "after", Type::Variant(VariantType)).into(),
+                NestedField::optional(3, "_is_backfill", Type::Primitive(PrimitiveType::Boolean))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(3, "_is_backfill", Transform::Identity)
+            .unwrap()
+            .build();
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("mongo_bronze".to_string())
+                    .schema(schema)
+                    .partition_spec(spec)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let ident = TableIdent::new(ns, "mongo_bronze".to_string());
+
+        // Input: `after` as plain JSON strings (no field ids, no variant).
+        let plain_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("after", DataType::Utf8, true),
+            Field::new("_is_backfill", DataType::Boolean, true),
+        ]));
+        let input = RecordBatch::try_new(plain_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some(r#"{"name":"a","n":1}"#), None])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(true)])),
+        ])
+        .unwrap();
+
+        let out = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            vec![input],
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.rows_appended, 2);
+
+        // Read back: canonical variant struct; row 1 non-null, row 2 null.
+        let table = catalog.load_table(&ident).await.unwrap();
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .select_all()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2);
+        let b = &batches[0];
+        let schema = b.schema();
+        let after = b
+            .column(schema.index_of("after").unwrap())
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let id_col = b
+            .column(schema.index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            if id_col.value(i) == 1 {
+                assert!(after.is_valid(i), "row id=1 carries a variant document");
+                let metadata = after.column_by_name("metadata").unwrap();
+                assert!(
+                    metadata
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap()
+                        .value(i)
+                        .len()
+                        > 0
+                );
+            } else {
+                assert!(after.is_null(i), "row id=2 is a NULL variant");
+            }
+        }
+    }
+}
