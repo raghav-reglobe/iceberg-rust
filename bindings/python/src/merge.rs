@@ -34,7 +34,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
 use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::functions::register_variant_functions;
+use iceberg_datafusion::functions::{register_parity_functions, register_variant_functions};
 use iceberg_datafusion::{IcebergCatalogProvider, MorMergeOptions};
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use pyo3::exceptions::PyValueError;
@@ -198,6 +198,7 @@ async fn session_with_catalogs(
         }
     };
     register_variant_functions(&ctx);
+    register_parity_functions(&ctx);
     for (name, props) in catalogs {
         let catalog = get_or_build_catalog(&name, props).await?;
         let provider = match scoped_tables.remove(&name) {

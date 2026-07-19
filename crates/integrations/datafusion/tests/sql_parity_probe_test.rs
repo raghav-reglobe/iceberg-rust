@@ -155,3 +155,71 @@ async fn conv_16_10_is_a_udf_gap() {
         Some("900150983cd24fb")
     );
 }
+
+/// The FULL md5-slice expression with the registered `conv16` UDF, against
+/// PRECOMPUTED MySQL goldens (hashlib/int(_,16) — exact CONV(_,16,10)
+/// integer semantics). The canonicalized row strings follow the contract:
+/// pipe separator, `\N` NULL sentinel (note: a MySQL string literal must
+/// spell it '\\N' — MySQL drops the backslash from unrecognized escapes),
+/// DECIMAL(38,6) full-scale rendering, booleans as 0/1, timestamps
+/// space-separated via to_char. MySQL side: SUM(CAST(CONV(...) AS
+/// UNSIGNED)) for the same exact-integer sum.
+#[tokio::test]
+async fn md5slice_full_expression_matches_mysql_goldens() {
+    use datafusion::arrow::array::UInt64Array;
+
+    let ctx = SessionContext::new();
+    iceberg_datafusion::functions::register_parity_functions(&ctx);
+
+    // Canonicalization happens IN SQL, from typed values — the same shapes
+    // the parity reader would emit.
+    let sql = "WITH src(id, name, amount, flag, ts) AS (VALUES \
+                   (1, 'alpha', 1.5,   true,  TIMESTAMP '2026-01-02 03:04:05'), \
+                   (2, NULL,    2.0,   false, TIMESTAMP '2026-01-02 03:04:06'), \
+                   (3, 'gamma', -7.25, true,  TIMESTAMP '2026-12-31 23:59:59')), \
+               canon AS (SELECT id, concat_ws('|', \
+                   CAST(id AS VARCHAR), \
+                   coalesce(name, '\\N'), \
+                   CAST(CAST(amount AS DECIMAL(38,6)) AS VARCHAR), \
+                   CAST(CAST(flag AS INT) AS VARCHAR), \
+                   to_char(ts, '%Y-%m-%d %H:%M:%S')) AS row_str \
+               FROM src) \
+               SELECT id, conv16(substr(md5(row_str), 1, 15)) AS h FROM canon ORDER BY id";
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut hashes = Vec::new();
+    for b in &batches {
+        let h = b.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+        hashes.extend(h.values().iter().copied());
+    }
+    // MySQL goldens: CONV(SUBSTRING(MD5('<canonical row>'),1,15),16,10).
+    assert_eq!(hashes, vec![
+        520256900126346162,  // '1|alpha|1.500000|1|2026-01-02 03:04:05'
+        1147288043085901310, // '2|\N|2.000000|0|2026-01-02 03:04:06'
+        33466909318705873,   // '3|gamma|-7.250000|1|2026-12-31 23:59:59'
+    ]);
+
+    // And the slice SUM — exact integer aggregation on both sides.
+    let sum_sql = "WITH src(id, name, amount, flag, ts) AS (VALUES \
+                   (1, 'alpha', 1.5,   true,  TIMESTAMP '2026-01-02 03:04:05'), \
+                   (2, NULL,    2.0,   false, TIMESTAMP '2026-01-02 03:04:06'), \
+                   (3, 'gamma', -7.25, true,  TIMESTAMP '2026-12-31 23:59:59')) \
+               SELECT CAST(SUM(conv16(substr(md5(concat_ws('|', \
+                   CAST(id AS VARCHAR), \
+                   coalesce(name, '\\N'), \
+                   CAST(CAST(amount AS DECIMAL(38,6)) AS VARCHAR), \
+                   CAST(CAST(flag AS INT) AS VARCHAR), \
+                   to_char(ts, '%Y-%m-%d %H:%M:%S'))), 1, 15))) AS VARCHAR) FROM src";
+    let batches = ctx.sql(sum_sql).await.unwrap().collect().await.unwrap();
+    let col = datafusion::arrow::compute::cast(
+        batches[0].column(0).as_ref(),
+        &datafusion::arrow::datatypes::DataType::Utf8,
+    )
+    .unwrap();
+    let sum = col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(sum, "1701011852530953345", "slice checksum golden");
+}

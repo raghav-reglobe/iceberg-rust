@@ -17,6 +17,8 @@
 
 //! Scalar UDFs that complement the Iceberg table provider.
 
+pub mod parity;
 pub mod variant;
 
+pub use parity::register_parity_functions;
 pub use variant::{all_variant_functions, register_variant_functions};
