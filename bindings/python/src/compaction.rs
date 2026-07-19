@@ -98,6 +98,7 @@ fn compact(
                 // S3 (and other object stores) via opendal — without a storage
                 // factory the RestCatalog can't issue any data-file IO.
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
@@ -140,6 +141,7 @@ fn rewrite_manifests(
         runtime().block_on(async move {
             let catalog = RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
@@ -233,6 +235,7 @@ fn remove_orphan_files(
         runtime().block_on(async move {
             let catalog = RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
@@ -322,6 +325,7 @@ fn expire_snapshots(
         runtime().block_on(async move {
             let catalog = RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {

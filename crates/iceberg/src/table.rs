@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::cache::ObjectBytesCacheRef;
 use crate::encryption::EncryptionManager;
 use crate::encryption::kms::KeyManagementClient;
 use crate::inspect::MetadataTable;
@@ -40,6 +41,7 @@ pub struct TableBuilder {
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    object_bytes_cache: Option<ObjectBytesCacheRef>,
     runtime: Option<Runtime>,
 }
 
@@ -54,6 +56,7 @@ impl TableBuilder {
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            object_bytes_cache: None,
             runtime: None,
         }
     }
@@ -102,6 +105,19 @@ impl TableBuilder {
         self
     }
 
+    /// optional - back the table's manifest / manifest-list cache with a
+    /// SHARED, path-keyed store of raw file bytes (see
+    /// [`crate::cache::ObjectBytesCache`]). The same store may be attached
+    /// to every table a process builds so repeat loads of the same table
+    /// hit warm cache; fetches on miss go through THIS table's `FileIO` and
+    /// parsing happens per call. Ignored when [`Self::disable_cache`] is
+    /// set; takes precedence over [`Self::cache_size_bytes`] (capacity then
+    /// belongs to the shared store).
+    pub fn object_bytes_cache(mut self, bytes_cache: ObjectBytesCacheRef) -> Self {
+        self.object_bytes_cache = Some(bytes_cache);
+        self
+    }
+
     /// Set the Runtime for this table to use when spawning tasks.
     pub fn runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = Some(runtime);
@@ -129,6 +145,7 @@ impl TableBuilder {
             readonly,
             disable_cache,
             cache_size_bytes,
+            object_bytes_cache,
             runtime,
         } = self;
 
@@ -166,6 +183,12 @@ impl TableBuilder {
         let object_cache = if disable_cache {
             Arc::new(ObjectCache::with_disabled_cache(
                 file_io.clone(),
+                encryption_manager.clone(),
+            ))
+        } else if let Some(bytes_cache) = object_bytes_cache {
+            Arc::new(ObjectCache::with_shared_bytes_cache(
+                file_io.clone(),
+                bytes_cache,
                 encryption_manager.clone(),
             ))
         } else if let Some(cache_size_bytes) = cache_size_bytes {

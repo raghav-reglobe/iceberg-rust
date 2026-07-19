@@ -26,6 +26,7 @@ use futures::lock::{Mutex, MutexGuard};
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
+use crate::cache::ObjectBytesCacheRef;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::runtime::Runtime;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
@@ -47,6 +48,7 @@ pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     runtime: Option<Runtime>,
+    object_bytes_cache: Option<ObjectBytesCacheRef>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -59,7 +61,19 @@ impl Default for MemoryCatalogBuilder {
             },
             storage_factory: None,
             runtime: None,
+            object_bytes_cache: None,
         }
+    }
+}
+
+impl MemoryCatalogBuilder {
+    /// Attach a SHARED, path-keyed cache of raw manifest / manifest-list
+    /// bytes (see [`crate::cache::ObjectBytesCache`]). Every table this
+    /// catalog builds uses the shared store, so repeat loads of the same
+    /// table hit warm cache.
+    pub fn with_object_bytes_cache(mut self, bytes_cache: ObjectBytesCacheRef) -> Self {
+        self.object_bytes_cache = Some(bytes_cache);
+        self
     }
 }
 
@@ -109,7 +123,12 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                 ))
             } else {
                 let runtime = self.runtime.unwrap_or_else(Runtime::current);
-                MemoryCatalog::new(self.config, self.storage_factory, runtime)
+                MemoryCatalog::new(
+                    self.config,
+                    self.storage_factory,
+                    runtime,
+                    self.object_bytes_cache,
+                )
             }
         };
 
@@ -131,6 +150,9 @@ pub struct MemoryCatalog {
     file_io: FileIO,
     warehouse_location: String,
     runtime: Runtime,
+    /// Shared manifest / manifest-list object cache attached to every table
+    /// this catalog builds.
+    object_bytes_cache: Option<ObjectBytesCacheRef>,
 }
 
 impl MemoryCatalog {
@@ -139,6 +161,7 @@ impl MemoryCatalog {
         config: MemoryCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
+        object_bytes_cache: Option<ObjectBytesCacheRef>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -148,7 +171,20 @@ impl MemoryCatalog {
             file_io: FileIOBuilder::new(factory).with_props(config.props).build(),
             warehouse_location: config.warehouse,
             runtime,
+            object_bytes_cache,
         })
+    }
+
+    /// Apply the catalog's shared object bytes cache (when configured) to a
+    /// table under construction.
+    fn attach_object_cache(
+        &self,
+        builder: crate::table::TableBuilder,
+    ) -> crate::table::TableBuilder {
+        match &self.object_bytes_cache {
+            Some(bytes_cache) => builder.object_bytes_cache(bytes_cache.clone()),
+            None => builder,
+        }
     }
 
     /// Loads a table from the locked namespace state.
@@ -160,13 +196,15 @@ impl MemoryCatalog {
         let metadata_location = root_namespace_state.get_existing_table_location(table_ident)?;
         let metadata = TableMetadata::read_from(&self.file_io, metadata_location).await?;
 
-        Table::builder()
-            .identifier(table_ident.clone())
-            .metadata(metadata)
-            .metadata_location(metadata_location.to_string())
-            .file_io(self.file_io.clone())
-            .runtime(self.runtime.clone())
-            .build()
+        self.attach_object_cache(
+            Table::builder()
+                .identifier(table_ident.clone())
+                .metadata(metadata)
+                .metadata_location(metadata_location.to_string())
+                .file_io(self.file_io.clone())
+                .runtime(self.runtime.clone()),
+        )
+        .build()
     }
 }
 
@@ -315,13 +353,15 @@ impl Catalog for MemoryCatalog {
 
         root_namespace_state.insert_new_table(&table_ident, metadata_location.to_string())?;
 
-        Table::builder()
-            .file_io(self.file_io.clone())
-            .metadata_location(metadata_location.to_string())
-            .metadata(metadata)
-            .identifier(table_ident)
-            .runtime(self.runtime.clone())
-            .build()
+        self.attach_object_cache(
+            Table::builder()
+                .file_io(self.file_io.clone())
+                .metadata_location(metadata_location.to_string())
+                .metadata(metadata)
+                .identifier(table_ident)
+                .runtime(self.runtime.clone()),
+        )
+        .build()
     }
 
     /// Load table from the catalog.
@@ -382,13 +422,15 @@ impl Catalog for MemoryCatalog {
 
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
 
-        Table::builder()
-            .file_io(self.file_io.clone())
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(table_ident.clone())
-            .runtime(self.runtime.clone())
-            .build()
+        self.attach_object_cache(
+            Table::builder()
+                .file_io(self.file_io.clone())
+                .metadata_location(metadata_location)
+                .metadata(metadata)
+                .identifier(table_ident.clone())
+                .runtime(self.runtime.clone()),
+        )
+        .build()
     }
 
     /// Update a table in the catalog.

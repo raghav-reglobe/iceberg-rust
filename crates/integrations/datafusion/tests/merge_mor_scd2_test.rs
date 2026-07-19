@@ -2168,3 +2168,219 @@ async fn late_materialization_target_scan_projects_narrow_schema() {
         "the wide payload column must not be materialized by the decide-phase scan"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Process-shared object cache across merge calls
+// ---------------------------------------------------------------------------
+
+mod object_cache_sharing {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use iceberg::cache::{ObjectBytesCache, ObjectBytesCacheRef};
+
+    use super::*;
+
+    /// Path-keyed bytes store counting hits and PER-KEY sets: every IO
+    /// fetch is followed by exactly one `set`, so `max_sets_per_key() == 1`
+    /// proves no manifest / manifest-list was ever fetched twice.
+    #[derive(Debug, Default)]
+    struct CountingBytesCache {
+        map: Mutex<HashMap<String, Bytes>>,
+        hits: AtomicUsize,
+        sets_per_key: Mutex<HashMap<String, usize>>,
+    }
+
+    impl CountingBytesCache {
+        fn max_sets_per_key(&self) -> usize {
+            self.sets_per_key
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn distinct_keys(&self) -> usize {
+            self.sets_per_key.lock().unwrap().len()
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectBytesCache for CountingBytesCache {
+        async fn get(&self, path: &str) -> Option<Bytes> {
+            let out = self.map.lock().unwrap().get(path).cloned();
+            if out.is_some() {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+            }
+            out
+        }
+
+        async fn set(&self, path: &str, bytes: Bytes) {
+            *self
+                .sets_per_key
+                .lock()
+                .unwrap()
+                .entry(path.to_string())
+                .or_default() += 1;
+            self.map.lock().unwrap().insert(path.to_string(), bytes);
+        }
+    }
+
+    /// Distinct keys that look like manifest lists (snapshot pointers) vs
+    /// manifests, by path shape (`snap-*.avro` vs other `.avro`).
+    fn list_keys(cache: &CountingBytesCache) -> usize {
+        cache
+            .sets_per_key
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| {
+                k.rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("snap-")
+            })
+            .count()
+    }
+
+    /// Two sequential MERGEs through a bytes-cache-armed catalog: every
+    /// manifest / manifest-list is fetched at most ONCE for the whole run —
+    /// the many scans within one statement AND the second call (which
+    /// re-loads the table at its NEW snapshot) all hit the shared store;
+    /// only genuinely new objects (the fresh snapshot's manifest list,
+    /// newly written manifests) are fetched.
+    #[tokio::test]
+    async fn merge_calls_share_process_object_cache() {
+        let warehouse = TempDir::new().unwrap();
+        let store = Arc::new(CountingBytesCache::default());
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_object_bytes_cache(Arc::clone(&store) as ObjectBytesCacheRef)
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.path().to_str().unwrap().to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new(NS.to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(5, "_is_current", Transform::Identity)
+            .unwrap()
+            .build();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name(TABLE.to_string())
+                    .schema(scd2_iceberg_schema())
+                    .partition_spec(spec)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let data_files = write_one_data_file(
+            &table,
+            scd2_batch(&[
+                (1, "a", 10, None, true, 100),
+                (2, "b", 10, None, true, 101),
+                (3, "c", 10, None, true, 102),
+            ]),
+        )
+        .await;
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let dfprovider = Arc::new(
+            IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+                .await
+                .unwrap(),
+        );
+        ctx.register_catalog(CATALOG, dfprovider);
+        let cdc = cdc_batch(&[(1, "a2", 20, 200), (4, "d", 20, 203)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+
+        // Merge 1: several scans of the same table within ONE statement
+        // (merge target + probe scans) — the shared store dedups them.
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            store.max_sets_per_key(),
+            1,
+            "nothing fetched twice within one merge"
+        );
+        let hits_after_merge1 = store.hits();
+        assert!(
+            hits_after_merge1 > 0,
+            "intra-statement scans must share the store"
+        );
+        assert_eq!(list_keys(&store), 1, "one snapshot so far");
+
+        // Merge 2: a fresh table load at the NEW snapshot. Its manifest
+        // list is genuinely new (fetched once); the seed manifest is WARM.
+        ctx.deregister_table("batch").unwrap();
+        let cdc = cdc_batch(&[(2, "b2", 30, 300), (1, "a3", 30, 301)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.max_sets_per_key(),
+            1,
+            "NOTHING is ever fetched twice across merge calls"
+        );
+        assert_eq!(
+            list_keys(&store),
+            2,
+            "merge 2 planned against the NEW snapshot's manifest list (freshness)"
+        );
+        assert!(
+            store.hits() > hits_after_merge1,
+            "merge 2 must hit the cache warmed by merge 1"
+        );
+        assert!(store.distinct_keys() >= 3, "lists + manifests were cached");
+
+        // And the merges themselves are correct (same expectations as
+        // `second_merge_consolidates_dvs_per_file`).
+        let state = read_state(&ctx).await;
+        assert_eq!(state, vec![
+            (1, "a".to_string(), 10, Some(20), false),
+            (1, "a2".to_string(), 20, Some(30), false),
+            (1, "a3".to_string(), 30, None, true),
+            (2, "b".to_string(), 10, Some(30), false),
+            (2, "b2".to_string(), 30, None, true),
+            (3, "c".to_string(), 10, None, true),
+            (4, "d".to_string(), 20, None, true),
+        ]);
+    }
+}

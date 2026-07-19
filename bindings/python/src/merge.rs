@@ -76,6 +76,7 @@ async fn get_or_build_catalog(
     }
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+        .with_object_bytes_cache(crate::runtime::global_object_cache().await)
         .load(name.to_string(), props)
         .await
         .map_err(|e| PyValueError::new_err(format!("build catalog `{name}`: {e}")))?;

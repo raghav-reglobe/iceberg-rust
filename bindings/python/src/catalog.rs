@@ -120,6 +120,7 @@ fn create_table(
                 // S3 (and other object stores) via opendal — without a storage
                 // factory the RestCatalog can't issue any data-file IO.
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
