@@ -120,9 +120,8 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     let plan = plan_table(&table, cfg).await?;
 
     let mut all_removed: Vec<DataFile> = Vec::new();
-    let mut all_removed_deletes: Vec<DataFile> = Vec::new();
     let mut all_added: Vec<DataFile> = Vec::new();
-    let mut seen_delete_paths: HashSet<String> = HashSet::new();
+    let mut candidate_delete_paths: HashSet<String> = HashSet::new();
     for group in &plan.groups {
         let added = read_sort_write(&table, group, cfg).await?;
         if added.is_empty() {
@@ -134,19 +133,15 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
                 .iter()
                 .filter_map(|t| files.get(&t.data_file_path).cloned()),
         );
-        // Delete files (DVs) the SCAN bound to these rewritten data files — now
-        // dangling, so reabsorbed in the same commit. Sourced from `task.deletes`
-        // (the scan's per-file binding, the same the read applies), NOT a
-        // referenced_data_file lookup — matching iceberg-go (CollectSafeDeletionVectors)
-        // and iceberg-java (RewriteFileGroup.danglingDVs). `delete_files` only
-        // resolves each bound delete's path -> its DataFile; dedup by path.
+        // Delete files the SCAN bound to these rewritten data files become
+        // removal CANDIDATES. Sourced from `task.deletes` (the scan's
+        // per-file binding, the same the read applies), NOT a
+        // referenced_data_file lookup — matching iceberg-go
+        // (CollectSafeDeletionVectors) and iceberg-java
+        // (RewriteFileGroup.danglingDVs).
         for t in &group.tasks {
             for d in &t.deletes {
-                if seen_delete_paths.insert(d.file_path.clone()) {
-                    if let Some(dv) = delete_files.get(&d.file_path) {
-                        all_removed_deletes.push(dv.clone());
-                    }
-                }
+                candidate_delete_paths.insert(d.file_path.clone());
             }
         }
         all_added.extend(added);
@@ -155,6 +150,33 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     if all_added.is_empty() {
         return Ok(()); // nothing to compact
     }
+
+    // A delete file is removed ONLY when every data file the scan bound it
+    // to was rewritten in THIS pass. An EQUALITY delete applies to many
+    // files (its partition, lower sequence) — removing it after rewriting
+    // only some of them would RESURRECT its deleted rows in the files left
+    // behind. For positional DVs (bound to exactly one file) this subset
+    // rule reduces to the previous behavior. A retained delete file keeps
+    // applying to the remaining old files and ages out naturally once no
+    // lower-sequence data remains.
+    let rewritten_paths: HashSet<&str> = all_removed.iter().map(|f| f.file_path()).collect();
+    let mut all_removed_deletes: Vec<DataFile> = Vec::new();
+    for path in &candidate_delete_paths {
+        let fully_covered = plan
+            .delete_applicability
+            .get(path)
+            .is_some_and(|applies_to| {
+                applies_to
+                    .iter()
+                    .all(|f| rewritten_paths.contains(f.as_str()))
+            });
+        if fully_covered {
+            if let Some(df) = delete_files.get(path) {
+                all_removed_deletes.push(df.clone());
+            }
+        }
+    }
+
     commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
     Ok(())
 }

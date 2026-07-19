@@ -3,6 +3,8 @@
 //! or skipped (optimal / oversized-without-deletes), bin-pack candidates to
 //! `target_file_size_bytes`, and drop bins below `min_input_files`.
 
+use std::collections::{HashMap, HashSet};
+
 use iceberg::scan::FileScanTask;
 
 use crate::config::Config;
@@ -27,6 +29,15 @@ pub struct Plan {
     pub total_input_files: usize,
     pub total_input_bytes: u64,
     pub est_output_files: usize,
+    /// Delete-file APPLICABILITY over the WHOLE scan (candidates and skipped
+    /// files alike): delete file path -> every data file path the scan bound
+    /// it to. A delete file may only be removed by a rewrite when EVERY data
+    /// file it applies to is rewritten in the same pass — an EQUALITY delete
+    /// binds to many files (its partition, lower sequence), so removing it
+    /// after rewriting only some of them would resurrect deleted rows in the
+    /// rest. (A positional DV binds to exactly one file, so the same subset
+    /// rule degenerates to the old behavior for DVs.)
+    pub delete_applicability: HashMap<String, HashSet<String>>,
 }
 
 impl Plan {
@@ -88,9 +99,19 @@ fn partition_key(task: &FileScanTask) -> String {
 /// order), bin-pack each partition to target, and drop bins below
 /// `min_input_files`. Mirrors iceberg-go `Config.PlanCompaction`.
 pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
+    let mut delete_applicability: HashMap<String, HashSet<String>> = HashMap::new();
+    for t in &tasks {
+        for d in &t.deletes {
+            delete_applicability
+                .entry(d.file_path.clone())
+                .or_default()
+                .insert(t.data_file_path.clone());
+        }
+    }
     let mut plan = Plan {
         total_input_files: tasks.len(),
         total_input_bytes: tasks.iter().map(|t| t.file_size_in_bytes).sum(),
+        delete_applicability,
         ..Default::default()
     };
 
