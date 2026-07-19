@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use iceberg::cache::ObjectBytesCacheRef;
+use iceberg::cache::{DataBytesCache, ObjectBytesCacheRef};
 use iceberg_cache_foyer::FoyerObjectBytesCacheBuilder;
 use tokio::runtime::{Handle, Runtime};
 
@@ -48,16 +48,27 @@ fn env_mb(name: &str, default_mb: u64) -> u64 {
         .unwrap_or(default_mb)
 }
 
+/// The disk-cache root, when configured. NOTE: foyer's disk engine takes NO
+/// cross-process lock — the directory must be PRIVATE to this process (in
+/// K8s: a per-pod path, e.g. hostPath + subPathExpr on the pod name), never
+/// shared between pods.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var("ICEBERG_OBJECT_CACHE_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub async fn global_object_cache() -> ObjectBytesCacheRef {
     OBJECT_CACHE
         .get_or_init(|| async {
             let memory_bytes = env_mb("ICEBERG_OBJECT_CACHE_MB", 128) * 1024 * 1024;
             let mut builder = FoyerObjectBytesCacheBuilder::new(memory_bytes as usize);
-            if let Ok(dir) = std::env::var("ICEBERG_OBJECT_CACHE_DIR") {
-                if !dir.is_empty() {
-                    let disk_bytes = env_mb("ICEBERG_OBJECT_CACHE_DISK_MB", 1024) * 1024 * 1024;
-                    builder = builder.with_disk(dir, disk_bytes as usize);
-                }
+            if let Some(dir) = cache_dir() {
+                let disk_bytes = env_mb("ICEBERG_OBJECT_CACHE_DISK_MB", 1024) * 1024 * 1024;
+                // Own subdirectory: the DATA cache (below) shares the same
+                // root, and two foyer devices must never share one dir.
+                builder = builder.with_disk(dir.join("manifest"), disk_bytes as usize);
             }
             match builder.build().await {
                 Ok(cache) => Arc::new(cache) as ObjectBytesCacheRef,
@@ -87,4 +98,51 @@ pub fn runtime() -> Handle {
             rt.handle().clone()
         }
     }
+}
+
+/// Process-global WHOLE-FILE data cache (foyer disk tier), shared by every
+/// catalog this binding builds. DISABLED by default — turns on only when
+/// BOTH knobs are set:
+/// - `ICEBERG_OBJECT_CACHE_DIR` — the (process-private) disk-cache root;
+///   the data tier lives under `<dir>/data`.
+/// - `ICEBERG_DATA_CACHE_MB` — disk budget in MiB (default 0 = OFF).
+///
+/// With it on, the first read of a data file fetches the WHOLE object once
+/// (one GET replaces the scan's N ranged GETs) and every ranged read —
+/// parquet footer, column chunks, row-group byte ranges — is served from
+/// the node-local copy; files are immutable so there is no invalidation.
+/// `ICEBERG_CACHE_MAX_FILE_MB` (default 256) caps the per-file size: larger
+/// files bypass the cache (and set the disk engine's block size, which an
+/// entry must fit in). When OFF, the read path is byte-identical to today.
+static DATA_CACHE: tokio::sync::OnceCell<Option<DataBytesCache>> =
+    tokio::sync::OnceCell::const_new();
+
+pub async fn global_data_cache() -> Option<DataBytesCache> {
+    DATA_CACHE
+        .get_or_init(|| async {
+            let dir = cache_dir()?;
+            let disk_mb = env_mb("ICEBERG_DATA_CACHE_MB", 0);
+            if disk_mb == 0 {
+                return None;
+            }
+            let max_file_bytes = env_mb("ICEBERG_CACHE_MAX_FILE_MB", 256) * 1024 * 1024;
+            // Small memory tier (the disk tier is the store); block size
+            // sized above the per-file cap so capped files are admitted.
+            let builder = FoyerObjectBytesCacheBuilder::new(64 * 1024 * 1024)
+                .with_disk(dir.join("data"), (disk_mb * 1024 * 1024) as usize)
+                .with_disk_block_bytes((max_file_bytes + 16 * 1024 * 1024) as usize);
+            match builder.build().await {
+                Ok(cache) => Some(DataBytesCache {
+                    cache: Arc::new(cache) as ObjectBytesCacheRef,
+                    max_file_bytes,
+                }),
+                Err(e) => {
+                    // The cache must never block the platform.
+                    eprintln!("iceberg data cache: disabled ({e})");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }

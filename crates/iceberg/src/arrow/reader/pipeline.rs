@@ -39,6 +39,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+use crate::cache::DataBytesCache;
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
@@ -67,6 +68,7 @@ impl ArrowReader {
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
             shredded_passthrough: self.shredded_passthrough.clone(),
+            data_bytes_cache: self.data_bytes_cache.clone(),
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -190,6 +192,8 @@ struct FileScanTaskReader {
     /// transformer targets the shredded type); any other layout — canonical,
     /// or a different shredding — folds to canonical as usual.
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
+    data_bytes_cache: Option<DataBytesCache>,
 }
 
 impl FileScanTaskReader {
@@ -210,6 +214,7 @@ impl FileScanTaskReader {
             task.file_size_in_bytes,
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
+            self.data_bytes_cache.as_ref(),
         )
         .await?;
 
@@ -564,13 +569,51 @@ impl FileScanTaskReader {
 impl ArrowReader {
     /// Opens a Parquet file and loads its metadata, wrapping the reader with
     /// [`CountingFileRead`] so all I/O is accumulated into `bytes_read`.
+    ///
+    /// With a [`DataBytesCache`] configured and the file within its size
+    /// cap, the WHOLE object is read through the cache once (one storage GET
+    /// on first touch) and every ranged read — footer, column chunks,
+    /// row-group byte ranges — is served from the local copy. Larger files
+    /// (or no cache) read directly from storage, byte-identical to the
+    /// uncached path.
     pub(crate) async fn open_parquet_file(
         data_file_path: &str,
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
         bytes_read: &Arc<AtomicU64>,
+        data_bytes_cache: Option<&DataBytesCache>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
+        if let Some(dc) = data_bytes_cache
+            && file_size_in_bytes > 0
+            && file_size_in_bytes <= dc.max_file_bytes
+        {
+            let bytes = match dc.cache.get(data_file_path).await {
+                Some(bytes) => bytes,
+                None => {
+                    // ONE whole-object fetch replaces the scan's N ranged
+                    // reads even on first touch; files are immutable by
+                    // path, so the copy never needs invalidation.
+                    let bytes = file_io.new_input(data_file_path)?.read().await?;
+                    dc.cache.set(data_file_path, bytes.clone()).await;
+                    bytes
+                }
+            };
+            // Serve from the ACTUAL byte length — authoritative over the
+            // manifest-recorded size for footer location.
+            let actual_size = bytes.len() as u64;
+            let counting_reader = CountingFileRead::new(
+                Box::new(CachedWholeFileRead { bytes }) as Box<dyn FileRead>,
+                Arc::clone(bytes_read),
+            );
+            return Self::build_parquet_reader(
+                Box::new(counting_reader),
+                actual_size,
+                parquet_read_options,
+            )
+            .await;
+        }
+
         let parquet_file = file_io.new_input(data_file_path)?;
         let counting_reader =
             CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
@@ -602,6 +645,29 @@ impl ArrowReader {
             })?;
 
         Ok((reader, arrow_metadata))
+    }
+}
+
+/// A fully-materialized file served from cached bytes: every ranged read is
+/// a zero-copy slice of the local copy.
+struct CachedWholeFileRead {
+    bytes: bytes::Bytes,
+}
+
+#[async_trait::async_trait]
+impl FileRead for CachedWholeFileRead {
+    async fn read(&self, range: std::ops::Range<u64>) -> Result<bytes::Bytes> {
+        let (start, end) = (range.start as usize, range.end as usize);
+        if start > end || end > self.bytes.len() {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "range {start}..{end} out of bounds for cached file of {} bytes",
+                    self.bytes.len()
+                ),
+            ));
+        }
+        Ok(self.bytes.slice(start..end))
     }
 }
 

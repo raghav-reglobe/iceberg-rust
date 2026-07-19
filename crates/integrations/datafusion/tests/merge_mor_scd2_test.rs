@@ -2383,4 +2383,139 @@ mod object_cache_sharing {
             (4, "d".to_string(), 20, None, true),
         ]);
     }
+
+    /// The WHOLE-FILE data cache under real merges: every data file is
+    /// fetched from storage at most ONCE across two merges — the many reads
+    /// of the same file within one statement (target scan, probe scans,
+    /// demote scan, the late-materialization fetch) and the second merge's
+    /// re-reads are all served from the shared local copy — and the merged
+    /// state is byte-identical to the uncached sibling tests.
+    #[tokio::test]
+    async fn merge_data_reads_share_whole_file_cache() {
+        use iceberg::cache::DataBytesCache;
+
+        let warehouse = TempDir::new().unwrap();
+        let store = Arc::new(CountingBytesCache::default());
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_data_bytes_cache(DataBytesCache {
+                    cache: Arc::clone(&store) as ObjectBytesCacheRef,
+                    max_file_bytes: 256 * 1024 * 1024,
+                })
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.path().to_str().unwrap().to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new(NS.to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(5, "_is_current", Transform::Identity)
+            .unwrap()
+            .build();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name(TABLE.to_string())
+                    .schema(scd2_iceberg_schema())
+                    .partition_spec(spec)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let data_files = write_one_data_file(
+            &table,
+            scd2_batch(&[
+                (1, "a", 10, None, true, 100),
+                (2, "b", 10, None, true, 101),
+                (3, "c", 10, None, true, 102),
+            ]),
+        )
+        .await;
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let dfprovider = Arc::new(
+            IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+                .await
+                .unwrap(),
+        );
+        ctx.register_catalog(CATALOG, dfprovider);
+        let cdc = cdc_batch(&[(1, "a2", 20, 200), (4, "d", 20, 203)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+
+        // Merge 1: several scans + the late-mat fetch of the seed file, ONE
+        // storage fetch total.
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            store.max_sets_per_key(),
+            1,
+            "no data file fetched twice within one merge"
+        );
+        let hits_after_merge1 = store.hits.load(Ordering::SeqCst);
+        assert!(
+            hits_after_merge1 > 0,
+            "the statement's several reads of the seed file share ONE copy"
+        );
+
+        // Merge 2: the seed file (and merge 1's output) served warm.
+        ctx.deregister_table("batch").unwrap();
+        let cdc = cdc_batch(&[(2, "b2", 30, 300), (1, "a3", 30, 301)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.max_sets_per_key(),
+            1,
+            "NO data file is ever fetched from storage twice across merges"
+        );
+        assert!(
+            store.hits.load(Ordering::SeqCst) > hits_after_merge1,
+            "merge 2's data reads hit the cache warmed by merge 1"
+        );
+
+        // Byte-identical to the uncached sibling test's expectations.
+        let state = read_state(&ctx).await;
+        assert_eq!(state, vec![
+            (1, "a".to_string(), 10, Some(20), false),
+            (1, "a2".to_string(), 20, Some(30), false),
+            (1, "a3".to_string(), 30, None, true),
+            (2, "b".to_string(), 10, Some(30), false),
+            (2, "b2".to_string(), 30, None, true),
+            (3, "c".to_string(), 10, None, true),
+            (4, "d".to_string(), 20, None, true),
+        ]);
+        let dvs = live_dvs(&load_table(&catalog).await).await;
+        let mut per_file: HashMap<&str, usize> = HashMap::new();
+        for (file, _) in &dvs {
+            *per_file.entry(file.as_str()).or_default() += 1;
+        }
+        assert!(per_file.values().all(|&n| n == 1), "one live DV per file");
+    }
 }

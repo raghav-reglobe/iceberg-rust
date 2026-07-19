@@ -26,7 +26,7 @@ use futures::lock::{Mutex, MutexGuard};
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
-use crate::cache::ObjectBytesCacheRef;
+use crate::cache::{DataBytesCache, ObjectBytesCacheRef};
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::runtime::Runtime;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
@@ -49,6 +49,7 @@ pub struct MemoryCatalogBuilder {
     storage_factory: Option<Arc<dyn StorageFactory>>,
     runtime: Option<Runtime>,
     object_bytes_cache: Option<ObjectBytesCacheRef>,
+    data_bytes_cache: Option<DataBytesCache>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -62,6 +63,7 @@ impl Default for MemoryCatalogBuilder {
             storage_factory: None,
             runtime: None,
             object_bytes_cache: None,
+            data_bytes_cache: None,
         }
     }
 }
@@ -73,6 +75,13 @@ impl MemoryCatalogBuilder {
     /// table hit warm cache.
     pub fn with_object_bytes_cache(mut self, bytes_cache: ObjectBytesCacheRef) -> Self {
         self.object_bytes_cache = Some(bytes_cache);
+        self
+    }
+
+    /// Back DATA-FILE reads of every table this catalog builds with a
+    /// WHOLE-FILE read-through cache (see [`crate::cache::DataBytesCache`]).
+    pub fn with_data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
+        self.data_bytes_cache = Some(data_bytes_cache);
         self
     }
 }
@@ -128,6 +137,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     self.storage_factory,
                     runtime,
                     self.object_bytes_cache,
+                    self.data_bytes_cache,
                 )
             }
         };
@@ -153,6 +163,8 @@ pub struct MemoryCatalog {
     /// Shared manifest / manifest-list object cache attached to every table
     /// this catalog builds.
     object_bytes_cache: Option<ObjectBytesCacheRef>,
+    /// Whole-file data cache attached to every table this catalog builds.
+    data_bytes_cache: Option<DataBytesCache>,
 }
 
 impl MemoryCatalog {
@@ -162,6 +174,7 @@ impl MemoryCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         object_bytes_cache: Option<ObjectBytesCacheRef>,
+        data_bytes_cache: Option<DataBytesCache>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -172,6 +185,7 @@ impl MemoryCatalog {
             warehouse_location: config.warehouse,
             runtime,
             object_bytes_cache,
+            data_bytes_cache,
         })
     }
 
@@ -181,8 +195,12 @@ impl MemoryCatalog {
         &self,
         builder: crate::table::TableBuilder,
     ) -> crate::table::TableBuilder {
-        match &self.object_bytes_cache {
+        let builder = match &self.object_bytes_cache {
             Some(bytes_cache) => builder.object_bytes_cache(bytes_cache.clone()),
+            None => builder,
+        };
+        match &self.data_bytes_cache {
+            Some(dc) => builder.data_bytes_cache(dc.clone()),
             None => builder,
         }
     }

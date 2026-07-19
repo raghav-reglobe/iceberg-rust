@@ -34,6 +34,7 @@ pub use task::*;
 
 use crate::arrow::ArrowReaderBuilder;
 pub use crate::arrow::{ScanMetrics, ScanResult};
+use crate::cache::DataBytesCache;
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
@@ -243,6 +244,7 @@ impl<'a> TableScanBuilder<'a> {
                         row_selection_enabled: self.row_selection_enabled,
                         data_file_path_filter: self.data_file_path_filter.clone(),
                         data_file_path_ranges: self.data_file_path_ranges.clone(),
+                        data_bytes_cache: self.table.data_bytes_cache().cloned(),
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -367,6 +369,7 @@ impl<'a> TableScanBuilder<'a> {
             row_selection_enabled: self.row_selection_enabled,
             data_file_path_filter: self.data_file_path_filter,
             data_file_path_ranges: self.data_file_path_ranges,
+            data_bytes_cache: self.table.data_bytes_cache().cloned(),
             runtime: self.table.runtime().clone(),
         })
     }
@@ -400,6 +403,10 @@ pub struct TableScan {
     /// (externally planned file subset); deletes still apply.
     data_file_path_filter: Option<Arc<HashSet<String>>>,
     data_file_path_ranges: Option<Arc<HashMap<String, (u64, u64)>>>,
+
+    /// Whole-file data cache inherited from the table (see
+    /// [`crate::cache::DataBytesCache`]).
+    data_bytes_cache: Option<DataBytesCache>,
 
     runtime: Runtime,
 }
@@ -558,6 +565,10 @@ impl TableScan {
                 .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
                 .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
                 .with_row_selection_enabled(self.row_selection_enabled);
+
+        if let Some(dc) = &self.data_bytes_cache {
+            arrow_reader_builder = arrow_reader_builder.with_data_bytes_cache(dc.clone());
+        }
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

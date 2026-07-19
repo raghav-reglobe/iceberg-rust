@@ -10,7 +10,7 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
-use iceberg::arrow::{ArrowReaderBuilder, RecordBatchPartitionSplitter};
+use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
@@ -309,7 +309,9 @@ pub(crate) async fn read_group(
     table: &Table,
     tasks: Vec<FileScanTask>,
 ) -> Result<ArrowRecordBatchStream> {
-    let reader = ArrowReaderBuilder::new(table.file_io().clone(), table.runtime().clone()).build();
+    // `reader_builder()` inherits the table's whole-file data cache (when
+    // configured), so compaction reads share the node-local copy.
+    let reader = table.reader_builder().build();
     let task_stream: FileScanTaskStream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
     Ok(reader.read(task_stream)?.stream())
 }

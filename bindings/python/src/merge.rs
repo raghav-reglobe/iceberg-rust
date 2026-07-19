@@ -74,9 +74,14 @@ async fn get_or_build_catalog(
     {
         return Ok(Arc::clone(cat));
     }
-    let catalog = RestCatalogBuilder::default()
+    let builder = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
-        .with_object_bytes_cache(crate::runtime::global_object_cache().await)
+        .with_object_bytes_cache(crate::runtime::global_object_cache().await);
+    let builder = match crate::runtime::global_data_cache().await {
+        Some(dc) => builder.with_data_bytes_cache(dc),
+        None => builder,
+    };
+    let catalog = builder
         .load(name.to_string(), props)
         .await
         .map_err(|e| PyValueError::new_err(format!("build catalog `{name}`: {e}")))?;

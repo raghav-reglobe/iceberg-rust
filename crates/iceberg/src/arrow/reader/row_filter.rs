@@ -1635,4 +1635,152 @@ mod row_position_range_tests {
             (0i64..100).chain(200..300).map(|v| (v as i32, v)).collect();
         assert_eq!(rows, expected);
     }
+
+    /// The whole-file data cache under BYTE-RANGE tasks (the late-mat fetch
+    /// shape): ONE whole-file fetch serves every ranged read, and the
+    /// batches are identical to direct reads.
+    #[tokio::test]
+    async fn ranged_reads_through_data_cache_match_direct_reads() {
+        use std::collections::HashMap as Map;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use bytes::Bytes;
+
+        use crate::cache::{DataBytesCache, ObjectBytesCache};
+
+        #[derive(Debug, Default)]
+        struct CountingBytesCache {
+            map: Mutex<Map<String, Bytes>>,
+            hits: AtomicUsize,
+            sets: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectBytesCache for CountingBytesCache {
+            async fn get(&self, path: &str) -> Option<Bytes> {
+                let out = self.map.lock().unwrap().get(path).cloned();
+                if out.is_some() {
+                    self.hits.fetch_add(1, Ordering::SeqCst);
+                }
+                out
+            }
+
+            async fn set(&self, path: &str, bytes: Bytes) {
+                self.sets.fetch_add(1, Ordering::SeqCst);
+                self.map.lock().unwrap().insert(path.to_string(), bytes);
+            }
+        }
+
+        let tmp_dir = TempDir::new().unwrap();
+        let (file_path, meta, schema) = multi_row_group_file(&tmp_dir);
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let positions: Vec<u64> = vec![7, 42, 210, 299];
+        let ranges = ArrowReader::byte_ranges_for_row_positions(&meta, &positions)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges.len(), 2, "two disjoint sub-file tasks");
+
+        let make_tasks = |ranges: &[(u64, u64)]| -> Vec<crate::Result<FileScanTask>> {
+            ranges
+                .iter()
+                .map(|(start, length)| {
+                    Ok(FileScanTask::builder()
+                        .with_file_size_in_bytes(file_size)
+                        .with_start(*start)
+                        .with_length(*length)
+                        .with_data_file_path(file_path.clone())
+                        .with_data_file_format(DataFileFormat::Parquet)
+                        .with_schema(schema.clone())
+                        .with_project_field_ids(vec![
+                            1,
+                            crate::metadata_columns::RESERVED_FIELD_ID_POS,
+                        ])
+                        .with_case_sensitive(false)
+                        .build())
+                })
+                .collect()
+        };
+        let collect_rows = |batches: Vec<RecordBatch>| -> Vec<(i32, i64)> {
+            let mut rows = Vec::new();
+            for b in &batches {
+                let ids = b.column(0).as_primitive::<arrow_array::types::Int32Type>();
+                let pos = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((ids.value(i), pos.value(i)));
+                }
+            }
+            rows.sort_unstable();
+            rows
+        };
+
+        // Direct (uncached) reads — the reference.
+        let direct = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let direct_rows = collect_rows(
+            direct
+                .read(Box::pin(futures::stream::iter(make_tasks(&ranges))) as FileScanTaskStream)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap(),
+        );
+
+        // Cached reads: one WHOLE-FILE fetch serves both ranged tasks.
+        let store = Arc::new(CountingBytesCache::default());
+        let cached = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            // Serialize the two tasks so the fetch/hit accounting is exact.
+            .with_data_file_concurrency_limit(1)
+            .with_data_bytes_cache(DataBytesCache {
+                cache: store.clone(),
+                max_file_bytes: 64 * 1024 * 1024,
+            })
+            .build();
+        let cached_rows = collect_rows(
+            cached
+                .read(Box::pin(futures::stream::iter(make_tasks(&ranges))) as FileScanTaskStream)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(cached_rows, direct_rows, "byte-identical to direct reads");
+        assert_eq!(
+            store.sets.load(Ordering::SeqCst),
+            1,
+            "exactly ONE whole-file fetch for both ranged tasks"
+        );
+        assert_eq!(
+            store.hits.load(Ordering::SeqCst),
+            1,
+            "the second task is served from the cached copy"
+        );
+
+        // A file above the size cap BYPASSES the cache entirely.
+        let store2 = Arc::new(CountingBytesCache::default());
+        let capped = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_data_bytes_cache(DataBytesCache {
+                cache: store2.clone(),
+                max_file_bytes: 16, // smaller than the file
+            })
+            .build();
+        let capped_rows = collect_rows(
+            capped
+                .read(Box::pin(futures::stream::iter(make_tasks(&ranges))) as FileScanTaskStream)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(capped_rows, direct_rows);
+        assert_eq!(
+            store2.sets.load(Ordering::SeqCst),
+            0,
+            "no caching above the cap"
+        );
+        assert_eq!(store2.hits.load(Ordering::SeqCst), 0);
+    }
 }

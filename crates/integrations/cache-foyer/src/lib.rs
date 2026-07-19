@@ -42,6 +42,7 @@ use iceberg::cache::ObjectBytesCache;
 pub struct FoyerObjectBytesCacheBuilder {
     memory_capacity_bytes: usize,
     disk: Option<(PathBuf, usize)>,
+    disk_block_bytes: Option<usize>,
 }
 
 impl FoyerObjectBytesCacheBuilder {
@@ -51,6 +52,7 @@ impl FoyerObjectBytesCacheBuilder {
         Self {
             memory_capacity_bytes,
             disk: None,
+            disk_block_bytes: None,
         }
     }
 
@@ -61,6 +63,16 @@ impl FoyerObjectBytesCacheBuilder {
     /// and disk hits repopulate memory.
     pub fn with_disk(mut self, dir: impl Into<PathBuf>, capacity_bytes: usize) -> Self {
         self.disk = Some((dir.into(), capacity_bytes));
+        self
+    }
+
+    /// Sets the disk engine's block size (foyer default: 16 MiB). An entry
+    /// must fit in one block to be admitted to the disk tier — size this
+    /// ABOVE the largest entry the cache should hold (e.g. the data cache's
+    /// per-file cap), or larger entries are silently dropped from disk. The
+    /// write-buffer and submit-queue thresholds scale along with it.
+    pub fn with_disk_block_bytes(mut self, block_bytes: usize) -> Self {
+        self.disk_block_bytes = Some(block_bytes);
         self
     }
 
@@ -86,7 +98,14 @@ impl FoyerObjectBytesCacheBuilder {
                     .with_capacity(capacity_bytes)
                     .build()
                     .map_err(to_iceberg_err)?;
-                builder.with_engine_config(BlockEngineConfig::new(device))
+                let mut engine = BlockEngineConfig::new(device);
+                if let Some(block) = self.disk_block_bytes {
+                    engine = engine
+                        .with_block_size(block)
+                        .with_buffer_pool_size(block.saturating_mul(2))
+                        .with_submit_queue_size_threshold(block.saturating_mul(2));
+                }
+                builder.with_engine_config(engine)
             }
         };
         let cache = builder.build().await.map_err(to_iceberg_err)?;
@@ -182,5 +201,68 @@ mod tests {
         );
         // The device directory exists and has been written to.
         assert!(dir.path().exists());
+    }
+
+    /// The disk tier stays BOUNDED by its capacity under a workload larger
+    /// than the budget (the data-cache shape): total on-disk bytes never
+    /// exceed capacity (+ one block of slack), which by pigeonhole means
+    /// older entries were evicted, not accumulated.
+    #[tokio::test]
+    async fn disk_tier_is_bounded_by_capacity() {
+        const CAPACITY: usize = 32 * 1024 * 1024;
+        const ENTRY: usize = 2 * 1024 * 1024;
+        const N: usize = 32; // 64 MiB total inserted, 2x the capacity
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache: ObjectBytesCacheRef = Arc::new(
+            FoyerObjectBytesCacheBuilder::new(1024 * 1024)
+                .with_disk(dir.path(), CAPACITY)
+                .with_disk_block_bytes(8 * 1024 * 1024)
+                .build()
+                .await
+                .unwrap(),
+        );
+        for i in 0..N {
+            cache
+                .set(
+                    &format!("s3://bucket/data/f{i}.parquet"),
+                    vec![i as u8; ENTRY].into(),
+                )
+                .await;
+            // Yield so foyer's flushers keep up with the submit queue.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Let async flush/reclaim settle.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut disk_bytes = 0u64;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                disk_bytes += entry.metadata().unwrap().len();
+            }
+        }
+        assert!(disk_bytes > 0, "the disk tier must hold data");
+        assert!(
+            disk_bytes as usize <= CAPACITY + 8 * 1024 * 1024,
+            "disk usage {disk_bytes} must stay within capacity {CAPACITY} (+1 block slack)"
+        );
+
+        // Pigeonhole: not all 64 MiB of entries can be retrievable from a
+        // 32 MiB store — older entries were evicted.
+        let mut retrievable = 0usize;
+        for i in 0..N {
+            if cache
+                .get(&format!("s3://bucket/data/f{i}.parquet"))
+                .await
+                .is_some()
+            {
+                retrievable += 1;
+            }
+        }
+        assert!(
+            retrievable < N,
+            "a bounded store cannot retain the whole over-budget workload"
+        );
     }
 }

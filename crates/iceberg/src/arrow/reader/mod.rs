@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::cache::DataBytesCache;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::util::available_parallelism;
@@ -61,6 +62,7 @@ pub struct ArrowReaderBuilder {
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    data_bytes_cache: Option<DataBytesCache>,
 }
 
 impl ArrowReaderBuilder {
@@ -77,7 +79,20 @@ impl ArrowReaderBuilder {
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             shredded_passthrough: None,
+            data_bytes_cache: None,
         }
+    }
+
+    /// Back DATA-FILE reads with a WHOLE-FILE read-through cache (see
+    /// [`crate::cache::DataBytesCache`]): the first read of a file fetches
+    /// the entire object once into the shared store; every ranged read of
+    /// that file (footer, column chunks, byte-range splits) is then served
+    /// from the local copy. Files above the cache's `max_file_bytes` bypass
+    /// it. Without this, reads go directly to storage — byte-identical to
+    /// the uncached behavior.
+    pub fn with_data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
+        self.data_bytes_cache = Some(data_bytes_cache);
+        self
     }
 
     /// Shredded variant passthrough: keep the named variant columns in their
@@ -160,6 +175,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: self.parquet_read_options,
             runtime: self.runtime,
             shredded_passthrough: self.shredded_passthrough,
+            data_bytes_cache: self.data_bytes_cache,
         }
     }
 }
@@ -183,4 +199,6 @@ pub struct ArrowReader {
     runtime: Runtime,
     /// See [`ArrowReaderBuilder::with_shredded_passthrough`].
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
+    data_bytes_cache: Option<DataBytesCache>,
 }

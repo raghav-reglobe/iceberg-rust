@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
-use crate::cache::ObjectBytesCacheRef;
+use crate::cache::{DataBytesCache, ObjectBytesCacheRef};
 use crate::encryption::EncryptionManager;
 use crate::encryption::kms::KeyManagementClient;
 use crate::inspect::MetadataTable;
@@ -42,6 +42,7 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     object_bytes_cache: Option<ObjectBytesCacheRef>,
+    data_bytes_cache: Option<DataBytesCache>,
     runtime: Option<Runtime>,
 }
 
@@ -57,6 +58,7 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             object_bytes_cache: None,
+            data_bytes_cache: None,
             runtime: None,
         }
     }
@@ -118,6 +120,17 @@ impl TableBuilder {
         self
     }
 
+    /// optional - back DATA-FILE reads (scans, merges, compaction) with a
+    /// WHOLE-FILE read-through cache (see [`crate::cache::DataBytesCache`]):
+    /// the first read of a file fetches the entire object once into the
+    /// shared store; every ranged read is then served from the local copy.
+    /// Files above the cache's size cap bypass it. Unset = reads go
+    /// directly to storage (byte-identical to today).
+    pub fn data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
+        self.data_bytes_cache = Some(data_bytes_cache);
+        self
+    }
+
     /// Set the Runtime for this table to use when spawning tasks.
     pub fn runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = Some(runtime);
@@ -146,6 +159,7 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             object_bytes_cache,
+            data_bytes_cache,
             runtime,
         } = self;
 
@@ -211,6 +225,7 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            data_bytes_cache,
             runtime,
             encryption_manager,
         })
@@ -226,6 +241,7 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    data_bytes_cache: Option<DataBytesCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
 }
@@ -288,6 +304,11 @@ impl Table {
         self.object_cache.clone()
     }
 
+    /// Returns this table's whole-file data cache, if configured.
+    pub fn data_bytes_cache(&self) -> Option<&DataBytesCache> {
+        self.data_bytes_cache.as_ref()
+    }
+
     /// Returns the [`EncryptionManager`] for this table, if encryption is
     /// configured.
     ///
@@ -339,7 +360,11 @@ impl Table {
 
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
+        let builder = ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone());
+        match &self.data_bytes_cache {
+            Some(dc) => builder.with_data_bytes_cache(dc.clone()),
+            None => builder,
+        }
     }
 }
 

@@ -82,6 +82,24 @@ pub trait ObjectBytesCache: Send + Sync + std::fmt::Debug {
 /// A thread-safe, reference-counted handle to an [`ObjectBytesCache`].
 pub type ObjectBytesCacheRef = Arc<dyn ObjectBytesCache>;
 
+/// A WHOLE-FILE read-through cache for immutable DATA files (parquet),
+/// path-keyed like [`ObjectBytesCache`] but sized for data: on the first
+/// read of a file at most `max_file_bytes` large, the ENTIRE object is
+/// fetched once and cached; every ranged read (parquet footer, column
+/// chunks, row-group byte ranges) is then served from the local copy — one
+/// object-store GET replaces the N ranged GETs of a parquet scan, first
+/// touch included. Files larger than `max_file_bytes` bypass the cache
+/// entirely (ranged reads go straight to storage), protecting the store
+/// from giant-file eviction storms. Data files are immutable by path — no
+/// invalidation.
+#[derive(Clone, Debug)]
+pub struct DataBytesCache {
+    /// The shared, path-keyed bytes store (typically disk-backed).
+    pub cache: ObjectBytesCacheRef,
+    /// Files larger than this are never cached (read directly).
+    pub max_file_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

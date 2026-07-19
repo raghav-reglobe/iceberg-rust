@@ -80,6 +80,9 @@ impl BasicDeleteFileLoader {
             file_size_in_bytes,
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
+            // Delete files are small and short-lived relative to data files —
+            // they bypass the data cache.
+            None,
         )
         .await?;
 

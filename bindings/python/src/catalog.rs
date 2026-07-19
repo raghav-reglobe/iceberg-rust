@@ -116,11 +116,16 @@ fn create_table(
     // catalog + object store, so other Python threads can run meanwhile.
     py.detach(|| {
         runtime().block_on(async move {
-            let catalog = RestCatalogBuilder::default()
+            let builder = RestCatalogBuilder::default()
                 // S3 (and other object stores) via opendal — without a storage
                 // factory the RestCatalog can't issue any data-file IO.
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
-                .with_object_bytes_cache(crate::runtime::global_object_cache().await)
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await);
+            let builder = match crate::runtime::global_data_cache().await {
+                Some(dc) => builder.with_data_bytes_cache(dc),
+                None => builder,
+            };
+            let catalog = builder
                 .load(catalog_name.clone(), catalog_props)
                 .await
                 .map_err(|e| {
