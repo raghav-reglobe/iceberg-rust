@@ -30,12 +30,52 @@
 #![deny(missing_docs)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, Event, EventListener, FifoConfig, FsDeviceBuilder,
+    HybridCache, HybridCacheBuilder, LfuConfig, LruConfig, S3FifoConfig,
+};
 use iceberg::Result;
-use iceberg::cache::ObjectBytesCache;
+use iceberg::cache::{ObjectBytesCache, ObjectCacheStats};
+
+/// In-memory tier eviction policy (see foyer's `EvictionConfig`).
+///
+/// The default (foyer's) is LRU. For CYCLIC whole-set scans larger than the
+/// capacity — the merge slice pattern, where every current file is re-read
+/// once per slice — LRU (and plain FIFO) degrade to ~0% hit rate the moment
+/// the working set exceeds capacity; the scan-resistant policies keep a
+/// stable hot subset resident instead. `S3Fifo` is the recommended choice
+/// for the data tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// Least-recently-used (foyer's default).
+    Lru,
+    /// S3-FIFO — scan-resistant, the recommended data-tier policy.
+    S3Fifo,
+    /// w-TinyLFU — scan-resistant, frequency-based.
+    Lfu,
+    /// Plain FIFO.
+    Fifo,
+}
+
+/// Counts in-memory tier evictions via foyer's event listener.
+#[derive(Debug, Default)]
+struct EvictionCounter(AtomicU64);
+
+impl EventListener for EvictionCounter {
+    type Key = String;
+    type Value = Bytes;
+
+    fn on_leave(&self, reason: Event, _key: &String, _value: &Bytes) {
+        if matches!(reason, Event::Evict) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Builder for [`FoyerObjectBytesCache`].
 #[derive(Debug)]
@@ -43,6 +83,7 @@ pub struct FoyerObjectBytesCacheBuilder {
     memory_capacity_bytes: usize,
     disk: Option<(PathBuf, usize)>,
     disk_block_bytes: Option<usize>,
+    eviction_policy: Option<EvictionPolicy>,
 }
 
 impl FoyerObjectBytesCacheBuilder {
@@ -53,6 +94,7 @@ impl FoyerObjectBytesCacheBuilder {
             memory_capacity_bytes,
             disk: None,
             disk_block_bytes: None,
+            eviction_policy: None,
         }
     }
 
@@ -76,6 +118,13 @@ impl FoyerObjectBytesCacheBuilder {
         self
     }
 
+    /// Sets the in-memory tier's eviction policy (see [`EvictionPolicy`]).
+    /// Unset = foyer's default (LRU).
+    pub fn with_eviction_policy(mut self, policy: EvictionPolicy) -> Self {
+        self.eviction_policy = Some(policy);
+        self
+    }
+
     /// Builds the cache. Must be called within an async runtime (foyer
     /// spawns its maintenance tasks on the current one).
     pub async fn build(self) -> Result<FoyerObjectBytesCache> {
@@ -86,11 +135,21 @@ impl FoyerObjectBytesCacheBuilder {
             )
             .with_source(e)
         };
-        let builder = HybridCacheBuilder::new()
+        let evictions = Arc::new(EvictionCounter::default());
+        let mut builder = HybridCacheBuilder::new()
             .with_name("iceberg-object-bytes")
+            .with_event_listener(evictions.clone())
             .memory(self.memory_capacity_bytes)
-            .with_weighter(|key: &String, value: &Bytes| key.len() + value.len())
-            .storage();
+            .with_weighter(|key: &String, value: &Bytes| key.len() + value.len());
+        if let Some(policy) = self.eviction_policy {
+            builder = match policy {
+                EvictionPolicy::Lru => builder.with_eviction_config(LruConfig::default()),
+                EvictionPolicy::S3Fifo => builder.with_eviction_config(S3FifoConfig::default()),
+                EvictionPolicy::Lfu => builder.with_eviction_config(LfuConfig::default()),
+                EvictionPolicy::Fifo => builder.with_eviction_config(FifoConfig::default()),
+            };
+        }
+        let builder = builder.storage();
         let builder = match self.disk {
             None => builder,
             Some((dir, capacity_bytes)) => {
@@ -109,7 +168,13 @@ impl FoyerObjectBytesCacheBuilder {
             }
         };
         let cache = builder.build().await.map_err(to_iceberg_err)?;
-        Ok(FoyerObjectBytesCache { cache })
+        Ok(FoyerObjectBytesCache {
+            cache,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            evictions,
+        })
     }
 }
 
@@ -118,12 +183,19 @@ impl FoyerObjectBytesCacheBuilder {
 #[derive(Debug)]
 pub struct FoyerObjectBytesCache {
     cache: HybridCache<String, Bytes>,
+    // foyer exposes memory usage/capacity, disk read/write bytes and
+    // eviction EVENTS natively, but not hit/miss/insert counters outside its
+    // metrics-registry machinery — those are wrapped here at the seam.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    evictions: Arc<EvictionCounter>,
 }
 
 #[async_trait]
 impl ObjectBytesCache for FoyerObjectBytesCache {
     async fn get(&self, path: &str) -> Option<Bytes> {
-        match self.cache.get(path).await {
+        let out = match self.cache.get(path).await {
             Ok(entry) => entry.map(|e| e.value().clone()),
             Err(e) => {
                 // A cache-read failure (e.g. a disk-tier IO error) must
@@ -131,11 +203,31 @@ impl ObjectBytesCache for FoyerObjectBytesCache {
                 tracing::warn!("foyer object-bytes cache read failed: {e}");
                 None
             }
-        }
+        };
+        match &out {
+            Some(_) => self.hits.fetch_add(1, Ordering::Relaxed),
+            None => self.misses.fetch_add(1, Ordering::Relaxed),
+        };
+        out
     }
 
     async fn set(&self, path: &str, bytes: Bytes) {
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         self.cache.insert(path.to_string(), bytes);
+    }
+
+    fn stats(&self) -> Option<ObjectCacheStats> {
+        let statistics = self.cache.statistics();
+        Some(ObjectCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            evictions: self.evictions.0.load(Ordering::Relaxed),
+            memory_usage_bytes: self.cache.memory().usage() as u64,
+            memory_capacity_bytes: self.cache.memory().capacity() as u64,
+            disk_write_bytes: statistics.disk_write_bytes() as u64,
+            disk_read_bytes: statistics.disk_read_bytes() as u64,
+        })
     }
 }
 
@@ -264,5 +356,49 @@ mod tests {
             retrievable < N,
             "a bounded store cannot retain the whole over-budget workload"
         );
+    }
+
+    /// The stats surface: wrapped hit/miss/insert counters, native memory
+    /// usage, and eviction events under memory pressure — with the
+    /// scan-resistant S3-FIFO policy configured.
+    #[tokio::test]
+    async fn stats_reflect_traffic_and_evictions() {
+        let cache = FoyerObjectBytesCacheBuilder::new(256 * 1024)
+            .with_eviction_policy(EvictionPolicy::S3Fifo)
+            .build()
+            .await
+            .unwrap();
+
+        let fresh = cache.stats().unwrap();
+        assert_eq!(
+            (fresh.hits, fresh.misses, fresh.inserts, fresh.evictions),
+            (0, 0, 0, 0)
+        );
+
+        // miss -> insert -> hit
+        assert!(cache.get("s3://b/one").await.is_none());
+        cache.set("s3://b/one", Bytes::from_static(b"abc")).await;
+        assert!(cache.get("s3://b/one").await.is_some());
+        let stats = cache.stats().unwrap();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.inserts, 1);
+        assert_eq!(stats.hits, 1);
+        assert!(stats.memory_usage_bytes > 0);
+        assert_eq!(stats.memory_capacity_bytes, 256 * 1024);
+        assert_eq!(stats.disk_write_bytes, 0, "memory-only tier");
+
+        // Overflow the 256 KiB memory tier -> eviction events.
+        for i in 0..64 {
+            cache
+                .set(&format!("s3://b/f{i}"), vec![i as u8; 16 * 1024].into())
+                .await;
+        }
+        let stats = cache.stats().unwrap();
+        assert_eq!(stats.inserts, 65);
+        assert!(
+            stats.evictions > 0,
+            "memory pressure must surface as evictions: {stats:?}"
+        );
+        assert!(stats.memory_usage_bytes <= 256 * 1024 + 32 * 1024);
     }
 }

@@ -29,8 +29,19 @@ mod schema;
 mod transform;
 mod variant_schema;
 
+/// atexit hook: one INFO line with per-process cache totals per tier.
+#[pyfunction]
+fn _log_cache_stats() {
+    runtime::log_cache_stats_at_exit();
+}
+
 #[pymodule]
 fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Final cache-effectiveness line in every run pod's logs.
+    if let Ok(atexit) = py.import("atexit") {
+        let hook = wrap_pyfunction!(_log_cache_stats, m)?;
+        let _ = atexit.call_method1("register", (hook,));
+    }
     datafusion_table_provider::register_module(py, m)?;
     transform::register_module(py, m)?;
     manifest::register_module(py, m)?;

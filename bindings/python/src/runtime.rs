@@ -18,7 +18,7 @@
 use std::sync::{Arc, OnceLock};
 
 use iceberg::cache::{DataBytesCache, ObjectBytesCacheRef};
-use iceberg_cache_foyer::FoyerObjectBytesCacheBuilder;
+use iceberg_cache_foyer::{EvictionPolicy, FoyerObjectBytesCacheBuilder};
 use tokio::runtime::{Handle, Runtime};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -128,9 +128,25 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
             let max_file_bytes = env_mb("ICEBERG_CACHE_MAX_FILE_MB", 256) * 1024 * 1024;
             // Small memory tier (the disk tier is the store); block size
             // sized above the per-file cap so capped files are admitted.
+            // Eviction: the merge access pattern is a CYCLIC whole-set scan
+            // per slice — plain LRU (foyer's default) collapses to ~0% hits
+            // once the working set exceeds capacity, so the data tier
+            // defaults to scan-resistant S3-FIFO
+            // (`ICEBERG_DATA_CACHE_POLICY`: s3fifo | lfu | lru | fifo).
+            let policy = match std::env::var("ICEBERG_DATA_CACHE_POLICY")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "lru" => EvictionPolicy::Lru,
+                "lfu" => EvictionPolicy::Lfu,
+                "fifo" => EvictionPolicy::Fifo,
+                _ => EvictionPolicy::S3Fifo,
+            };
             let builder = FoyerObjectBytesCacheBuilder::new(64 * 1024 * 1024)
                 .with_disk(dir.join("data"), (disk_mb * 1024 * 1024) as usize)
-                .with_disk_block_bytes((max_file_bytes + 16 * 1024 * 1024) as usize);
+                .with_disk_block_bytes((max_file_bytes + 16 * 1024 * 1024) as usize)
+                .with_eviction_policy(policy);
             match builder.build().await {
                 Ok(cache) => Some(DataBytesCache {
                     cache: Arc::new(cache) as ObjectBytesCacheRef,
@@ -145,4 +161,52 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
         })
         .await
         .clone()
+}
+
+/// Compact JSON of both cache tiers' cumulative stats (counters grow for
+/// the process lifetime; diff across observations). Only initialized tiers
+/// appear; returns None when no cache has been touched yet.
+///
+/// Shape (one line, log-friendly):
+/// `{"manifest":{"hits":..,"misses":..,"inserts":..,"evictions":..,
+///   "mem_bytes":..,"mem_cap_bytes":..,"disk_write_bytes":..,
+///   "disk_read_bytes":..},"data":{...}}`
+pub fn cache_stats_json() -> Option<String> {
+    fn tier(stats: iceberg::cache::ObjectCacheStats) -> String {
+        format!(
+            "{{\"hits\":{},\"misses\":{},\"inserts\":{},\"evictions\":{},\"mem_bytes\":{},\"mem_cap_bytes\":{},\"disk_write_bytes\":{},\"disk_read_bytes\":{}}}",
+            stats.hits,
+            stats.misses,
+            stats.inserts,
+            stats.evictions,
+            stats.memory_usage_bytes,
+            stats.memory_capacity_bytes,
+            stats.disk_write_bytes,
+            stats.disk_read_bytes,
+        )
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(cache) = OBJECT_CACHE.get()
+        && let Some(stats) = cache.stats()
+    {
+        parts.push(format!("\"manifest\":{}", tier(stats)));
+    }
+    if let Some(Some(dc)) = DATA_CACHE.get()
+        && let Some(stats) = dc.cache.stats()
+    {
+        parts.push(format!("\"data\":{}", tier(stats)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("{{{}}}", parts.join(",")))
+    }
+}
+
+/// One-line per-process totals, registered with Python's `atexit` at module
+/// init so every run pod logs its final cache effectiveness.
+pub fn log_cache_stats_at_exit() {
+    if let Some(stats) = cache_stats_json() {
+        eprintln!("INFO iceberg object-cache stats (process totals): {stats}");
+    }
 }

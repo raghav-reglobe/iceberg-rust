@@ -323,7 +323,14 @@ fn merge_into(
                     count += arr.iter().flatten().sum::<u64>();
                 }
             }
-            Ok(HashMap::from([("count".to_string(), count.to_string())]))
+            let mut out = HashMap::from([("count".to_string(), count.to_string())]);
+            // Cumulative per-process cache stats (manifest + data tiers) —
+            // the worker logs this result line per slice, so cache
+            // effectiveness lands in run-pod logs with zero new plumbing.
+            if let Some(stats) = crate::runtime::cache_stats_json() {
+                out.insert("cache_stats".to_string(), stats);
+            }
+            Ok(out)
         })
     })
 }

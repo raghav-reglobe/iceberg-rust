@@ -2518,4 +2518,133 @@ mod object_cache_sharing {
         }
         assert!(per_file.values().all(|&n| n == 1), "one live DV per file");
     }
+
+    /// The doorway-shaped stats surface over REAL foyer stores: two merges
+    /// with both tiers attached — after merge 1 the counters move; merge 2
+    /// reports MORE hits on both tiers (warm process), and the merged state
+    /// stays correct.
+    #[tokio::test]
+    async fn merge_stats_report_warm_hits_via_foyer() {
+        use iceberg::cache::DataBytesCache;
+        use iceberg_cache_foyer::{EvictionPolicy, FoyerObjectBytesCacheBuilder};
+
+        let warehouse = TempDir::new().unwrap();
+        let manifest_store = Arc::new(
+            FoyerObjectBytesCacheBuilder::new(32 * 1024 * 1024)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let data_store = Arc::new(
+            FoyerObjectBytesCacheBuilder::new(64 * 1024 * 1024)
+                .with_eviction_policy(EvictionPolicy::S3Fifo)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_object_bytes_cache(manifest_store.clone() as ObjectBytesCacheRef)
+                .with_data_bytes_cache(DataBytesCache {
+                    cache: data_store.clone() as ObjectBytesCacheRef,
+                    max_file_bytes: 256 * 1024 * 1024,
+                })
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.path().to_str().unwrap().to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new(NS.to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(5, "_is_current", Transform::Identity)
+            .unwrap()
+            .build();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name(TABLE.to_string())
+                    .schema(scd2_iceberg_schema())
+                    .partition_spec(spec)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let data_files = write_one_data_file(
+            &table,
+            scd2_batch(&[
+                (1, "a", 10, None, true, 100),
+                (2, "b", 10, None, true, 101),
+                (3, "c", 10, None, true, 102),
+            ]),
+        )
+        .await;
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let dfprovider = Arc::new(
+            IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+                .await
+                .unwrap(),
+        );
+        ctx.register_catalog(CATALOG, dfprovider);
+        let cdc = cdc_batch(&[(1, "a2", 20, 200), (4, "d", 20, 203)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let m1_manifest = manifest_store.stats().unwrap();
+        let m1_data = data_store.stats().unwrap();
+        assert!(m1_manifest.inserts > 0 && m1_data.inserts > 0);
+
+        ctx.deregister_table("batch").unwrap();
+        let cdc = cdc_batch(&[(2, "b2", 30, 300), (1, "a3", 30, 301)]);
+        let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
+        ctx.register_table("batch", Arc::new(mem)).unwrap();
+        ctx.sql(&scd2_merge_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let m2_manifest = manifest_store.stats().unwrap();
+        let m2_data = data_store.stats().unwrap();
+        assert!(
+            m2_manifest.hits > m1_manifest.hits,
+            "merge 2 must report warm manifest hits: {m1_manifest:?} -> {m2_manifest:?}"
+        );
+        assert!(
+            m2_data.hits > m1_data.hits,
+            "merge 2 must report warm data hits: {m1_data:?} -> {m2_data:?}"
+        );
+        assert!(m2_data.memory_usage_bytes > 0);
+
+        let state = read_state(&ctx).await;
+        assert_eq!(state.len(), 7);
+        assert_eq!(
+            state.iter().filter(|r| r.4).count(),
+            4,
+            "one current per id"
+        );
+    }
 }

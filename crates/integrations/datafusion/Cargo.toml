@@ -42,6 +42,7 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+iceberg-cache-foyer = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 expect-test = { workspace = true }

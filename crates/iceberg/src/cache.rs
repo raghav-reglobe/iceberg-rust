@@ -77,6 +77,34 @@ pub trait ObjectBytesCache: Send + Sync + std::fmt::Debug {
     async fn get(&self, path: &str) -> Option<Bytes>;
     /// Caches the raw file bytes fetched from `path`.
     async fn set(&self, path: &str, bytes: Bytes);
+    /// Cumulative statistics for this store, when the implementation tracks
+    /// them (see [`ObjectCacheStats`]). Default: none.
+    fn stats(&self) -> Option<ObjectCacheStats> {
+        None
+    }
+}
+
+/// Cumulative, process-lifetime statistics of an [`ObjectBytesCache`].
+/// Counters only ever grow (consumers diff across observations); usage
+/// gauges are point-in-time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectCacheStats {
+    /// `get` calls served from the store.
+    pub hits: u64,
+    /// `get` calls that missed (the caller then fetched from storage).
+    pub misses: u64,
+    /// `set` calls (fetched objects entering the store).
+    pub inserts: u64,
+    /// Entries evicted from the in-memory tier (capacity pressure).
+    pub evictions: u64,
+    /// Current in-memory tier usage in (weighted) bytes.
+    pub memory_usage_bytes: u64,
+    /// In-memory tier capacity in (weighted) bytes.
+    pub memory_capacity_bytes: u64,
+    /// Cumulative bytes written to the disk tier (0 when memory-only).
+    pub disk_write_bytes: u64,
+    /// Cumulative bytes read from the disk tier (0 when memory-only).
+    pub disk_read_bytes: u64,
 }
 
 /// A thread-safe, reference-counted handle to an [`ObjectBytesCache`].
