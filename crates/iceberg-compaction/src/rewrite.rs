@@ -67,79 +67,175 @@ pub async fn commit_rewrite(
 /// `commit_rewrite` — a single atomic `Replace` snapshot, NOT one commit per group
 /// (per-group commits re-run the manifest carry-forward over each prior snapshot,
 /// which duplicated data files).
+///
+/// MEMORY CONTRACT (giant-TEXT safety): the group is processed as a stream of
+/// CHUNKS of at most ~`cfg.sort_chunk_bytes` estimated arrow bytes. Each chunk
+/// is sorted independently (bounded `interleave` slices of
+/// ~`cfg.write_batch_bytes`, never a whole-group concat) and written before
+/// the next chunk is buffered, so peak memory is one chunk + one slice +
+/// writer buffers — REGARDLESS of group size. A 128 MB zstd group of multi-KB
+/// TEXT rows decodes to GBs (and a delete-pressure giant file to tens of
+/// GBs); whole-group materialization OOM-killed the pod and its whole-group
+/// concat overflowed arrow's i32 string offsets. Groups under the chunk
+/// budget (the common case) still produce ONE fully-sorted run; oversized
+/// groups degrade gracefully to several sorted runs (slightly looser
+/// per-file `_valid_from` bounds, full correctness).
 pub(crate) async fn read_sort_write(
     table: &Table,
     group: &Group,
     cfg: &Config,
 ) -> Result<Vec<DataFile>> {
-    let batches = read_group(table, group.tasks.clone())
-        .await?
-        .try_collect()
-        .await?;
-    let sorted = crate::sort::sort_by_valid_from(batches)?;
-    // Shred-preserving mode: re-shred the (canonical, post-fold) batches to
-    // the input files' layout and keep the writer's schema in lockstep.
-    let (batches, shred_overrides) = if cfg.shred_variants {
-        let plain = variant_shred::input_shred_types(table, group).await?;
-        variant_shred::shred_batches(sorted, &plain)?
+    // Shred-preserving layout is derived once per group (first input file's
+    // footer); the writer itself is built lazily on the first non-empty
+    // slice (so an all-deleted group writes nothing) with the ACTUAL
+    // shredded arrow types of that slice.
+    let shred_plain = if cfg.shred_variants {
+        variant_shred::input_shred_types(table, group).await?
     } else {
-        (sorted, std::collections::HashMap::new())
+        std::collections::HashMap::new()
     };
-    write_data_files(table, batches, shred_overrides).await
+
+    let mut stream = read_group(table, group.tasks.clone()).await?;
+    let mut sink: Option<CompactSink> = None;
+    let mut chunk: Vec<RecordBatch> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    while let Some(batch) = stream.try_next().await? {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        chunk_bytes += batch.get_array_memory_size();
+        chunk.push(batch);
+        if chunk_bytes >= cfg.sort_chunk_bytes {
+            flush_chunk(
+                table,
+                cfg,
+                &shred_plain,
+                std::mem::take(&mut chunk),
+                &mut sink,
+            )
+            .await?;
+            chunk_bytes = 0;
+        }
+    }
+    flush_chunk(table, cfg, &shred_plain, chunk, &mut sink).await?;
+
+    match sink {
+        Some(s) => s.close().await,
+        None => Ok(Vec::new()), // no live rows in the group — nothing to write
+    }
 }
 
-/// Write sorted record batches to new parquet data files via iceberg-rust's
-/// writer chain (ParquetWriter -> RollingFileWriter -> DataFileWriter). For a
-/// partitioned table the batches are routed to per-partition files by a
-/// `FanoutWriter` (rows split via `RecordBatchPartitionSplitter`). Returns the
-/// `added` DataFiles. Per-column bloom filters are enabled from the table's
-/// `write.parquet.bloom-filter-*` properties (see `bloom_writer_properties`).
-async fn write_data_files(
+/// Sort one buffered chunk and stream its bounded slices into the (lazily
+/// created) group sink.
+async fn flush_chunk(
     table: &Table,
+    cfg: &Config,
+    shred_plain: &std::collections::HashMap<String, arrow_schema::DataType>,
     batches: Vec<RecordBatch>,
-    variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
-) -> Result<Vec<DataFile>> {
-    if batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(Vec::new()); // nothing to write
+    sink: &mut Option<CompactSink>,
+) -> Result<()> {
+    if batches.is_empty() {
+        return Ok(());
     }
-    let schema = table.metadata().current_schema().clone();
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        ParquetWriterBuilder::new(bloom_writer_properties(table), schema.clone())
-            .with_variant_shred_types(variant_shred_types),
-        table.file_io().clone(),
-        DefaultLocationGenerator::new(table.metadata())?,
-        // Unique per write: DefaultFileNameGenerator's counter resets with each new
-        // instance, and write_data_files is called once per group. A constant prefix
-        // would name every group's output `compact-00000.parquet` — multi-group
-        // compaction overwriting its own files (corrupt/duplicated data). The
-        // per-write UUID keeps each group's output path distinct.
-        DefaultFileNameGenerator::new(
-            format!("compact-{}", uuid::Uuid::now_v7()),
-            None,
-            DataFileFormat::Parquet,
-        ),
-    );
-    let data_file_builder = DataFileWriterBuilder::new(rolling);
-    let spec = table.metadata().default_partition_spec();
-
-    if spec.is_unpartitioned() {
-        let mut writer = data_file_builder.build(None).await?;
-        for batch in batches {
-            writer.write(batch).await?;
+    let mut sorted = crate::sort::sort_chunk(batches, cfg.write_batch_bytes)?;
+    while let Some(slice) = sorted.next_batch()? {
+        if slice.num_rows() == 0 {
+            continue;
         }
-        Ok(writer.close().await?)
-    } else {
-        // Route each row to its partition's file. The splitter computes partition
-        // values from the rows; FanoutWriter keeps one open writer per partition.
-        let splitter =
-            RecordBatchPartitionSplitter::try_new_with_computed_values(schema, spec.clone())?;
-        let mut writer = FanoutWriter::new(data_file_builder);
-        for batch in batches {
-            for (partition_key, partition_batch) in splitter.split(&batch)? {
-                writer.write(partition_key, partition_batch).await?;
+        // Shred-preserving mode: re-shred each (canonical, post-fold) slice
+        // to the input files' layout; the first slice's actual shredded
+        // types become the writer's schema overrides.
+        let (slice, overrides) = if shred_plain.is_empty() {
+            (slice, std::collections::HashMap::new())
+        } else {
+            let (mut shredded, overrides) = variant_shred::shred_batches(vec![slice], shred_plain)?;
+            (shredded.pop().expect("one batch in, one out"), overrides)
+        };
+        if sink.is_none() {
+            *sink = Some(CompactSink::build(table, overrides).await?);
+        }
+        sink.as_mut().expect("just built").write(slice).await?;
+    }
+    Ok(())
+}
+
+type CompactWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+/// The per-group output writer: iceberg-rust's writer chain (ParquetWriter ->
+/// RollingFileWriter -> DataFileWriter), fanned out per partition for
+/// partitioned tables. Built lazily on the first non-empty slice; fed
+/// bounded slices; closed once per group. Per-column bloom filters are
+/// enabled from the table's `write.parquet.bloom-filter-*` properties (see
+/// `bloom_writer_properties`).
+enum CompactSink {
+    Plain(
+        Box<
+            iceberg::writer::base_writer::data_file_writer::DataFileWriter<
+                ParquetWriterBuilder,
+                DefaultLocationGenerator,
+                DefaultFileNameGenerator,
+            >,
+        >,
+    ),
+    Fanout(
+        Box<FanoutWriter<CompactWriterBuilder>>,
+        Box<RecordBatchPartitionSplitter>,
+    ),
+}
+
+impl CompactSink {
+    async fn build(
+        table: &Table,
+        variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
+    ) -> Result<Self> {
+        let schema = table.metadata().current_schema().clone();
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(bloom_writer_properties(table), schema.clone())
+                .with_variant_shred_types(variant_shred_types),
+            table.file_io().clone(),
+            DefaultLocationGenerator::new(table.metadata())?,
+            // Unique per group: DefaultFileNameGenerator's counter resets with
+            // each new instance and one sink is built per group. A constant
+            // prefix would name every group's output `compact-00000.parquet` —
+            // multi-group compaction overwriting its own files.
+            DefaultFileNameGenerator::new(
+                format!("compact-{}", uuid::Uuid::now_v7()),
+                None,
+                DataFileFormat::Parquet,
+            ),
+        );
+        let data_file_builder = DataFileWriterBuilder::new(rolling);
+        let spec = table.metadata().default_partition_spec();
+        if spec.is_unpartitioned() {
+            Ok(Self::Plain(Box::new(data_file_builder.build(None).await?)))
+        } else {
+            let splitter =
+                RecordBatchPartitionSplitter::try_new_with_computed_values(schema, spec.clone())?;
+            Ok(Self::Fanout(
+                Box::new(FanoutWriter::new(data_file_builder)),
+                Box::new(splitter),
+            ))
+        }
+    }
+
+    async fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        match self {
+            Self::Plain(writer) => writer.write(batch).await?,
+            Self::Fanout(writer, splitter) => {
+                for (partition_key, partition_batch) in splitter.split(&batch)? {
+                    writer.write(partition_key, partition_batch).await?;
+                }
             }
         }
-        Ok(writer.close().await?)
+        Ok(())
+    }
+
+    async fn close(self) -> Result<Vec<DataFile>> {
+        Ok(match self {
+            Self::Plain(mut writer) => writer.close().await?,
+            Self::Fanout(writer, _) => writer.close().await?,
+        })
     }
 }
 

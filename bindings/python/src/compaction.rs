@@ -58,6 +58,14 @@ fn split_fqn(fqn: &str) -> PyResult<(String, Vec<String>, String)> {
 /// `catalog.namespace.table`. The optional ints override the compaction config
 /// (target file size + the candidate / delete-pressure thresholds). Blocks until
 /// the rewrite commits; raises `ValueError` on failure.
+/// Positive-integer MiB env knob (unset / unparsable / 0 = None).
+fn env_mb(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
 #[pyfunction]
 #[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None))]
 fn compact(
@@ -86,6 +94,19 @@ fn compact(
     // canonical output). See `Config::shred_variants`.
     if let Some(v) = shred_variants {
         cfg.shred_variants = v;
+    }
+    // Wide-row memory bounds, env-tunable per pod (see Config docs):
+    // - ICEBERG_COMPACT_CHUNK_MB       — sort-chunk budget (default 1024).
+    //   A group whose decoded arrow data exceeds it is rewritten as several
+    //   sorted runs instead of buffered whole (the giant-TEXT OOM guard).
+    // - ICEBERG_COMPACT_WRITE_BATCH_MB — per-slice writer batch (default 32).
+    //   Also keeps every output array far below arrow's i32 string-offset
+    //   range (the "Offset overflow" guard).
+    if let Some(mb) = env_mb("ICEBERG_COMPACT_CHUNK_MB") {
+        cfg.sort_chunk_bytes = mb.saturating_mul(1024 * 1024);
+    }
+    if let Some(mb) = env_mb("ICEBERG_COMPACT_WRITE_BATCH_MB") {
+        cfg.write_batch_bytes = mb.saturating_mul(1024 * 1024);
     }
     cfg.validate()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;

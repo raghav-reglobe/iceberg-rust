@@ -252,14 +252,13 @@ impl<'a> TableScanBuilder<'a> {
 
         let schema = snapshot.schema(self.table.metadata())?;
 
-        // Check that all column names exist in the schema (skip reserved columns).
+        // Check that all column names exist in the schema (reserved metadata
+        // names that are NOT schema columns are allowed).
         if let Some(column_names) = self.column_names.as_ref() {
             for column_name in column_names {
-                // Skip reserved columns that don't exist in the schema
-                if is_metadata_column_name(column_name) {
-                    continue;
-                }
-                if schema.field_by_name(column_name).is_none() {
+                if schema.field_by_name(column_name).is_none()
+                    && !is_metadata_column_name(column_name)
+                {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!("Column {column_name} not found in table. Schema: {schema}"),
@@ -279,32 +278,41 @@ impl<'a> TableScanBuilder<'a> {
         });
 
         for column_name in column_names.iter() {
-            // Handle metadata columns (like "_file")
+            // Resolve against the TABLE SCHEMA first: a data column may
+            // legally carry a reserved metadata NAME (e.g. a `file_path`
+            // column colliding with the position-delete `file_path`,
+            // reserved id 2147483546). Resolving reserved names first
+            // projected the RESERVED id for such columns — which no data
+            // file produces — failing every scan (and compaction) of the
+            // table with "metadata column with field id ... was projected
+            // but not produced by the reader". Only names that are NOT
+            // schema columns resolve as metadata columns (like "_file").
+            if let Some(field_id) = schema.field_id_by_name(column_name) {
+                schema
+                    .as_struct()
+                    .field_by_id(field_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::FeatureUnsupported,
+                            format!(
+                            "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
+                        ),
+                    )
+                })?;
+
+                field_ids.push(field_id);
+                continue;
+            }
+
             if is_metadata_column_name(column_name) {
                 field_ids.push(get_metadata_field_id(column_name)?);
                 continue;
             }
 
-            let field_id = schema.field_id_by_name(column_name).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Column {column_name} not found in table. Schema: {schema}"),
-                )
-            })?;
-
-            schema
-                .as_struct()
-                .field_by_id(field_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!(
-                        "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
-                    ),
-                )
-            })?;
-
-            field_ids.push(field_id);
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Column {column_name} not found in table. Schema: {schema}"),
+            ));
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
