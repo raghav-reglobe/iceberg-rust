@@ -93,6 +93,7 @@ fn build_storage_for_scheme(
             Ok(OpenDalStorage::S3 {
                 config: Arc::new(config),
                 customized_credential_load: customized_credential_load.clone(),
+                op_cache: Arc::default(),
             })
         }
         #[cfg(feature = "opendal-gcs")]

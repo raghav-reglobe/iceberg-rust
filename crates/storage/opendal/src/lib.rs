@@ -26,7 +26,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -150,6 +150,7 @@ impl StorageFactory for OpenDalStorageFactory {
             } => Ok(Arc::new(OpenDalStorage::S3 {
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
+                op_cache: Arc::default(),
             })),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
@@ -210,6 +211,12 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
+        /// Cache of bucket → built operator. Credential state (reqsign) lives
+        /// per operator, so building one per call re-assumes the IAM role on
+        /// every file operation; a cached operator refreshes its own
+        /// credential at expiry instead.
+        #[serde(skip, default)]
+        op_cache: Arc<RwLock<HashMap<String, Operator>>>,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
@@ -287,10 +294,8 @@ impl OpenDalStorage {
             OpenDalStorage::S3 {
                 config,
                 customized_credential_load,
+                op_cache,
             } => {
-                let op = s3_config_build(config, customized_credential_load, path)?;
-                let op_info = op.info();
-
                 // Use the URL scheme in the path for prefix matching. This enables
                 // use of S3-compatible storage backends using custom schemes (e.g., `minio://`, `r2://`).
                 let url = url::Url::parse(path).map_err(|e| {
@@ -299,7 +304,39 @@ impl OpenDalStorage {
                         format!("Invalid s3 url: {path}: {e}"),
                     )
                 })?;
-                let prefix = format!("{}://{}/", url.scheme(), op_info.name());
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}, missing bucket"),
+                    )
+                })?;
+
+                let cached = {
+                    let cache = op_cache.read().map_err(|_| {
+                        Error::new(ErrorKind::Unexpected, "Operator cache lock poisoned")
+                    })?;
+                    cache.get(bucket).cloned()
+                };
+                let op = match cached {
+                    Some(op) => op,
+                    None => {
+                        let mut cache = op_cache.write().map_err(|_| {
+                            Error::new(ErrorKind::Unexpected, "Operator cache lock poisoned")
+                        })?;
+                        // Double-check after acquiring write lock.
+                        match cache.get(bucket) {
+                            Some(op) => op.clone(),
+                            None => {
+                                let op =
+                                    s3_config_build(config, customized_credential_load, path)?;
+                                cache.insert(bucket.to_string(), op.clone());
+                                op
+                            }
+                        }
+                    }
+                };
+
+                let prefix = format!("{}://{}/", url.scheme(), op.info().name());
                 if path.starts_with(&prefix) {
                     (op, &path[prefix.len()..])
                 } else {
@@ -717,6 +754,7 @@ mod tests {
         let storage = OpenDalStorage::S3 {
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
+            op_cache: Arc::default(),
         };
 
         // All S3-family schemes are accepted by the same storage instance.
@@ -730,6 +768,37 @@ mod tests {
                 "path/to/file.parquet"
             );
         }
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_s3_operator_cache_reuse() {
+        let op_cache: Arc<RwLock<HashMap<String, Operator>>> = Arc::default();
+        let mut config = S3Config::default();
+        config.region = Some("us-east-1".to_string());
+        let storage = OpenDalStorage::S3 {
+            config: Arc::new(config),
+            customized_credential_load: None,
+            op_cache: Arc::clone(&op_cache),
+        };
+
+        // Repeated operations on the same bucket (any S3-family scheme) must
+        // reuse one operator — credential state lives per operator.
+        for _ in 0..10 {
+            storage
+                .create_operator(&"s3://bucket-a/path/file.parquet")
+                .unwrap();
+            storage
+                .create_operator(&"s3a://bucket-a/other/file.parquet")
+                .unwrap();
+        }
+        assert_eq!(op_cache.read().unwrap().len(), 1);
+
+        // A different bucket gets its own operator.
+        storage
+            .create_operator(&"s3://bucket-b/path/file.parquet")
+            .unwrap();
+        assert_eq!(op_cache.read().unwrap().len(), 2);
     }
 
     #[cfg(feature = "opendal-gcs")]

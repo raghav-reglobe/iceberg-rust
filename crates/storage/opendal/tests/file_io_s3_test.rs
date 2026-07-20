@@ -130,6 +130,72 @@ mod tests {
         }
     }
 
+    /// Credential loader that counts how many times a credential is loaded.
+    #[derive(Debug)]
+    struct CountingCredentialLoader {
+        inner: MockCredentialLoader,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProvideCredential for CountingCredentialLoader {
+        type Credential = AwsCredential;
+
+        async fn provide_credential(
+            &self,
+            ctx: &Context,
+        ) -> reqsign_core::Result<Option<AwsCredential>> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.provide_credential(ctx).await
+        }
+    }
+
+    /// The per-bucket operator cache must collapse credential loads: without
+    /// it every file operation builds a fresh operator whose first request
+    /// re-loads (and in production re-assumes the IAM role for) the
+    /// credential — one STS call per S3 operation.
+    #[tokio::test]
+    async fn test_s3_credential_loaded_once_across_many_operations() {
+        let _ = get_file_io().await;
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = CountingCredentialLoader {
+            inner: MockCredentialLoader::new_minio(),
+            count: Arc::clone(&count),
+        };
+        let custom_loader = CustomAwsCredentialLoader::new(loader);
+        let minio_endpoint = get_minio_endpoint();
+
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(custom_loader),
+        }))
+        .with_props(vec![
+            (S3_ENDPOINT, minio_endpoint),
+            (S3_REGION, "us-east-1".to_string()),
+            (S3_PATH_STYLE_ACCESS, "true".to_string()),
+        ])
+        .build();
+
+        let base = format!(
+            "s3://bucket1/{}",
+            normalize_test_name_with_parts!("test_s3_credential_loaded_once")
+        );
+        for i in 0..50 {
+            let path = format!("{base}/f{i}");
+            let output = file_io.new_output(&path).unwrap();
+            output.write("x".into()).await.unwrap();
+            let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+            assert_eq!(data, "x".as_bytes());
+            assert!(file_io.exists(&path).await.unwrap());
+        }
+
+        let loads = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            loads <= 2,
+            "expected the cached operator to load the credential at most twice \
+             across 150 S3 operations, got {loads}"
+        );
+    }
+
     #[test]
     fn test_custom_aws_credential_loader_instantiation() {
         // Test creating CustomAwsCredentialLoader with mock loader
