@@ -362,6 +362,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_DATA_FILES,
         ADDED_DATA_FILES,
         DELETED_DATA_FILES,
+        false,
     );
 
     update_totals(
@@ -370,6 +371,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_DELETE_FILES,
         ADDED_DELETE_FILES,
         REMOVED_DELETE_FILES,
+        false,
     );
 
     update_totals(
@@ -378,6 +380,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_RECORDS,
         ADDED_RECORDS,
         DELETED_RECORDS,
+        false,
     );
 
     update_totals(
@@ -386,6 +389,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_FILE_SIZE,
         ADDED_FILE_SIZE,
         REMOVED_FILE_SIZE,
+        false,
     );
 
     update_totals(
@@ -394,14 +398,25 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_POSITION_DELETES,
         ADDED_POSITION_DELETES,
         REMOVED_POSITION_DELETES,
+        false,
     );
 
+    // Equality deletes get missing-previous-as-zero recovery: a table whose
+    // early snapshots were written by an engine that omitted this key can
+    // otherwise never regain it — the missing-baseline skip below carries
+    // forward on every subsequent commit — and summary consumers doing
+    // COUNT(*) pushdown treat an absent counter as "cannot use summary",
+    // a permanent full-scan tax. Unlike total-records, a missing
+    // equality-deletes baseline is safe to recover as 0 here: this writer
+    // emits only position deletes (V3 DVs), so the true baseline for any
+    // table it owns is 0.
     update_totals(
         &mut summary,
         previous_summary,
         TOTAL_EQUALITY_DELETES,
         ADDED_EQUALITY_DELETES,
         REMOVED_EQUALITY_DELETES,
+        true,
     );
     Ok(summary)
 }
@@ -483,6 +498,7 @@ fn update_totals(
     total_property: &str,
     added_property: &str,
     removed_property: &str,
+    missing_previous_as_zero: bool,
 ) {
     let previous_total = match previous_summary {
         None => 0,
@@ -497,6 +513,7 @@ fn update_totals(
                     return;
                 }
             },
+            None if missing_previous_as_zero => 0,
             None => {
                 tracing::debug!(
                     "Property '{total_property}' was not set in the previous snapshot summary. \
@@ -624,6 +641,58 @@ mod tests {
                 .get(TOTAL_EQUALITY_DELETES)
                 .unwrap(),
             "4"
+        );
+    }
+
+    #[test]
+    fn test_missing_previous_equality_deletes_recovers_as_zero() {
+        // A previous summary WITHOUT total-equality-deletes (written by an
+        // engine that omitted the key) must not poison-carry: the next commit
+        // recovers the key from a 0 baseline. total-records stays governed by
+        // the strict skip — a missing baseline there is NOT recoverable.
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
+            // no TOTAL_EQUALITY_DELETES, no TOTAL_RECORDS
+        ]
+        .into_iter()
+        .collect();
+
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [
+            (ADDED_DATA_FILES.to_string(), "1".to_string()),
+            (ADDED_RECORDS.to_string(), "40".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: new_props,
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        // equality-deletes total recovered as 0 (no deltas in this commit)
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_EQUALITY_DELETES)
+                .unwrap(),
+            "0"
+        );
+        // total-records must remain absent (strict skip — unrecoverable baseline)
+        assert!(!updated.additional_properties.contains_key(TOTAL_RECORDS));
+        // untouched totals still update normally
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
+            "11"
         );
     }
 
@@ -1157,13 +1226,15 @@ mod tests {
             TOTAL_RECORDS,
             TOTAL_FILE_SIZE,
             TOTAL_POSITION_DELETES,
-            TOTAL_EQUALITY_DELETES,
         ] {
             assert!(
                 !props.contains_key(total_field),
                 "{total_field} should not be set when previous summary lacks it",
             );
         }
+        // TOTAL_EQUALITY_DELETES is the exception: missing-previous recovers
+        // as a 0 baseline (see update_snapshot_summaries), so 0 + 3 added = 3.
+        assert_eq!(props.get(TOTAL_EQUALITY_DELETES).unwrap(), "3");
     }
 
     #[test]
