@@ -252,7 +252,21 @@ impl<'a> TableScanBuilder<'a> {
             }
         };
 
-        let schema = snapshot.schema(self.table.metadata())?;
+        // A current-state scan (no explicit snapshot id) resolves columns
+        // against the table's CURRENT schema, not the current snapshot's
+        // pinned schema-id: after a schema evolution commit, the head
+        // snapshot still carries the pre-evolution schema-id until the next
+        // DATA commit — resolving through it makes every new column
+        // unreadable ("Column X not found in table"), which deadlocks any
+        // writer that must read-then-write the table (MERGE can never
+        // succeed to produce a post-evolution snapshot). Old data files
+        // lacking the new field-id read as NULL per the spec's Column
+        // Projection rules (record_batch_transformer). An EXPLICIT
+        // snapshot id keeps the snapshot's schema — time-travel semantics.
+        let schema = match self.snapshot_id {
+            Some(_) => snapshot.schema(self.table.metadata())?,
+            None => self.table.metadata().current_schema().clone(),
+        };
 
         // Check that all column names exist in the schema (reserved metadata
         // names that are NOT schema columns are allowed).
@@ -1381,6 +1395,47 @@ pub mod tests {
 
         let table_scan = table.scan().select(["x", "y", "z", "a", "b"]).build();
         assert!(table_scan.is_err());
+    }
+
+    #[test]
+    fn test_current_scan_uses_current_schema_not_snapshot_schema() {
+        // Evolved-but-unwritten table: current-schema-id is 1 but the head
+        // snapshot still pins schema-0 (no data commit since the evolution).
+        // A current-state scan must resolve columns against the CURRENT
+        // schema — resolving through the snapshot deadlocks read-then-write
+        // paths (MERGE can never commit a post-evolution snapshot). An
+        // explicit snapshot id keeps snapshot schema (time travel).
+        let fixture = TableTestFixture::new();
+        let metadata_location = fixture.table.metadata_location().unwrap().to_string();
+        let mut v = serde_json::to_value(fixture.table.metadata()).unwrap();
+        let cur_snap = v["current-snapshot-id"].clone();
+        for s in v["snapshots"].as_array_mut().unwrap() {
+            if s["snapshot-id"] == cur_snap {
+                s["schema-id"] = 0.into();
+            }
+        }
+        let metadata: TableMetadata = serde_json::from_value(v).unwrap();
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location(metadata_location)
+            .runtime(test_runtime())
+            .build()
+            .unwrap();
+
+        // `y` exists only in current schema-1 — must resolve.
+        let scan = table.scan().select(["x", "y"]).build();
+        assert!(
+            scan.is_ok(),
+            "current-state scan must use current-schema-id: {:?}",
+            scan.err()
+        );
+
+        // Explicit snapshot id keeps the snapshot's schema-0 → `y` absent.
+        let snap_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let tt = table.scan().snapshot_id(snap_id).select(["y"]).build();
+        assert!(tt.is_err(), "time-travel scan must keep snapshot schema");
     }
 
     #[tokio::test]
