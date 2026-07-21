@@ -252,21 +252,27 @@ impl<'a> TableScanBuilder<'a> {
             }
         };
 
-        // A current-state scan (no explicit snapshot id) resolves columns
-        // against the table's CURRENT schema, not the current snapshot's
-        // pinned schema-id: after a schema evolution commit, the head
-        // snapshot still carries the pre-evolution schema-id until the next
-        // DATA commit — resolving through it makes every new column
-        // unreadable ("Column X not found in table"), which deadlocks any
-        // writer that must read-then-write the table (MERGE can never
-        // succeed to produce a post-evolution snapshot). Old data files
-        // lacking the new field-id read as NULL per the spec's Column
-        // Projection rules (record_batch_transformer). An EXPLICIT
-        // snapshot id keeps the snapshot's schema — time-travel semantics.
-        let schema = match self.snapshot_id {
-            Some(_) => snapshot.schema(self.table.metadata())?,
-            None => self.table.metadata().current_schema().clone(),
-        };
+        // Column resolution ALWAYS uses the table's CURRENT schema —
+        // iceberg-java `useSnapshot` parity: a snapshot id pins the FILE
+        // SET, never the schema. Resolving through the snapshot's pinned
+        // schema-id breaks two ways:
+        // - current-state scans: after a schema-evolution commit the head
+        //   snapshot still carries the pre-evolution schema-id until the
+        //   next DATA commit — every new column reads "Column X not found
+        //   in table", which deadlocks any read-then-write path (MERGE can
+        //   never commit the post-evolution snapshot that would clear it);
+        // - consistency-pinned scans (OCC merge/compaction pin the current
+        //   snapshot id for a stable file set): same stale-schema failure,
+        //   with the same deadlock.
+        // Old data files lacking a newer field-id read as NULL per the
+        // spec's Column Projection rules (record_batch_transformer).
+        // Time-travel READS with as-of-snapshot schema semantics are the
+        // caller's concern (java: SnapshotUtil.schemaFor + an explicit
+        // projection): IcebergStaticTableProvider::try_new_from_table_snapshot
+        // already captures the snapshot's schema at construction and
+        // projects through it; this platform never drops columns, so the
+        // snapshot schema is always a subset of current.
+        let schema = self.table.metadata().current_schema().clone();
 
         // Check that all column names exist in the schema (reserved metadata
         // names that are NOT schema columns are allowed).
@@ -1398,13 +1404,16 @@ pub mod tests {
     }
 
     #[test]
-    fn test_current_scan_uses_current_schema_not_snapshot_schema() {
+    fn test_scan_resolves_columns_against_current_schema() {
         // Evolved-but-unwritten table: current-schema-id is 1 but the head
         // snapshot still pins schema-0 (no data commit since the evolution).
-        // A current-state scan must resolve columns against the CURRENT
-        // schema — resolving through the snapshot deadlocks read-then-write
-        // paths (MERGE can never commit a post-evolution snapshot). An
-        // explicit snapshot id keeps snapshot schema (time travel).
+        // Column resolution must use the CURRENT schema for BOTH scan
+        // flavors (java `useSnapshot` parity — a snapshot id pins the file
+        // set, never the schema): resolving through the snapshot deadlocks
+        // read-then-write paths — a current-state MERGE can never commit
+        // the post-evolution snapshot, and an OCC-pinned merge target scan
+        // (explicit CURRENT snapshot id) fails identically (the 2026-07-22
+        // regression: the None-only fix left the pinned path broken).
         let fixture = TableTestFixture::new();
         let metadata_location = fixture.table.metadata_location().unwrap().to_string();
         let mut v = serde_json::to_value(fixture.table.metadata()).unwrap();
@@ -1424,18 +1433,24 @@ pub mod tests {
             .build()
             .unwrap();
 
-        // `y` exists only in current schema-1 — must resolve.
+        // `y` exists only in current schema-1 — must resolve on a
+        // current-state scan.
         let scan = table.scan().select(["x", "y"]).build();
         assert!(
             scan.is_ok(),
-            "current-state scan must use current-schema-id: {:?}",
+            "current-state scan must use current schema: {:?}",
             scan.err()
         );
 
-        // Explicit snapshot id keeps the snapshot's schema-0 → `y` absent.
+        // ... AND on a consistency-pinned scan (explicit snapshot id —
+        // the OCC merge target path).
         let snap_id = table.metadata().current_snapshot().unwrap().snapshot_id();
-        let tt = table.scan().snapshot_id(snap_id).select(["y"]).build();
-        assert!(tt.is_err(), "time-travel scan must keep snapshot schema");
+        let pinned = table.scan().snapshot_id(snap_id).select(["x", "y"]).build();
+        assert!(
+            pinned.is_ok(),
+            "snapshot-pinned scan must use current schema: {:?}",
+            pinned.err()
+        );
     }
 
     #[tokio::test]
