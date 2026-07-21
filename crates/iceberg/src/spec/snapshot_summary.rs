@@ -407,9 +407,14 @@ pub(crate) fn update_snapshot_summaries(
     // forward on every subsequent commit — and summary consumers doing
     // COUNT(*) pushdown treat an absent counter as "cannot use summary",
     // a permanent full-scan tax. Unlike total-records, a missing
-    // equality-deletes baseline is safe to recover as 0 here: this writer
-    // emits only position deletes (V3 DVs), so the true baseline for any
-    // table it owns is 0.
+    // equality-deletes baseline is safe to recover as 0 here: the only
+    // fork path that WRITES equality deletes (the partition-scoped replace
+    // primitive) commits through this same summary code, so its adds are
+    // counted from the recovered baseline onward; engines that omit the
+    // key entirely (duckdb-iceberg) write position deletes/DVs only. A
+    // removal against a recovered-0 baseline (compaction cleaning retained
+    // equality-delete files) saturates at 0 in update_totals rather than
+    // underflowing.
     update_totals(
         &mut summary,
         previous_summary,
@@ -550,7 +555,19 @@ fn update_totals(
         return;
     };
 
-    let new_total = previous_total + added - removed;
+    // Saturating: with `missing_previous_as_zero` a recovered 0 baseline can
+    // legitimately see removals exceed it (compaction removing equality-delete
+    // files on a chain that never carried the total) — that must floor at 0,
+    // not underflow u64 into a garbage total that summary consumers (COUNT(*)
+    // pushdown) would trust.
+    let gross = previous_total.saturating_add(added);
+    if removed > gross {
+        tracing::warn!(
+            "Property '{total_property}': removed ({removed}) exceeds previous+added ({gross}); \
+             flooring total at 0 (inconsistent or recovered baseline)."
+        );
+    }
+    let new_total = gross.saturating_sub(removed);
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
@@ -693,6 +710,49 @@ mod tests {
         assert_eq!(
             updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
             "11"
+        );
+    }
+
+    #[test]
+    fn test_recovered_zero_baseline_saturates_on_removal() {
+        // Missing-key chain + a commit that REMOVES equality-delete files
+        // (compaction partial-rewrite cleanup — the retained-eq-delete-file
+        // class): the recovered 0 baseline must saturate at 0, not
+        // underflow u64 into a garbage total that COUNT(*) pushdown
+        // consumers would trust.
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            // no TOTAL_EQUALITY_DELETES
+        ]
+        .into_iter()
+        .collect();
+
+        let previous_summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [(
+            REMOVED_EQUALITY_DELETES.to_string(),
+            "7".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: new_props,
+        };
+
+        let updated =
+            update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_EQUALITY_DELETES)
+                .unwrap(),
+            "0"
         );
     }
 
