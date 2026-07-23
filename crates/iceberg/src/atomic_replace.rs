@@ -29,15 +29,25 @@
 //! (equality-delete sequence numbers come from the commit, so a re-commit
 //! stays correct).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use futures::TryStreamExt;
 use parquet::variant::{VariantArrayBuilder, json_to_variant};
+use roaring::RoaringTreemap;
 use uuid::Uuid;
 
 use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
-use crate::spec::{DataFileFormat, Literal, PartitionKey, Struct, Transform};
+use crate::delete_vector::DeleteVector;
+use crate::expr::Reference;
+use crate::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
+use crate::scan::FileScanTask;
+use crate::spec::{
+    DataContentType, DataFile, DataFileFormat, Datum, Literal, ManifestContentType, ManifestList,
+    PartitionKey, Struct, Transform,
+};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -241,6 +251,460 @@ fn is_commit_conflict(e: &Error) -> bool {
     e.kind() == ErrorKind::CatalogCommitConflicts
         || e.to_string()
             .contains("Found conflicting concurrent commit")
+}
+
+/// Atomically replace one KEY-PREFIX chunk of an identity partition — the
+/// envelope-shaped (mongo) bronze variant of [`atomic_partition_replace`]:
+/// there is no top-level pk column to equality-delete on, and the chunk's
+/// scope is a PREFIX of a nested string key (`_cdc.key LIKE '{"$oid":
+/// "<hex>%'`), which no equality-delete file can express. Instead the prior
+/// rows are deleted by SCAN + DELETION VECTOR — the same delete class the
+/// DuckDB path writes today, so every existing bronze reader applies them
+/// by construction:
+///
+/// 1. scan the pinned snapshot for `partition_column = partition_value AND
+///    starts_with(key_column, key_prefix) [AND op_column IN op_values]`,
+///    projecting only `_file`/`_pos` (the reader applies prior DVs, so
+///    matched positions are disjoint from already-deleted ones);
+/// 2. per affected file: consolidated DV = prior live DV positions ∪
+///    matched positions (ONE DV per data file — the V3 invariant), prior
+///    delete files superseded via `remove_delete_files`;
+/// 3. append the replacement rows;
+/// 4. commit 1–3 as ONE `RowDelta` snapshot at SNAPSHOT isolation
+///    (concurrent sink appends are irrelevant to file-referenced DVs;
+///    double-DV and referenced-file-removal conflicts still fail closed).
+///
+/// Concurrency: a conflict retries by RE-SCAN — unlike the equality mode,
+/// the DVs reference specific files/positions of the pinned snapshot, so a
+/// rerun must re-derive them against the fresh base (the replacement DATA
+/// files are reused). Failed attempts orphan their DV puffins —
+/// `remove_orphan_files`' job.
+///
+/// Semantics parity with the duck `DELETE ... LIKE` path: a source doc that
+/// VANISHED since the last backfill loses its baseline row (prefix-scoped
+/// delete, nothing re-inserts it) — stronger than the equality mode's
+/// keep-until-CDC-tombstone. A ZERO-ROW input still deletes (the prefix's
+/// docs are gone at source); `dry_run` stops after validation + conformance
+/// (no scan, no writes; `delete_tuples` reports 0).
+///
+/// Fail-closed guards: any attached EQUALITY delete file, or a positional
+/// delete file WITHOUT a `referenced_data_file` binding (could span data
+/// files — superseding it would resurrect other files' deletes), errors
+/// `FeatureUnsupported` — compact the table first.
+#[allow(clippy::too_many_arguments)]
+pub async fn atomic_partition_replace_prefix(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: bool,
+    key_column: &str,
+    key_prefix: &str,
+    op_column: Option<&str>,
+    op_values: &[String],
+    batches: Vec<RecordBatch>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
+    let table = catalog.load_table(ident).await?;
+    let schema = table.metadata().current_schema().clone();
+
+    // The scan filter references the key column by (possibly nested) name —
+    // resolve it against the LOADED schema to fail fast on typos.
+    if schema.field_id_by_name(key_column).is_none() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("key column `{key_column}` not found in table schema"),
+        ));
+    }
+    if let Some(op_col) = op_column
+        && schema.field_id_by_name(op_col).is_none()
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("op column `{op_col}` not found in table schema"),
+        ));
+    }
+
+    // Same single-field IDENTITY-partition contract as the equality mode.
+    let spec = table.metadata().default_partition_spec().clone();
+    let ok_spec = spec.fields().len() == 1
+        && spec.fields()[0].transform == Transform::Identity
+        && schema
+            .field_id_by_name(partition_column)
+            .is_some_and(|id| id == spec.fields()[0].source_id);
+    if !ok_spec {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "atomic replace requires a single-field IDENTITY partition on \
+                 `{partition_column}`; the table's default spec is {spec:?}"
+            ),
+        ));
+    }
+    let partition_key = PartitionKey::new(
+        spec.as_ref().clone(),
+        schema.clone(),
+        Struct::from_iter(vec![Some(Literal::bool(partition_value))]),
+    );
+
+    // Conform + count the replacement rows.
+    let target_arrow: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema)?);
+    let batches = batches
+        .into_iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(|b| conform_batch(&b, &target_arrow))
+        .collect::<Result<Vec<_>>>()?;
+    let rows_appended: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+    if dry_run {
+        return Ok(ReplaceOutcome {
+            snapshot_id: table.metadata().current_snapshot_id(),
+            rows_appended,
+            delete_tuples: 0,
+            attempts: 0,
+        });
+    }
+
+    // Write the replacement data files ONCE (reused across commit attempts;
+    // zero rows -> no data files, the commit may be delete-only).
+    let run = Uuid::now_v7();
+    let data_files = if rows_appended > 0 {
+        let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
+            table.file_io().clone(),
+            DefaultLocationGenerator::new(table.metadata())?,
+            DefaultFileNameGenerator::new(format!("replace-{run}"), None, DataFileFormat::Parquet),
+        );
+        let mut data_writer = DataFileWriterBuilder::new(data_rolling)
+            .build(Some(partition_key.clone()))
+            .await?;
+        for batch in &batches {
+            data_writer.write(batch.clone()).await?;
+        }
+        data_writer.close().await?
+    } else {
+        Vec::new()
+    };
+
+    let max_attempts = max_attempts.max(1);
+    let mut attempts = 0u32;
+    let mut table = table;
+    loop {
+        attempts += 1;
+
+        let Some(base_snapshot) = table.metadata().current_snapshot_id() else {
+            // Empty table: nothing to delete — commit the appends (if any).
+            if data_files.is_empty() {
+                return Ok(ReplaceOutcome {
+                    snapshot_id: None,
+                    rows_appended,
+                    delete_tuples: 0,
+                    attempts: attempts - 1,
+                });
+            }
+            let tx = Transaction::new(&table);
+            let action = tx
+                .row_delta()
+                .add_data_files(data_files.clone())
+                .validate_from_empty_table();
+            match async { action.apply(tx)?.commit(catalog).await }.await {
+                Ok(committed) => {
+                    return Ok(ReplaceOutcome {
+                        snapshot_id: committed.metadata().current_snapshot_id(),
+                        rows_appended,
+                        delete_tuples: 0,
+                        attempts,
+                    });
+                }
+                Err(e) if attempts < max_attempts && is_commit_conflict(&e) => {
+                    table = catalog.load_table(ident).await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        // 1. Scan the pinned snapshot for the chunk's prior rows. The full
+        //    filter drives PLANNING (partition pruning + manifest/file
+        //    bounds work on nested field ids); it is STRIPPED from the read
+        //    tasks below — the arrow row filter rejects nested (non-root)
+        //    predicate columns — and re-applied row-wise in the collect
+        //    loop over the projected key/op ancestor column.
+        let mut filter = Reference::new(partition_column)
+            .equal_to(Datum::bool(partition_value))
+            .and(Reference::new(key_column).starts_with(Datum::string(key_prefix)));
+        if let Some(op_col) = op_column {
+            filter = filter.and(
+                Reference::new(op_col).is_in(op_values.iter().map(|v| Datum::string(v.clone()))),
+            );
+        }
+        let key_root = key_column.split('.').next().expect("non-empty key column");
+        let mut select_cols = vec![key_root, RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS];
+        if let Some(op_col) = op_column {
+            let op_root = op_col.split('.').next().expect("non-empty op column");
+            if op_root != key_root {
+                select_cols.insert(1, op_root);
+            }
+        }
+        let scan = table
+            .scan()
+            .snapshot_id(base_snapshot)
+            .with_filter(filter)
+            .select(select_cols)
+            .build()?;
+        let tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await?
+            .try_collect::<Vec<FileScanTask>>()
+            .await?
+            .into_iter()
+            .map(|mut t| {
+                t.predicate = None; // row-wise filtering happens below
+                t
+            })
+            .collect();
+
+        // Fail-closed delete-file guards (see docstring).
+        for task in &tasks {
+            for del in &task.deletes {
+                if del.file_type == DataContentType::EqualityDeletes {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "prefix replace cannot supersede EQUALITY delete file {} — \
+                             equality deletes are undecidable per-file; compact first",
+                            del.file_path
+                        ),
+                    ));
+                }
+                if del.file_type == DataContentType::PositionDeletes
+                    && del.referenced_data_file.is_none()
+                {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "prefix replace cannot supersede positional delete file {} \
+                             carrying no referenced_data_file (it may span data files); \
+                             compact first",
+                            del.file_path
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // 2. Read matched rows' (file, pos) — prior DVs applied by the reader.
+        let reader = table.reader_builder().build();
+        let task_stream = Box::pin(futures::stream::iter(
+            tasks.iter().cloned().map(Ok).collect::<Vec<_>>(),
+        )) as crate::scan::FileScanTaskStream;
+        // The clone shares the reader's delete cache — prior DVs loaded for
+        // this read are reused by `load_positional_deletes` below.
+        let mut stream = reader.clone().read(task_stream)?.stream();
+        let mut positions_by_file: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut matched: u64 = 0;
+        while let Some(batch) = stream.try_next().await? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let schema = batch.schema();
+            let file_idx = schema.index_of(RESERVED_COL_NAME_FILE).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, format!("_file column missing: {e}"))
+            })?;
+            let pos_idx = schema.index_of(RESERVED_COL_NAME_POS).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, format!("_pos column missing: {e}"))
+            })?;
+            let files = arrow_cast::cast(batch.column(file_idx).as_ref(), &DataType::Utf8)
+                .map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, format!("_file cast failed: {e}"))
+                })?;
+            let files = files
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast to Utf8");
+            let positions = batch
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "_pos must be Int64"))?;
+            let keys = string_leaf(&batch, key_column)?;
+            let ops = op_column.map(|c| string_leaf(&batch, c)).transpose()?;
+            for row in 0..batch.num_rows() {
+                if keys.is_null(row) || !keys.value(row).starts_with(key_prefix) {
+                    continue;
+                }
+                if let Some(ops) = &ops
+                    && !op_values.iter().any(|v| v == ops.value(row))
+                {
+                    continue;
+                }
+                positions_by_file
+                    .entry(files.value(row).to_string())
+                    .or_default()
+                    .push(positions.value(row) as u64);
+                matched += 1;
+            }
+        }
+
+        if matched == 0 && data_files.is_empty() {
+            return Ok(ReplaceOutcome {
+                snapshot_id: Some(base_snapshot),
+                rows_appended,
+                delete_tuples: 0,
+                attempts: attempts - 1,
+            });
+        }
+
+        // 3. One consolidated DV per affected file (prior live positions ∪
+        //    matched), superseding that file's prior delete files.
+        let affected_tasks: Vec<FileScanTask> = tasks
+            .iter()
+            .filter(|t| positions_by_file.contains_key(t.data_file_path()))
+            .cloned()
+            .collect();
+        let mut prior_deletes: HashMap<String, DeleteVector> =
+            reader.load_positional_deletes(&affected_tasks).await?;
+        let location = table.metadata().location().to_string();
+        let mut new_delete_files: Vec<DataFile> = Vec::with_capacity(affected_tasks.len());
+        for task in &affected_tasks {
+            let file = task.data_file_path();
+            let mut bitmap: RoaringTreemap = prior_deletes
+                .remove(file)
+                .map(DeleteVector::into_inner)
+                .unwrap_or_default();
+            for pos in positions_by_file.get(file).into_iter().flatten() {
+                bitmap.insert(*pos);
+            }
+            let partition = task.partition.clone().unwrap_or(Struct::empty());
+            let spec_id = task
+                .partition_spec
+                .as_ref()
+                .map(|s| s.spec_id())
+                .unwrap_or_else(|| table.metadata().default_partition_spec_id());
+            let dv_path = format!("{location}/data/{}-deletes.puffin", Uuid::now_v7());
+            new_delete_files.push(
+                DeleteVector::new(bitmap)
+                    .write_to_puffin_file(
+                        table.file_io(),
+                        dv_path,
+                        file.to_string(),
+                        partition,
+                        spec_id,
+                    )
+                    .await?,
+            );
+        }
+        let prior_paths: HashSet<String> = affected_tasks
+            .iter()
+            .flat_map(|t| t.deletes.iter().map(|d| d.file_path.clone()))
+            .collect();
+        let removed_delete_files = if prior_paths.is_empty() {
+            Vec::new()
+        } else {
+            resolve_delete_files(&table, base_snapshot, &prior_paths).await?
+        };
+
+        // 4. ONE RowDelta snapshot, snapshot-isolation validated.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_data_files(data_files.clone())
+            .add_delete_files(new_delete_files)
+            .remove_delete_files(removed_delete_files)
+            .validate_from_snapshot(base_snapshot)
+            .with_snapshot_isolation();
+        match async { action.apply(tx)?.commit(catalog).await }.await {
+            Ok(committed) => {
+                return Ok(ReplaceOutcome {
+                    snapshot_id: committed.metadata().current_snapshot_id(),
+                    rows_appended,
+                    delete_tuples: matched,
+                    attempts,
+                });
+            }
+            Err(e) if attempts < max_attempts && is_commit_conflict(&e) => {
+                // RE-SCAN against the fresh base (positions/files/prior DVs
+                // may have changed); this attempt's DV puffins are orphans.
+                table = catalog.load_table(ident).await?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Extract a (possibly nested) string leaf from a record batch by dotted
+/// path — `_cdc.key` walks the `_cdc` struct column to its `key` child.
+/// Cast to Utf8 is not attempted: the replace contract requires STRING key
+/// and op columns.
+fn string_leaf<'a>(batch: &'a RecordBatch, dotted: &str) -> Result<&'a StringArray> {
+    let mut parts = dotted.split('.');
+    let root = parts.next().expect("non-empty dotted path");
+    let mut current: &ArrayRef = batch.column(
+        batch
+            .schema()
+            .index_of(root)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("column `{root}`: {e}")))?,
+    );
+    for part in parts {
+        let s = current.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("`{dotted}`: `{part}`'s parent is not a struct"),
+            )
+        })?;
+        current = s.column_by_name(part).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("`{dotted}`: struct field `{part}` not found"),
+            )
+        })?;
+    }
+    current
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("`{dotted}` must be a string column"),
+            )
+        })
+}
+
+/// Resolve live delete-file paths of `snapshot_id` to their manifest
+/// `DataFile` entries (needed for `remove_delete_files` — a scan task's
+/// `FileScanTaskDeleteFile` is not a full manifest entry).
+async fn resolve_delete_files(
+    table: &Table,
+    snapshot_id: i64,
+    paths: &HashSet<String>,
+) -> Result<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("snapshot {snapshot_id} not found"),
+        )
+    })?;
+    let bytes = table
+        .file_io()
+        .new_input(snapshot.manifest_list())?
+        .read()
+        .await?;
+    let manifest_list = ManifestList::parse_with_version(&bytes, metadata.format_version())?;
+    let mut out = Vec::new();
+    for mf in manifest_list.entries() {
+        if mf.content != ManifestContentType::Deletes {
+            continue;
+        }
+        let manifest = mf.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries() {
+            if entry.is_alive() && paths.contains(entry.data_file().file_path()) {
+                out.push(entry.data_file().clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Conform `batch` to the table's arrow schema: resolve columns BY NAME,

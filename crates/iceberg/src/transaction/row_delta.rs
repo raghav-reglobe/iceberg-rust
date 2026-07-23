@@ -81,6 +81,14 @@ pub struct RowDeltaAction {
     /// (neither this nor `starting_snapshot_id` set — Java parity: a
     /// RowDelta without `validateFromSnapshot` performs no base validation).
     validate_empty_base: bool,
+    /// Per-action isolation override: validate the skipped range at SNAPSHOT
+    /// isolation regardless of the table's `write.merge.isolation-level`
+    /// property (Java parity — the RowDelta CALLER chooses validation
+    /// strictness via which `validate*` methods it invokes). Used by writers
+    /// whose delete files carry exact file references (V3 DVs): concurrent
+    /// pure appends are semantically irrelevant to them, while double-DV /
+    /// referenced-file-removal conflicts still fail closed.
+    snapshot_isolation_override: bool,
 }
 
 impl RowDeltaAction {
@@ -94,6 +102,7 @@ impl RowDeltaAction {
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
             validate_empty_base: false,
+            snapshot_isolation_override: false,
         }
     }
 
@@ -142,6 +151,17 @@ impl RowDeltaAction {
     /// Reject the commit if the table has advanced past `snapshot_id` (optimistic concurrency).
     pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
         self.starting_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Validate the skipped range at SNAPSHOT isolation for THIS action,
+    /// regardless of the table's `write.merge.isolation-level` property
+    /// (Java parity — the RowDelta caller chooses validation strictness).
+    /// Concurrent pure data APPENDS then pass; a concurrent delete file
+    /// colliding with this commit's DV targets (double-DV), a wildcard
+    /// equality delete, or a removal of a referenced file still conflicts.
+    pub fn with_snapshot_isolation(mut self) -> Self {
+        self.snapshot_isolation_override = true;
         self
     }
 
@@ -209,7 +229,11 @@ impl RowDeltaAction {
             return Ok(());
         }
 
-        let isolation = isolation_level(meta.properties());
+        let isolation = if self.snapshot_isolation_override {
+            IsolationLevel::SnapshotIsolation
+        } else {
+            isolation_level(meta.properties())
+        };
 
         // 2. This commit's conflict sets.
         let our_dv_targets: HashSet<String> = self
@@ -675,6 +699,28 @@ mod tests {
         };
         assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
         assert!(err.to_string().contains("serializable isolation violation"));
+    }
+
+    #[tokio::test]
+    async fn test_per_action_snapshot_isolation_override() {
+        // Same shape as the serializable-conflict test — NO table property —
+        // but the ACTION opts into snapshot isolation (Java parity: the
+        // RowDelta caller chooses validation strictness). The concurrent
+        // pure data append must then pass.
+        let base = make_v2_minimal_table();
+        let table_s1 = append_snapshot(&base, &["test/data.parquet"]).await;
+        let s1 = table_s1.metadata().current_snapshot_id().unwrap();
+        let table_s2 = append_snapshot(&table_s1, &["test/concurrent.parquet"]).await;
+
+        let action = Transaction::new(&table_s2)
+            .row_delta()
+            .add_data_files(vec![make_data_file(&table_s2, "test/mine.parquet", 100)])
+            .validate_from_snapshot(s1)
+            .with_snapshot_isolation();
+        assert!(
+            Arc::new(action).commit(&table_s2).await.is_ok(),
+            "the per-action override must allow a rebase over a pure data append"
+        );
     }
 
     #[tokio::test]
