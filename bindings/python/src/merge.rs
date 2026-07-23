@@ -147,6 +147,7 @@ async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
     mut scan_files: ScanFiles,
     mut scoped_tables: ScopedTables,
+    local_tables: HashMap<String, String>,
     options: Option<Arc<MorMergeOptions>>,
 ) -> PyResult<SessionContext> {
     // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
@@ -230,6 +231,18 @@ async fn session_with_catalogs(
             "scoped_tables references catalog `{unmatched}` which is not in `catalogs`"
         )));
     }
+    // Local parquet tables — `{name: path}` registered in the session's
+    // default catalog, referenced by BARE name in the SQL. The sanctioned
+    // way to join side data (e.g. a value-remap table) WITHOUT inlining the
+    // values as SQL literals: statement text surfaces in planner errors and
+    // logs, so sensitive values must ride in files, never literals.
+    for (name, path) in local_tables {
+        ctx.register_parquet(&name, &path, Default::default())
+            .await
+            .map_err(|e| {
+                PyValueError::new_err(format!("register local table `{name}` from `{path}`: {e}"))
+            })?;
+    }
     Ok(ctx)
 }
 
@@ -275,7 +288,7 @@ async fn doorway_deadline<T>(
 /// row versions). Raises `ValueError` on planning or execution failure, and
 /// on deadline expiry.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None, late_materialization=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None, late_materialization=None, local_tables=None))]
 fn merge_into(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -285,9 +298,11 @@ fn merge_into(
     write_workers: Option<usize>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     late_materialization: Option<bool>,
+    local_tables: Option<HashMap<String, String>>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
+    let local_tables = local_tables.unwrap_or_default();
     // The deadline covers catalog mounting, planning and the scan/write
     // phase (enforced cooperatively inside the merge write node). The
     // snapshot COMMIT is deliberately outside it — cancelling a REST commit
@@ -304,7 +319,13 @@ fn merge_into(
             let ctx = doorway_deadline(
                 deadline,
                 "mounting catalogs",
-                session_with_catalogs(catalogs, scan_files, scoped_tables, Some(options)),
+                session_with_catalogs(
+                    catalogs,
+                    scan_files,
+                    scoped_tables,
+                    local_tables,
+                    Some(options),
+                ),
             )
             .await??;
             let df = doorway_deadline(deadline, "planning MERGE", ctx.sql(&sql))
@@ -342,19 +363,23 @@ fn merge_into(
 /// only, no data IO, no commit), so a failing or suspicious merge can be
 /// inspected with zero writes.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, scoped_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, scoped_tables=None, local_tables=None))]
 fn dry_run_inspect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     sql: String,
     scan_files: Option<HashMap<String, Vec<String>>>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
+    let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, None).await?;
+            let ctx =
+                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
+                    .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -382,7 +407,7 @@ fn dry_run_inspect(
 /// JSON-serializable by the arrow JSON writer — wrap variant/binary columns
 /// in `variant_to_json(...)` in the statement.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None))]
 fn sql_collect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -390,14 +415,16 @@ fn sql_collect(
     scan_files: Option<HashMap<String, Vec<String>>>,
     max_rows: usize,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
 ) -> PyResult<String> {
     use datafusion::logical_expr::LogicalPlan;
 
     let scan_files = parse_scan_files(scan_files)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
+    let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, None).await?;
+            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None).await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -438,11 +465,86 @@ fn sql_collect(
     })
 }
 
+/// Run one READ-ONLY SQL statement and return its result as ARROW IPC
+/// STREAM bytes (`pyarrow.ipc.open_stream(...).read_all()`) — the
+/// byte-fidelity twin of [`sql_collect`]. JSON round-trips lose exactness
+/// (float rendering, binary, timestamp precision); IPC preserves the arrow
+/// values verbatim, which value-keyed consumers (a remap's `original`
+/// column must re-match the stored value EXACTLY) require. Same read-only
+/// guard and loud `max_rows` cap; the stream always carries the schema, so
+/// a zero-row result is a valid empty table, not an error.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None))]
+fn sql_collect_ipc(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
+    max_rows: usize,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
+) -> PyResult<Py<pyo3::types::PyBytes>> {
+    use datafusion::logical_expr::LogicalPlan;
+
+    let scan_files = parse_scan_files(scan_files)?;
+    let scoped_tables = parse_scoped_tables(scoped_tables)?;
+    let local_tables = local_tables.unwrap_or_default();
+    let buf: Vec<u8> = py.detach(|| {
+        runtime().block_on(async move {
+            let ctx =
+                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
+                    .await?;
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("planning query: {e}")))?;
+            if matches!(
+                df.logical_plan(),
+                LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Copy(_)
+            ) {
+                return Err(PyValueError::new_err(
+                    "sql_collect_ipc is read-only — use merge_into for writes",
+                ));
+            }
+            let schema = Arc::new(df.schema().as_arrow().clone());
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("executing query: {e}")))?;
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if total > max_rows {
+                return Err(PyValueError::new_err(format!(
+                    "result has {total} rows > max_rows={max_rows} — narrow the query or raise the cap"
+                )));
+            }
+            let mut buf = Vec::new();
+            {
+                let mut writer =
+                    datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+                        .map_err(|e| {
+                            PyValueError::new_err(format!("serializing rows: {e}"))
+                        })?;
+                for batch in &batches {
+                    writer
+                        .write(batch)
+                        .map_err(|e| PyValueError::new_err(format!("serializing rows: {e}")))?;
+                }
+                writer
+                    .finish()
+                    .map_err(|e| PyValueError::new_err(format!("serializing rows: {e}")))?;
+            }
+            Ok(buf)
+        })
+    })?;
+    Ok(pyo3::types::PyBytes::new(py, &buf).unbind())
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "merge")?;
     this.add_function(wrap_pyfunction!(merge_into, &this)?)?;
     this.add_function(wrap_pyfunction!(dry_run_inspect, &this)?)?;
     this.add_function(wrap_pyfunction!(sql_collect, &this)?)?;
+    this.add_function(wrap_pyfunction!(sql_collect_ipc, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
