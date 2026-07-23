@@ -27,13 +27,31 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use arrow::array::RecordBatch;
-use iceberg::atomic_replace::{atomic_partition_replace, atomic_partition_replace_prefix};
+use iceberg::atomic_replace::{
+    ReplaceInput, atomic_partition_replace, atomic_partition_replace_prefix,
+};
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::runtime::runtime;
+
+/// Resolve the input mode: `parquet_path` (streamed, bounded memory — the
+/// giant-chunk mode) is mutually exclusive with a non-empty `batches_ipc`.
+fn replace_input(batches_ipc: &[u8], parquet_path: Option<String>) -> PyResult<ReplaceInput> {
+    match parquet_path {
+        Some(path) => {
+            if !batches_ipc.is_empty() {
+                return Err(PyValueError::new_err(
+                    "pass EITHER batches_ipc OR parquet_path, not both",
+                ));
+            }
+            Ok(ReplaceInput::LocalParquet(path))
+        }
+        None => Ok(ReplaceInput::Batches(decode_ipc(batches_ipc)?)),
+    }
+}
 
 fn split_fqn(fqn: &str) -> PyResult<(String, NamespaceIdent, String)> {
     let parts: Vec<&str> = fqn.split('.').collect();
@@ -76,7 +94,7 @@ fn decode_ipc(batches_ipc: &[u8]) -> PyResult<Vec<RecordBatch>> {
 /// without writing or committing. Returns
 /// `{snapshot_id, rows_appended, delete_tuples_est, attempts}`.
 #[pyfunction]
-#[pyo3(signature = (catalogs, table, batches_ipc, pk_columns, partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false))]
+#[pyo3(signature = (catalogs, table, batches_ipc, pk_columns, partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false, parquet_path=None))]
 #[allow(clippy::too_many_arguments)]
 fn bronze_replace(
     py: Python<'_>,
@@ -88,6 +106,7 @@ fn bronze_replace(
     partition_value: bool,
     max_retries: u32,
     dry_run: bool,
+    parquet_path: Option<String>,
 ) -> PyResult<HashMap<String, String>> {
     let (catalog_name, namespace, table_name) = split_fqn(&table)?;
     let Some(props) = catalogs.get(&catalog_name).cloned() else {
@@ -98,7 +117,7 @@ fn bronze_replace(
     if pk_columns.is_empty() {
         return Err(PyValueError::new_err("pk_columns must be non-empty"));
     }
-    let batches = decode_ipc(&batches_ipc)?;
+    let input = replace_input(&batches_ipc, parquet_path)?;
     py.detach(|| {
         runtime().block_on(async move {
             let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
@@ -109,7 +128,7 @@ fn bronze_replace(
                 &partition_column,
                 Literal::bool(partition_value),
                 &pk_columns,
-                batches,
+                input,
                 max_retries,
                 dry_run,
             )
@@ -152,7 +171,7 @@ fn bronze_replace(
 /// `{snapshot_id, rows_appended, delete_tuples_est, attempts}` where
 /// `delete_tuples_est` is the ACTUAL matched-row count.
 #[pyfunction]
-#[pyo3(signature = (catalogs, table, batches_ipc, key_prefix, key_column="_cdc.key".to_string(), op_column=Some("_cdc.op".to_string()), op_values=vec!["R".to_string(), "r".to_string()], partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false))]
+#[pyo3(signature = (catalogs, table, batches_ipc, key_prefix, key_column="_cdc.key".to_string(), op_column=Some("_cdc.op".to_string()), op_values=vec!["R".to_string(), "r".to_string()], partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false, parquet_path=None))]
 #[allow(clippy::too_many_arguments)]
 fn bronze_replace_prefix(
     py: Python<'_>,
@@ -167,6 +186,7 @@ fn bronze_replace_prefix(
     partition_value: bool,
     max_retries: u32,
     dry_run: bool,
+    parquet_path: Option<String>,
 ) -> PyResult<HashMap<String, String>> {
     let (catalog_name, namespace, table_name) = split_fqn(&table)?;
     let Some(props) = catalogs.get(&catalog_name).cloned() else {
@@ -177,7 +197,7 @@ fn bronze_replace_prefix(
     if key_prefix.is_empty() {
         return Err(PyValueError::new_err("key_prefix must be non-empty"));
     }
-    let batches = decode_ipc(&batches_ipc)?;
+    let input = replace_input(&batches_ipc, parquet_path)?;
     py.detach(|| {
         runtime().block_on(async move {
             let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
@@ -191,7 +211,7 @@ fn bronze_replace_prefix(
                 &key_prefix,
                 op_column.as_deref(),
                 &op_values,
-                batches,
+                input,
                 max_retries,
                 dry_run,
             )

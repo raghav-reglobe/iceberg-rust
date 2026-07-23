@@ -62,6 +62,81 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
+/// Input rows for an atomic replace: in-memory record batches (the IPC
+/// doorway mode) or a LOCAL parquet file streamed batch-wise — bounded
+/// memory for arbitrarily large chunks. The equality mode reads the input
+/// TWICE (data pass + delete-tuple pass); each pass re-opens the file.
+/// In-memory batches are conformed per pass too (deterministic — a small
+/// CPU cost for one shared code path).
+pub enum ReplaceInput {
+    /// Decoded record batches held in memory.
+    Batches(Vec<RecordBatch>),
+    /// Path to a local parquet file (the caller's staged chunk).
+    LocalParquet(String),
+}
+
+impl From<Vec<RecordBatch>> for ReplaceInput {
+    fn from(batches: Vec<RecordBatch>) -> Self {
+        ReplaceInput::Batches(batches)
+    }
+}
+
+enum InputPass<'a> {
+    Mem(std::slice::Iter<'a, RecordBatch>),
+    File(parquet::arrow::arrow_reader::ParquetRecordBatchReader),
+}
+
+impl ReplaceInput {
+    fn pass(&self) -> Result<InputPass<'_>> {
+        match self {
+            ReplaceInput::Batches(v) => Ok(InputPass::Mem(v.iter())),
+            ReplaceInput::LocalParquet(path) => {
+                let file = std::fs::File::open(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("opening local parquet input `{path}`: {e}"),
+                    )
+                })?;
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .map_err(|e| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!("reading local parquet input `{path}`: {e}"),
+                            )
+                        })?
+                        .with_batch_size(8192)
+                        .build()
+                        .map_err(|e| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!("reading local parquet input `{path}`: {e}"),
+                            )
+                        })?;
+                Ok(InputPass::File(reader))
+            }
+        }
+    }
+}
+
+impl Iterator for InputPass<'_> {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            InputPass::Mem(it) => it.next().map(|b| Ok(b.clone())),
+            InputPass::File(r) => r.next().map(|res| {
+                res.map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("decoding local parquet input batch: {e}"),
+                    )
+                })
+            }),
+        }
+    }
+}
+
 /// The result of an [`atomic_partition_replace`].
 #[derive(Debug, Clone)]
 pub struct ReplaceOutcome {
@@ -79,7 +154,7 @@ pub struct ReplaceOutcome {
 
 /// Atomically replace one key-chunk of an identity partition: equality-delete
 /// the chunk's PRIOR rows (`partition_column = partition_value`, pk in the
-/// batches' keys) and append the batches, as ONE snapshot.
+/// input rows' keys) and append the input rows, as ONE snapshot.
 ///
 /// Contracts:
 /// - `equality_columns` must be TOP-LEVEL, non-float table columns (the
@@ -91,7 +166,8 @@ pub struct ReplaceOutcome {
 /// - input batches are conformed to the table schema BY NAME (field-id
 ///   metadata attached, primitives cast, structs realigned recursively);
 ///   string columns targeting a VARIANT column are parsed as JSON via the
-///   arrow variant kernel.
+///   arrow variant kernel. [`ReplaceInput::LocalParquet`] streams the file
+///   batch-wise — memory stays O(batch) regardless of chunk size.
 /// - `dry_run` stops after validation + conformance: nothing is written,
 ///   nothing committed; the outcome carries the would-be counts.
 #[allow(clippy::too_many_arguments)]
@@ -101,10 +177,11 @@ pub async fn atomic_partition_replace(
     partition_column: &str,
     partition_value: Literal,
     equality_columns: &[String],
-    batches: Vec<RecordBatch>,
+    input: impl Into<ReplaceInput>,
     max_attempts: u32,
     dry_run: bool,
 ) -> Result<ReplaceOutcome> {
+    let input = input.into();
     let table = catalog.load_table(ident).await?;
     let schema = table.metadata().current_schema().clone();
 
@@ -155,41 +232,75 @@ pub async fn atomic_partition_replace(
     // Conform the input to the table's arrow schema (names -> field ids,
     // casts, struct realignment, JSON -> VARIANT).
     let target_arrow: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema)?);
-    let batches = batches
-        .into_iter()
-        .filter(|b| b.num_rows() > 0)
-        .map(|b| conform_batch(&b, &target_arrow))
-        .collect::<Result<Vec<_>>>()?;
-    let rows_appended: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
-    if dry_run || rows_appended == 0 {
+    if dry_run {
+        // Conform-only validation pass — nothing written, nothing committed.
+        let mut rows = 0u64;
+        for batch in input.pass()? {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += conform_batch(&batch, &target_arrow)?.num_rows() as u64;
+        }
         return Ok(ReplaceOutcome {
             snapshot_id: table.metadata().current_snapshot_id(),
-            rows_appended,
-            delete_tuples: rows_appended,
+            rows_appended: rows,
+            delete_tuples: rows,
             attempts: 0,
         });
     }
 
-    // Write the replacement data files (into the scoped partition).
+    // Pass 1 — the replacement data files (into the scoped partition),
+    // streamed. The writer opens LAZILY on the first non-empty batch so a
+    // zero-row input never creates writers.
     let run = Uuid::now_v7();
-    let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
-        table.file_io().clone(),
-        DefaultLocationGenerator::new(table.metadata())?,
-        DefaultFileNameGenerator::new(format!("replace-{run}"), None, DataFileFormat::Parquet),
-    );
-    let mut data_writer = DataFileWriterBuilder::new(data_rolling)
-        .build(Some(partition_key.clone()))
-        .await?;
-    for batch in &batches {
-        data_writer.write(batch.clone()).await?;
+    let mut data_writer = None;
+    let mut rows_appended = 0u64;
+    for batch in input.pass()? {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let conformed = conform_batch(&batch, &target_arrow)?;
+        rows_appended += conformed.num_rows() as u64;
+        if data_writer.is_none() {
+            let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata())?,
+                DefaultFileNameGenerator::new(
+                    format!("replace-{run}"),
+                    None,
+                    DataFileFormat::Parquet,
+                ),
+            );
+            data_writer = Some(
+                DataFileWriterBuilder::new(data_rolling)
+                    .build(Some(partition_key.clone()))
+                    .await?,
+            );
+        }
+        data_writer
+            .as_mut()
+            .expect("writer opened above")
+            .write(conformed)
+            .await?;
     }
-    let data_files = data_writer.close().await?;
+    if rows_appended == 0 {
+        return Ok(ReplaceOutcome {
+            snapshot_id: table.metadata().current_snapshot_id(),
+            rows_appended: 0,
+            delete_tuples: 0,
+            attempts: 0,
+        });
+    }
+    let data_files = data_writer.expect("rows_appended > 0").close().await?;
 
-    // Write the partition-scoped equality-delete file: the delete tuples are
-    // the replacement rows' own keys (the writer projects the equality-id
-    // columns). Its parquet schema is the PROJECTED equality-id schema.
+    // Pass 2 — the partition-scoped equality-delete file: the delete tuples
+    // are the replacement rows' own keys (the writer projects the
+    // equality-id columns; its parquet schema is the PROJECTED equality-id
+    // schema). Re-streams the input.
     let eq_config = EqualityDeleteWriterConfig::new(equality_ids, schema.clone())?;
     let delete_schema = Arc::new(arrow_schema_to_schema(
         eq_config.projected_arrow_schema_ref(),
@@ -206,8 +317,12 @@ pub async fn atomic_partition_replace(
     let mut eq_writer = EqualityDeleteFileWriterBuilder::new(eq_rolling, eq_config)
         .build(Some(partition_key))
         .await?;
-    for batch in &batches {
-        eq_writer.write(batch.clone()).await?;
+    for batch in input.pass()? {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        eq_writer.write(conform_batch(&batch, &target_arrow)?).await?;
     }
     let delete_files = eq_writer.close().await?;
 
@@ -301,10 +416,11 @@ pub async fn atomic_partition_replace_prefix(
     key_prefix: &str,
     op_column: Option<&str>,
     op_values: &[String],
-    batches: Vec<RecordBatch>,
+    input: impl Into<ReplaceInput>,
     max_attempts: u32,
     dry_run: bool,
 ) -> Result<ReplaceOutcome> {
+    let input = input.into();
     let table = catalog.load_table(ident).await?;
     let schema = table.metadata().current_schema().clone();
 
@@ -347,43 +463,64 @@ pub async fn atomic_partition_replace_prefix(
         Struct::from_iter(vec![Some(Literal::bool(partition_value))]),
     );
 
-    // Conform + count the replacement rows.
+    // Conform + write the replacement data files ONCE (reused across commit
+    // attempts), streamed — the writer opens LAZILY on the first non-empty
+    // batch (zero rows -> no data files, the commit may be delete-only).
     let target_arrow: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema)?);
-    let batches = batches
-        .into_iter()
-        .filter(|b| b.num_rows() > 0)
-        .map(|b| conform_batch(&b, &target_arrow))
-        .collect::<Result<Vec<_>>>()?;
-    let rows_appended: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
     if dry_run {
+        let mut rows = 0u64;
+        for batch in input.pass()? {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += conform_batch(&batch, &target_arrow)?.num_rows() as u64;
+        }
         return Ok(ReplaceOutcome {
             snapshot_id: table.metadata().current_snapshot_id(),
-            rows_appended,
+            rows_appended: rows,
             delete_tuples: 0,
             attempts: 0,
         });
     }
 
-    // Write the replacement data files ONCE (reused across commit attempts;
-    // zero rows -> no data files, the commit may be delete-only).
     let run = Uuid::now_v7();
-    let data_files = if rows_appended > 0 {
-        let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
-            table.file_io().clone(),
-            DefaultLocationGenerator::new(table.metadata())?,
-            DefaultFileNameGenerator::new(format!("replace-{run}"), None, DataFileFormat::Parquet),
-        );
-        let mut data_writer = DataFileWriterBuilder::new(data_rolling)
-            .build(Some(partition_key.clone()))
-            .await?;
-        for batch in &batches {
-            data_writer.write(batch.clone()).await?;
+    let mut data_writer = None;
+    let mut rows_appended = 0u64;
+    for batch in input.pass()? {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
         }
-        data_writer.close().await?
-    } else {
-        Vec::new()
+        let conformed = conform_batch(&batch, &target_arrow)?;
+        rows_appended += conformed.num_rows() as u64;
+        if data_writer.is_none() {
+            let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata())?,
+                DefaultFileNameGenerator::new(
+                    format!("replace-{run}"),
+                    None,
+                    DataFileFormat::Parquet,
+                ),
+            );
+            data_writer = Some(
+                DataFileWriterBuilder::new(data_rolling)
+                    .build(Some(partition_key.clone()))
+                    .await?,
+            );
+        }
+        data_writer
+            .as_mut()
+            .expect("writer opened above")
+            .write(conformed)
+            .await?;
+    }
+    let data_files = match data_writer {
+        Some(mut w) => w.close().await?,
+        None => Vec::new(),
     };
 
     let max_attempts = max_attempts.max(1);

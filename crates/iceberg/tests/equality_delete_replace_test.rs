@@ -681,6 +681,122 @@ mod replace_api {
     }
 
     #[tokio::test]
+    async fn replace_composite_equality_columns_delete_by_tuple() {
+        // Multi-column equality ids (the composite-PK seam): delete tuples
+        // are (id, payload) PAIRS — a row sharing only the id with a
+        // replacement row survives; an exact tuple match is replaced.
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = setup(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+
+        let out = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string(), "payload".to_string()],
+            vec![external_batch(&table, &[
+                // exact tuple match with seeded (1, "r-old-1") -> replaced
+                // (the op marker flips r -> R, proving delete + re-insert)
+                (1, "r-old-1", "R", Some(true)),
+                // same id as seeded row 2 but DIFFERENT payload -> the old
+                // (2, "r-old-2") row must SURVIVE alongside the new row
+                (2, "zz-new-2", "R", Some(true)),
+            ])],
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.rows_appended, out.delete_tuples), (2, 2));
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_rows(&table).await, vec![
+            (1, "r-old-1".to_string(), "R".to_string()), // replaced (op R)
+            (2, "c-2".to_string(), "c".to_string()),
+            (2, "r-old-2".to_string(), "r".to_string()), // tuple mismatch: survives
+            (2, "zz-new-2".to_string(), "R".to_string()),
+            (6, "r-old-6".to_string(), "r".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn replace_local_parquet_input_streams_and_matches_batches() {
+        // The giant-chunk mode: the SAME rows via a LOCAL parquet file
+        // (streamed batch-wise, bounded memory) must produce the same table
+        // state the in-memory batches mode does — incl. the two-pass read
+        // (data files + equality-delete tuples re-stream the file).
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = setup(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+
+        let batch = external_batch(&table, &[
+            (1, "r-file-1", "r", Some(true)),
+            (2, "r-file-2", "r", Some(true)),
+        ]);
+        let path = warehouse.path().join("chunk-input.parquet");
+        let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let out = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            iceberg::atomic_replace::ReplaceInput::LocalParquet(
+                path.to_str().unwrap().to_string(),
+            ),
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.rows_appended, out.delete_tuples), (2, 2));
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_rows(&table).await, vec![
+            (1, "r-file-1".to_string(), "r".to_string()),
+            (2, "c-2".to_string(), "c".to_string()),
+            (2, "r-file-2".to_string(), "r".to_string()),
+            (6, "r-old-6".to_string(), "r".to_string()),
+        ]);
+
+        // Zero-row parquet input -> no-op (no snapshot, no writers).
+        let empty = warehouse.path().join("empty-input.parquet");
+        let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+            std::fs::File::create(&empty).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        w.close().unwrap();
+        let snaps_before = table.metadata().snapshots().count();
+        let out = atomic_partition_replace(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            iceberg::atomic_replace::ReplaceInput::LocalParquet(
+                empty.to_str().unwrap().to_string(),
+            ),
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.rows_appended, out.attempts), (0, 0));
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), snaps_before);
+    }
+
+    #[tokio::test]
     async fn replace_rejects_nested_equality_and_wrong_spec() {
         let warehouse = TempDir::new().unwrap();
         let (catalog, ident) = setup(&warehouse).await;
@@ -835,3 +951,4 @@ mod replace_api {
         }
     }
 }
+

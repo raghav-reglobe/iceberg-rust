@@ -512,6 +512,84 @@ async fn prefix_replace_consolidates_prior_dvs() {
 }
 
 #[tokio::test]
+async fn prefix_replace_local_parquet_input() {
+    // The giant-chunk mode: rows via a LOCAL parquet path (streamed) —
+    // same semantics as the batches mode; a ZERO-ROW file still deletes
+    // (the prefix's docs vanished at source — delete-only commit).
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident) = setup(&warehouse).await;
+    seed(&catalog, &ident).await;
+    let table = catalog.load_table(&ident).await.unwrap();
+
+    let b = batch(&table, &[("r-file-aa01", "R", "{\"$oid\": \"aa01\"}", Some(true))]);
+    let path = warehouse.path().join("chunk-input.parquet");
+    let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+        std::fs::File::create(&path).unwrap(),
+        b.schema(),
+        None,
+    )
+    .unwrap();
+    w.write(&b).unwrap();
+    w.close().unwrap();
+
+    let out = atomic_partition_replace_prefix(
+        &catalog,
+        &ident,
+        "_is_backfill",
+        true,
+        "_cdc.key",
+        &oid_prefix(),
+        Some("_cdc.op"),
+        &["R".to_string(), "r".to_string()],
+        iceberg::atomic_replace::ReplaceInput::LocalParquet(path.to_str().unwrap().to_string()),
+        3,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!((out.rows_appended, out.delete_tuples), (1, 2)); // aa01+aa02 deleted
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(read_rows(&table).await, vec![
+        ("c-aa01".into(), "c".into(), "{\"$oid\": \"aa01\"}".into()),
+        ("c-zz01".into(), "c".into(), "{\"$oid\": \"zz01\"}".into()),
+        ("r-file-aa01".into(), "R".into(), "{\"$oid\": \"aa01\"}".into()),
+        ("r-old-ab99".into(), "r".into(), "{\"$oid\": \"ab99\"}".into()),
+        ("r-old-bb01".into(), "r".into(), "{\"$oid\": \"bb01\"}".into()),
+    ]);
+
+    // Zero-row file: delete-only (removes the row appended above).
+    let empty = warehouse.path().join("empty-input.parquet");
+    let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+        std::fs::File::create(&empty).unwrap(),
+        b.schema(),
+        None,
+    )
+    .unwrap();
+    w.close().unwrap();
+    let out = atomic_partition_replace_prefix(
+        &catalog,
+        &ident,
+        "_is_backfill",
+        true,
+        "_cdc.key",
+        &oid_prefix(),
+        Some("_cdc.op"),
+        &["R".to_string(), "r".to_string()],
+        iceberg::atomic_replace::ReplaceInput::LocalParquet(empty.to_str().unwrap().to_string()),
+        3,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!((out.rows_appended, out.delete_tuples), (0, 1));
+    let table = catalog.load_table(&ident).await.unwrap();
+    let rows = read_rows(&table).await;
+    assert!(!rows.iter().any(|(_, op, key)| {
+        (op == "r" || op == "R") && key.starts_with(&oid_prefix())
+    }));
+}
+
+#[tokio::test]
 async fn prefix_replace_rejects_equality_deletes() {
     let warehouse = TempDir::new().unwrap();
     let (catalog, ident) = setup(&warehouse).await;
