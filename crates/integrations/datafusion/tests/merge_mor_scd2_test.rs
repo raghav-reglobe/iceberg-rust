@@ -2648,3 +2648,73 @@ mod object_cache_sharing {
         );
     }
 }
+
+/// The value-remap shape (a value-keyed rewrite: for every row whose value
+/// column matches a remap `original`, set it to the remap's replacement) —
+/// a MATCHED-only UPDATE keyed on the VALUE column, with NO `NOT MATCHED`
+/// clause. Pins four behaviors the SCD2 statements (which always carry both
+/// clauses) never exercise:
+///   - a merge without an INSERT arm plans and executes;
+///   - unmatched SOURCE rows are dropped (no insert arm to route to);
+///   - the rewrite covers current AND history rows (value-keyed, not
+///     current-scoped);
+///   - REPLAY is a no-op with NO new snapshot (rewritten rows no longer
+///     match the remap's `original` values).
+#[tokio::test]
+async fn value_remap_matched_only_update_no_insert_arm() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ctx) = setup(
+        &warehouse,
+        &[
+            (1, "raw-a", 10, None, true, 100),
+            (2, "raw-b", 10, Some(20), false, 101), // history row remaps too
+            (2, "b2", 20, None, true, 103),
+            (3, "keep", 10, None, true, 102),
+        ],
+        &[],
+    )
+    .await;
+
+    // The remap source: two live originals + one matching nothing.
+    let map_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("original", DataType::Utf8, false),
+        Field::new("encrypted", DataType::Utf8, false),
+    ]));
+    let map = RecordBatch::try_new(map_schema, vec![
+        Arc::new(StringArray::from(vec!["raw-a", "raw-b", "absent"])),
+        Arc::new(StringArray::from(vec!["enc::A", "enc::B", "enc::X"])),
+    ])
+    .unwrap();
+    let mem = MemTable::try_new(map.schema(), vec![vec![map]]).unwrap();
+    ctx.register_table("value_map", Arc::new(mem)).unwrap();
+
+    let sql = format!(
+        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING value_map AS m \
+         ON t.val = m.original \
+         WHEN MATCHED THEN UPDATE SET val = m.encrypted"
+    );
+
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+    let state = read_state(&ctx).await;
+    assert_eq!(state, vec![
+        (1, "enc::A".to_string(), 10, None, true),
+        (2, "enc::B".to_string(), 10, Some(20), false),
+        (2, "b2".to_string(), 20, None, true),
+        (3, "keep".to_string(), 10, None, true),
+    ]);
+    // Both rewrites hit the single seed file: one consolidated DV, 2 rows.
+    let dvs = live_dvs(&table).await;
+    assert_eq!(dvs.len(), 1, "one DV total: {dvs:?}");
+    assert_eq!(dvs[0].1, 2, "DV covers exactly the two rewritten rows");
+
+    // Replay: nothing matches the originals any more — no-op, NO snapshot.
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+    assert_eq!(read_state(&ctx).await, state);
+}
