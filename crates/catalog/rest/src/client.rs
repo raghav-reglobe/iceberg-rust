@@ -258,9 +258,30 @@ impl HttpClient {
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
     // returns a `Response`.
+    //
+    // The cached OAuth token carries a server-side TTL and is never refreshed
+    // proactively (see the `authenticate` TODO), so a long-lived client starts
+    // receiving 401 on every call once it expires. When a credential is held,
+    // a 401 response triggers ONE token regeneration + retry of the request
+    // (Iceberg-Java `OAuth2Util.AuthSession` parity).
     pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
         self.authenticate(&mut request).await?;
-        self.execute(request).await
+        let retry_request = if self.credential.is_some() {
+            request.try_clone()
+        } else {
+            None
+        };
+        let response = self.execute(request).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Some(mut retry) = retry_request {
+                self.regenerate_token().await?;
+                // `authenticate` replaces the (stale) Authorization header
+                // with the freshly regenerated token.
+                self.authenticate(&mut retry).await?;
+                return self.execute(retry).await;
+            }
+        }
+        Ok(response)
     }
 
     /// Returns whether header redaction is disabled for this client.
