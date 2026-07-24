@@ -34,7 +34,24 @@ use crate::runtime::runtime;
 /// (which cannot add a VARIANT column) — and unlike pyiceberg-python this path
 /// does not corrupt VARIANT -> unknown.
 fn parse_type(s: &str) -> PyResult<Type> {
-    Ok(match s.trim().to_ascii_lowercase().as_str() {
+    let norm = s.trim().to_ascii_lowercase();
+    // `decimal(p,s)` / `decimal(p, s)` — the mongo variant-schema discovery
+    // emits `DECIMAL(p,s)` for unwrapped ExtendedJSON `$numberDecimal` fields.
+    if let Some(args) = norm
+        .strip_prefix("decimal(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let mut it = args.splitn(2, ',');
+        let (p, sc) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+        let precision: u32 = p.trim().parse().map_err(|_| {
+            PyValueError::new_err(format!("bad decimal precision in `{s}`"))
+        })?;
+        let scale: u32 = sc.trim().parse().map_err(|_| {
+            PyValueError::new_err(format!("bad decimal scale in `{s}`"))
+        })?;
+        return Ok(Type::Primitive(PrimitiveType::Decimal { precision, scale }));
+    }
+    Ok(match norm.as_str() {
         "variant" => Type::Variant(VariantType),
         "string" | "varchar" | "text" => Type::Primitive(PrimitiveType::String),
         "long" | "bigint" => Type::Primitive(PrimitiveType::Long),
@@ -43,10 +60,13 @@ fn parse_type(s: &str) -> PyResult<Type> {
         "boolean" | "bool" => Type::Primitive(PrimitiveType::Boolean),
         "timestamp" => Type::Primitive(PrimitiveType::Timestamp),
         "date" => Type::Primitive(PrimitiveType::Date),
+        "time" => Type::Primitive(PrimitiveType::Time),
+        "binary" | "blob" => Type::Primitive(PrimitiveType::Binary),
         other => {
             return Err(PyValueError::new_err(format!(
                 "unsupported add_column type `{other}` (expected one of \
-                 variant/string/long/int/double/boolean/timestamp/date)"
+                 variant/string/long/int/double/boolean/timestamp/date/time/\
+                 binary/decimal(p,s))"
             )));
         }
     })
