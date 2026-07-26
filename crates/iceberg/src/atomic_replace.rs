@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
 use crate::delete_vector::DeleteVector;
-use crate::expr::Reference;
+use crate::expr::{Predicate, Reference};
 use crate::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use crate::scan::FileScanTask;
 use crate::spec::{
@@ -322,7 +322,9 @@ pub async fn atomic_partition_replace(
         if batch.num_rows() == 0 {
             continue;
         }
-        eq_writer.write(conform_batch(&batch, &target_arrow)?).await?;
+        eq_writer
+            .write(conform_batch(&batch, &target_arrow)?)
+            .await?;
     }
     let delete_files = eq_writer.close().await?;
 
@@ -366,6 +368,66 @@ fn is_commit_conflict(e: &Error) -> bool {
     e.kind() == ErrorKind::CatalogCommitConflicts
         || e.to_string()
             .contains("Found conflicting concurrent commit")
+}
+
+/// How a scan-based replace matches a chunk's prior rows against the
+/// (stringified) key column. Two shapes, one scan/DV/commit path:
+///
+/// - [`KeyMatcher::Prefix`] — `starts_with(key, prefix)`; the ObjectId-hex
+///   chunk shape (`{"$oid": "<hex>…`).
+/// - [`KeyMatcher::I64Range`] — inclusive numeric range on a stringified
+///   integer key (`str(_id)` for document stores with Int64 keys). A
+///   numeric range is inexpressible as a string prefix, and lexicographic
+///   string ordering diverges from numeric ordering across digit lengths —
+///   so the row-wise match parses each key as i64 (unparseable keys never
+///   match). For PLANNING, when `lo` and `hi` have the same digit count
+///   (and are non-negative) a lexicographic string-range predicate is
+///   emitted: over equal-length decimal strings lex == numeric, and every
+///   numeric match has that length, so the bounds are a SUPERSET of the
+///   numeric range (shorter/longer keys that lex-fall inside are false
+///   positives the row filter drops). Mixed-length bounds plan on the
+///   partition + op predicates only (correct, less pruning).
+#[derive(Debug, Clone)]
+pub enum KeyMatcher {
+    /// `starts_with(key_column, .0)`.
+    Prefix(String),
+    /// `.0 <= parse::<i64>(key_column) <= .1`, inclusive.
+    I64Range(i64, i64),
+}
+
+impl KeyMatcher {
+    fn planning_predicate(&self, key_column: &str) -> Option<Predicate> {
+        match self {
+            KeyMatcher::Prefix(p) => {
+                Some(Reference::new(key_column).starts_with(Datum::string(p.clone())))
+            }
+            KeyMatcher::I64Range(lo, hi) => {
+                let (lo_s, hi_s) = (lo.to_string(), hi.to_string());
+                if *lo >= 0 && lo_s.len() == hi_s.len() {
+                    Some(
+                        Reference::new(key_column)
+                            .greater_than_or_equal_to(Datum::string(lo_s))
+                            .and(
+                                Reference::new(key_column)
+                                    .less_than_or_equal_to(Datum::string(hi_s)),
+                            ),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn matches(&self, key: &str) -> bool {
+        match self {
+            KeyMatcher::Prefix(p) => key.starts_with(p.as_str()),
+            KeyMatcher::I64Range(lo, hi) => key
+                .trim()
+                .parse::<i64>()
+                .is_ok_and(|k| *lo <= k && k <= *hi),
+        }
+    }
 }
 
 /// Atomically replace one KEY-PREFIX chunk of an identity partition — the
@@ -414,6 +476,83 @@ pub async fn atomic_partition_replace_prefix(
     partition_value: bool,
     key_column: &str,
     key_prefix: &str,
+    op_column: Option<&str>,
+    op_values: &[String],
+    input: impl Into<ReplaceInput>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
+    atomic_partition_replace_scan(
+        catalog,
+        ident,
+        partition_column,
+        partition_value,
+        key_column,
+        &KeyMatcher::Prefix(key_prefix.to_string()),
+        op_column,
+        op_values,
+        input,
+        max_attempts,
+        dry_run,
+    )
+    .await
+}
+
+/// Atomically replace one NUMERIC-RANGE chunk of an identity partition —
+/// the [`atomic_partition_replace_prefix`] sibling for document stores
+/// whose keys are Int64 (stringified into the key column, e.g.
+/// `_cdc.key = "28753650"`). Hex-prefix chunks are inexpressible for
+/// numeric keys (lexicographic ≠ numeric across digit lengths), so the
+/// chunk scope is `key_lo <= key <= key_hi` inclusive, matched by parsing
+/// each key row-wise (see [`KeyMatcher::I64Range`] for the planning-bounds
+/// contract — chunk planners SHOULD emit same-digit-length ranges so file
+/// pruning engages). Same scan + consolidated-DV + one-RowDelta semantics,
+/// guards, retry, and zero-row-still-deletes behavior as the prefix mode.
+#[allow(clippy::too_many_arguments)]
+pub async fn atomic_partition_replace_key_range(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: bool,
+    key_column: &str,
+    key_lo: i64,
+    key_hi: i64,
+    op_column: Option<&str>,
+    op_values: &[String],
+    input: impl Into<ReplaceInput>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
+    if key_lo > key_hi {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("key range is inverted: lo {key_lo} > hi {key_hi}"),
+        ));
+    }
+    atomic_partition_replace_scan(
+        catalog,
+        ident,
+        partition_column,
+        partition_value,
+        key_column,
+        &KeyMatcher::I64Range(key_lo, key_hi),
+        op_column,
+        op_values,
+        input,
+        max_attempts,
+        dry_run,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn atomic_partition_replace_scan(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: bool,
+    key_column: &str,
+    matcher: &KeyMatcher,
     op_column: Option<&str>,
     op_values: &[String],
     input: impl Into<ReplaceInput>,
@@ -567,9 +706,10 @@ pub async fn atomic_partition_replace_prefix(
         //    tasks below — the arrow row filter rejects nested (non-root)
         //    predicate columns — and re-applied row-wise in the collect
         //    loop over the projected key/op ancestor column.
-        let mut filter = Reference::new(partition_column)
-            .equal_to(Datum::bool(partition_value))
-            .and(Reference::new(key_column).starts_with(Datum::string(key_prefix)));
+        let mut filter = Reference::new(partition_column).equal_to(Datum::bool(partition_value));
+        if let Some(key_pred) = matcher.planning_predicate(key_column) {
+            filter = filter.and(key_pred);
+        }
         if let Some(op_col) = op_column {
             filter = filter.and(
                 Reference::new(op_col).is_in(op_values.iter().map(|v| Datum::string(v.clone()))),
@@ -667,7 +807,7 @@ pub async fn atomic_partition_replace_prefix(
             let keys = string_leaf(&batch, key_column)?;
             let ops = op_column.map(|c| string_leaf(&batch, c)).transpose()?;
             for row in 0..batch.num_rows() {
-                if keys.is_null(row) || !keys.value(row).starts_with(key_prefix) {
+                if keys.is_null(row) || !matcher.matches(keys.value(row)) {
                     continue;
                 }
                 if let Some(ops) = &ops
@@ -784,12 +924,15 @@ fn string_leaf<'a>(batch: &'a RecordBatch, dotted: &str) -> Result<&'a StringArr
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("column `{root}`: {e}")))?,
     );
     for part in parts {
-        let s = current.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("`{dotted}`: `{part}`'s parent is not a struct"),
-            )
-        })?;
+        let s = current
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("`{dotted}`: `{part}`'s parent is not a struct"),
+                )
+            })?;
         current = s.column_by_name(part).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,

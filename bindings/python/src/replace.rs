@@ -28,7 +28,8 @@ use std::io::Cursor;
 
 use arrow::array::RecordBatch;
 use iceberg::atomic_replace::{
-    ReplaceInput, atomic_partition_replace, atomic_partition_replace_prefix,
+    ReplaceInput, atomic_partition_replace, atomic_partition_replace_key_range,
+    atomic_partition_replace_prefix,
 };
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -239,10 +240,98 @@ fn bronze_replace_prefix(
     })
 }
 
+/// Atomically replace one NUMERIC-KEY-RANGE chunk of the `partition_column
+/// = partition_value` identity partition — the `bronze_replace_prefix`
+/// sibling for document stores whose keys are Int64 stringified into the
+/// key column (`_cdc.key = "28753650"`): hex-prefix chunks cannot express a
+/// numeric range (lexicographic ≠ numeric across digit lengths), so prior
+/// rows with `key_lo <= int(key) <= key_hi` (inclusive; unparseable keys
+/// never match; `op_column IN op_values` when given) are deleted via scan +
+/// consolidated V3 DELETION VECTORS and the input rows appended, as ONE
+/// RowDelta snapshot at snapshot isolation with rescan-retry.
+///
+/// File-level planning bounds engage only when `key_lo`/`key_hi` have the
+/// same digit count — chunk planners SHOULD emit same-length ranges. Same
+/// zero-row-still-deletes / `dry_run` / return-shape contract as
+/// `bronze_replace_prefix`.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, batches_ipc, key_lo, key_hi, key_column="_cdc.key".to_string(), op_column=Some("_cdc.op".to_string()), op_values=vec!["R".to_string(), "r".to_string()], partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false, parquet_path=None))]
+#[allow(clippy::too_many_arguments)]
+fn bronze_replace_range(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    batches_ipc: Vec<u8>,
+    key_lo: i64,
+    key_hi: i64,
+    key_column: String,
+    op_column: Option<String>,
+    op_values: Vec<String>,
+    partition_column: String,
+    partition_value: bool,
+    max_retries: u32,
+    dry_run: bool,
+    parquet_path: Option<String>,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    if key_lo > key_hi {
+        return Err(PyValueError::new_err(format!(
+            "key range is inverted: key_lo {key_lo} > key_hi {key_hi}"
+        )));
+    }
+    let input = replace_input(&batches_ipc, parquet_path)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let outcome = atomic_partition_replace_key_range(
+                catalog.as_ref(),
+                &ident,
+                &partition_column,
+                partition_value,
+                &key_column,
+                key_lo,
+                key_hi,
+                op_column.as_deref(),
+                &op_values,
+                input,
+                max_retries,
+                dry_run,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("atomic range replace: {e}")))?;
+            Ok(HashMap::from([
+                (
+                    "snapshot_id".to_string(),
+                    outcome
+                        .snapshot_id
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "rows_appended".to_string(),
+                    outcome.rows_appended.to_string(),
+                ),
+                (
+                    "delete_tuples_est".to_string(),
+                    outcome.delete_tuples.to_string(),
+                ),
+                ("attempts".to_string(), outcome.attempts.to_string()),
+            ]))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "replace")?;
     this.add_function(wrap_pyfunction!(bronze_replace, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_prefix, &this)?)?;
+    this.add_function(wrap_pyfunction!(bronze_replace_range, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
