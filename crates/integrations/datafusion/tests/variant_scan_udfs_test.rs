@@ -84,7 +84,7 @@ fn doc_string(s: &str) -> VariantBytes {
 fn canonical_fields() -> Fields {
     Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
     ])
 }
 

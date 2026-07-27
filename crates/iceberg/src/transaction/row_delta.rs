@@ -886,7 +886,7 @@ mod tests {
 
         // A PositionDeletes entry must exist in the new snapshot's manifests.
         let manifest_list = table_s1
-            .manifest_list_reader(&std::sync::Arc::new(snap_s2.clone()))
+            .manifest_list_reader(&Arc::new(snap_s2.clone()))
             .load()
             .await
             .unwrap();
@@ -968,7 +968,7 @@ mod tests {
 
         // Scan all manifest entries in S2
         let manifest_list = table_s1
-            .manifest_list_reader(&std::sync::Arc::new(snapshot_s2.clone()))
+            .manifest_list_reader(&Arc::new(snapshot_s2.clone()))
             .load()
             .await
             .unwrap();

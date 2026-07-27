@@ -110,7 +110,7 @@ fn variant_long(v: i64) -> VariantBytes {
 fn arrow_schema() -> Arc<ArrowSchema> {
     let variant_fields = Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
     ]);
     Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
@@ -138,7 +138,7 @@ fn batch(rows: Vec<(i32, Option<VariantBytes>)>) -> RecordBatch {
     let validity = NullBuffer::from(rows.iter().map(|(_, v)| v.is_some()).collect::<Vec<_>>());
     let variant_fields = Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
     ]);
     let doc = StructArray::new(
         variant_fields,
@@ -422,7 +422,7 @@ fn jsons_of(rows: &[(i32, Option<VariantBytes>)]) -> Vec<(i32, Option<String>)> 
         let validity = NullBuffer::from(rows.iter().map(|(_, v)| v.is_some()).collect::<Vec<_>>());
         let fields = Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
         ]);
         Arc::new(StructArray::new(
             fields,

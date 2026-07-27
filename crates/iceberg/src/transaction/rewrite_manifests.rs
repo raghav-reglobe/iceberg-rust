@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(props.get("manifests-kept").map(String::as_str), Some("0"));
 
         let list_s3 = table_s2
-            .manifest_list_reader(&std::sync::Arc::new(snap3.clone()))
+            .manifest_list_reader(&Arc::new(snap3.clone()))
             .load()
             .await
             .unwrap();
@@ -558,7 +558,7 @@ mod tests {
         };
 
         let list_s3 = table_s2
-            .manifest_list_reader(&std::sync::Arc::new(snap3.clone()))
+            .manifest_list_reader(&Arc::new(snap3.clone()))
             .load()
             .await
             .unwrap();
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(props.get("manifests-kept").map(String::as_str), Some("1"));
 
         let list_s4 = table_s3
-            .manifest_list_reader(&std::sync::Arc::new(snap4.clone()))
+            .manifest_list_reader(&Arc::new(snap4.clone()))
             .load()
             .await
             .unwrap();

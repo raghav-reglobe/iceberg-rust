@@ -769,7 +769,7 @@ mod replace_api {
 
         // Zero-row parquet input -> no-op (no snapshot, no writers).
         let empty = warehouse.path().join("empty-input.parquet");
-        let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+        let w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
             std::fs::File::create(&empty).unwrap(),
             batch.schema(),
             None,

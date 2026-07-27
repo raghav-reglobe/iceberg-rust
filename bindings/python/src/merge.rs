@@ -28,9 +28,11 @@
 //! authenticated clients instead of re-fetching config/tokens per call.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use datafusion::arrow::array::UInt64Array;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -347,7 +349,7 @@ async fn session_with_catalogs(
 async fn doorway_deadline<T>(
     deadline: Option<std::time::Instant>,
     what: &str,
-    fut: impl std::future::Future<Output = T>,
+    fut: impl Future<Output = T>,
 ) -> PyResult<T> {
     match deadline {
         None => Ok(fut.await),
@@ -442,9 +444,7 @@ fn merge_into(
             let mut count: u64 = 0;
             for batch in &batches {
                 if let Some(col) = batch.column_by_name("count")
-                    && let Some(arr) = col
-                        .as_any()
-                        .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
                 {
                     count += arr.iter().flatten().sum::<u64>();
                 }
@@ -559,7 +559,7 @@ fn sql_collect(
             }
             let mut buf = Vec::new();
             {
-                let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+                let mut writer = arrow::json::ArrayWriter::new(&mut buf);
                 for batch in &batches {
                     writer
                         .write(batch)
@@ -630,7 +630,7 @@ fn sql_collect_ipc(
             let mut buf = Vec::new();
             {
                 let mut writer =
-                    datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+                    arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
                         .map_err(|e| {
                             PyValueError::new_err(format!("serializing rows: {e}"))
                         })?;

@@ -378,7 +378,7 @@ mod tests {
     fn canonical_type() -> DataType {
         DataType::Struct(Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
         ]))
     }
 

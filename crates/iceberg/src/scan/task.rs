@@ -118,6 +118,19 @@ pub struct FileScanTask {
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
+
+    /// Key metadata for encrypted data files (Parquet Modular Encryption).
+    /// When present, the reader uses this to build `FileDecryptionProperties`.
+    ///
+    /// Note on the trust boundary: for the standard encryption scheme this
+    /// carries `StandardKeyMetadata`, whose payload is the *plaintext* DEK.
+    /// Because `FileScanTask` derives `Serialize`, that plaintext DEK is part
+    /// of the serialized scan plan should these tasks ever be serialized and sent
+    /// over the network.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub key_metadata: Option<Box<[u8]>>,
 }
 
 impl FileScanTask {
@@ -165,6 +178,13 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_referenced_data_file(ctx.manifest_entry.data_file().referenced_data_file())
             .with_content_offset(ctx.manifest_entry.data_file().content_offset())
             .with_content_size_in_bytes(ctx.manifest_entry.data_file().content_size_in_bytes())
+            .with_key_metadata(
+                ctx.manifest_entry
+                    .data_file
+                    .key_metadata
+                    .as_deref()
+                    .map(Box::from),
+            )
             .build()
     }
 }
@@ -208,4 +228,14 @@ pub struct FileScanTaskDeleteFile {
     /// `content_size_in_bytes`). `None` for positional/equality delete files.
     #[builder(default)]
     pub content_size_in_bytes: Option<i64>,
+    /// Key metadata for encrypted delete files (Parquet Modular Encryption).
+    /// When present, the reader uses this to build `FileDecryptionProperties`.
+    ///
+    /// Same plaintext-DEK trust boundary as [`FileScanTask::key_metadata`]:
+    /// this is serialized into the scan plan and crosses the planner -> worker
+    /// channel in the clear for the standard encryption scheme.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub key_metadata: Option<Box<[u8]>>,
 }

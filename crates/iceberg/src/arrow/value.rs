@@ -860,10 +860,10 @@ pub(crate) fn create_primitive_array_single_element(
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(arrow_array::StructArray::new(
+            Ok(Arc::new(StructArray::new(
                 fields.clone(),
                 null_arrays,
-                Some(arrow_buffer::NullBuffer::new_null(1)),
+                Some(NullBuffer::new_null(1)),
             )))
         }
         _ => Err(Error::new(
@@ -903,6 +903,9 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::Date32, None) => {
             let vals: Vec<Option<i32>> = vec![None; num_rows];
             Arc::new(Date32Array::from(vals))
+        }
+        (DataType::Int64, Some(PrimitiveLiteral::Int(value))) => {
+            Arc::new(Int64Array::from(vec![i64::from(*value); num_rows]))
         }
         (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Int64Array::from(vec![*value; num_rows]))
@@ -1053,7 +1056,7 @@ pub(crate) fn create_primitive_array_repeated(
         (dt, _) => {
             return Err(Error::new(
                 ErrorKind::Unexpected,
-                format!("unexpected target column type {dt}"),
+                format!("unexpected target column type {dt}, prim_lit {prim_lit:?}"),
             ));
         }
     })

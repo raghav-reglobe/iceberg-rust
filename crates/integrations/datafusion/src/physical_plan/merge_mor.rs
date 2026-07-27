@@ -44,6 +44,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -219,7 +220,7 @@ fn deadline_error(what: &str) -> DataFusionError {
 async fn with_deadline<T>(
     deadline: Option<std::time::Instant>,
     what: &str,
-    fut: impl std::future::Future<Output = T>,
+    fut: impl Future<Output = T>,
 ) -> DFResult<T> {
     match deadline {
         None => Ok(fut.await),

@@ -983,7 +983,7 @@ mod tests {
 
     fn simple_predicate(schema: SchemaRef) -> BoundPredicate {
         Reference::new("x")
-            .greater_than(crate::spec::Datum::int(0))
+            .greater_than(Datum::int(0))
             .bind(schema.clone(), false)
             .unwrap()
     }
@@ -1227,7 +1227,7 @@ mod tests {
         ])
         .unwrap();
 
-        let file = std::fs::File::create(&file_path).unwrap();
+        let file = File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
         // Truly exercising a file without column/offset index
         {
             use parquet::file::reader::{FileReader, SerializedFileReader};
-            let f = std::fs::File::open(&file_path).unwrap();
+            let f = File::open(&file_path).unwrap();
             let rdr = SerializedFileReader::new(f).unwrap();
             assert!(
                 rdr.metadata().column_index().is_none(),
@@ -1275,6 +1275,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            key_metadata: None,
         };
 
         let stream = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1331,7 +1332,7 @@ mod tests {
             .set_statistics_enabled(EnabledStatistics::None)
             .build();
 
-        let pos_del_file = std::fs::File::create(&pos_del_path).unwrap();
+        let pos_del_file = File::create(&pos_del_path).unwrap();
         let mut pos_del_writer = ArrowWriter::try_new(
             pos_del_file,
             pos_del_arrow_schema.clone(),
@@ -1371,11 +1372,13 @@ mod tests {
                 referenced_data_file: None,
                 content_offset: None,
                 content_size_in_bytes: None,
+                key_metadata: None,
             }],
             partition: None,
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            key_metadata: None,
         };
 
         let stream_sub2 =
@@ -1692,10 +1695,7 @@ mod row_position_range_tests {
                         .with_data_file_path(file_path.clone())
                         .with_data_file_format(DataFileFormat::Parquet)
                         .with_schema(schema.clone())
-                        .with_project_field_ids(vec![
-                            1,
-                            crate::metadata_columns::RESERVED_FIELD_ID_POS,
-                        ])
+                        .with_project_field_ids(vec![1, RESERVED_FIELD_ID_POS])
                         .with_case_sensitive(false)
                         .build())
                 })

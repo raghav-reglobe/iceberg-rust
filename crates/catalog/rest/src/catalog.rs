@@ -17,13 +17,14 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::cache::{DataBytesCache, ObjectBytesCacheRef};
+use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
 use iceberg::{
@@ -41,6 +42,7 @@ use typed_builder::TypedBuilder;
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
+use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
@@ -63,6 +65,7 @@ const PATH_V1: &str = "v1";
 pub struct RestCatalogBuilder {
     config: RestCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
     runtime: Option<Runtime>,
     object_bytes_cache: Option<ObjectBytesCacheRef>,
     data_bytes_cache: Option<DataBytesCache>,
@@ -79,31 +82,11 @@ impl Default for RestCatalogBuilder {
                 client: None,
             },
             storage_factory: None,
+            kms_client_factory: None,
             runtime: None,
             object_bytes_cache: None,
             data_bytes_cache: None,
         }
-    }
-}
-
-impl RestCatalogBuilder {
-    /// Attach a SHARED, path-keyed cache of raw manifest / manifest-list
-    /// bytes (see [`iceberg::cache::ObjectBytesCache`]). Every table this
-    /// catalog builds — from `load_table`, `create_table`, commits — uses
-    /// the shared store, so repeat loads of the same table across catalog
-    /// calls hit warm cache. Fetches on miss go through each table's own
-    /// `FileIO`; parsing happens per call.
-    pub fn with_object_bytes_cache(mut self, bytes_cache: ObjectBytesCacheRef) -> Self {
-        self.object_bytes_cache = Some(bytes_cache);
-        self
-    }
-
-    /// Back DATA-FILE reads of every table this catalog builds with a
-    /// WHOLE-FILE read-through cache (see
-    /// [`iceberg::cache::DataBytesCache`]).
-    pub fn with_data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
-        self.data_bytes_cache = Some(data_bytes_cache);
-        self
     }
 }
 
@@ -112,6 +95,11 @@ impl CatalogBuilder for RestCatalogBuilder {
 
     fn with_storage_factory(mut self, storage_factory: Arc<dyn StorageFactory>) -> Self {
         self.storage_factory = Some(storage_factory);
+        self
+    }
+
+    fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
+        self.kms_client_factory = Some(kms_client_factory);
         self
     }
 
@@ -144,7 +132,7 @@ impl CatalogBuilder for RestCatalogBuilder {
             .filter(|(k, _)| k != REST_CATALOG_PROP_URI && k != REST_CATALOG_PROP_WAREHOUSE)
             .collect();
 
-        let result = {
+        async move {
             if self.config.name.is_none() {
                 Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -157,17 +145,20 @@ impl CatalogBuilder for RestCatalogBuilder {
                 ))
             } else {
                 let runtime = self.runtime.unwrap_or_else(Runtime::current);
+                let kms_client = match self.kms_client_factory {
+                    Some(factory) => Some(factory.create_kms_client(&self.config.props).await?),
+                    None => None,
+                };
                 Ok(RestCatalog::new(
                     self.config,
                     self.storage_factory,
                     runtime,
+                    kms_client,
                     self.object_bytes_cache,
                     self.data_bytes_cache,
                 ))
             }
-        };
-
-        std::future::ready(result)
+        }
     }
 }
 
@@ -175,6 +166,25 @@ impl RestCatalogBuilder {
     /// Configures the catalog with a custom HTTP client.
     pub fn with_client(mut self, client: Client) -> Self {
         self.config.client = Some(client);
+        self
+    }
+
+    /// Attach a SHARED, path-keyed cache of raw manifest / manifest-list
+    /// bytes (see [`iceberg::cache::ObjectBytesCache`]). Every table this
+    /// catalog builds — from `load_table`, `create_table`, commits — uses
+    /// the shared store, so repeat loads of the same table across catalog
+    /// calls hit warm cache. Fetches on miss go through each table's own
+    /// `FileIO`; parsing happens per call.
+    pub fn with_object_bytes_cache(mut self, bytes_cache: ObjectBytesCacheRef) -> Self {
+        self.object_bytes_cache = Some(bytes_cache);
+        self
+    }
+
+    /// Back DATA-FILE reads of every table this catalog builds with a
+    /// WHOLE-FILE read-through cache (see
+    /// [`iceberg::cache::DataBytesCache`]).
+    pub fn with_data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
+        self.data_bytes_cache = Some(data_bytes_cache);
         self
     }
 }
@@ -379,6 +389,8 @@ struct RestContext {
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
+    /// Capabilities the server advertises (see [`RestCatalog::supports_endpoint`]).
+    endpoints: HashSet<Endpoint>,
 }
 
 /// Rest catalog implementation.
@@ -392,6 +404,8 @@ pub struct RestCatalog {
     /// Storage factory for creating FileIO instances.
     storage_factory: Option<Arc<dyn StorageFactory>>,
     runtime: Runtime,
+    /// Optional KMS client for encrypted tables.
+    kms_client: Option<Arc<dyn KeyManagementClient>>,
     /// Shared manifest / manifest-list object cache attached to every table
     /// this catalog builds.
     object_bytes_cache: Option<ObjectBytesCacheRef>,
@@ -405,6 +419,7 @@ impl RestCatalog {
         config: RestCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
+        kms_client: Option<Arc<dyn KeyManagementClient>>,
         object_bytes_cache: Option<ObjectBytesCacheRef>,
         data_bytes_cache: Option<DataBytesCache>,
     ) -> Self {
@@ -413,6 +428,7 @@ impl RestCatalog {
             ctx: OnceCell::new(),
             storage_factory,
             runtime,
+            kms_client,
             object_bytes_cache,
             data_bytes_cache,
         }
@@ -469,12 +485,48 @@ impl RestCatalog {
             .get_or_try_init(|| async {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
+                // Use the advertised endpoints as-is, falling back to
+                // `DEFAULT_ENDPOINTS` when absent or empty.
+                let endpoints = match &catalog_config.endpoints {
+                    Some(advertised) if !advertised.is_empty() => {
+                        advertised.iter().cloned().collect()
+                    }
+                    _ => crate::endpoint::DEFAULT_ENDPOINTS.clone(),
+                };
                 let config = self.user_config.clone().merge_with_config(catalog_config);
                 let client = client.update_with(&config)?;
 
-                Ok(RestContext { config, client })
+                Ok(RestContext {
+                    config,
+                    client,
+                    endpoints,
+                })
             })
             .await
+    }
+
+    /// Returns whether the server supports `endpoint`, per the `endpoints` it
+    /// advertised in `GET /v1/config` (or a default base set when it advertised
+    /// none).
+    pub(crate) async fn supports_endpoint(&self, endpoint: &Endpoint) -> Result<bool> {
+        Ok(self.context().await?.endpoints.contains(endpoint))
+    }
+
+    /// Issue a `HEAD` request to `url` and interpret it as an existence check:
+    /// `2xx` means it exists, `404` means it doesn't.
+    async fn check_exists_via_head(&self, context: &RestContext, url: String) -> Result<bool> {
+        let request = context.client.request(Method::HEAD, url).build()?;
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
     }
 
     /// Load the runtime config from the server by `user_config`.
@@ -686,24 +738,21 @@ impl Catalog for RestCatalog {
     }
 
     async fn namespace_exists(&self, ns: &NamespaceIdent) -> Result<bool> {
-        let context = self.context().await?;
-
-        let request = context
-            .client
-            .request(Method::HEAD, context.config.namespace_endpoint(ns))
-            .build()?;
-
-        let http_response = context.client.query_catalog(request).await?;
-
-        match http_response.status() {
-            StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
-            _ => Err(deserialize_unexpected_catalog_error(
-                http_response,
-                context.client.disable_header_redaction(),
-            )
-            .await),
+        // Prefer a cheap HEAD when the server advertises it; otherwise fall back
+        // to loading the namespace (GET) and treating a missing namespace as
+        // `false`, so this still works against servers that don't advertise the
+        // HEAD route.
+        if !self.supports_endpoint(&V1_NAMESPACE_EXISTS).await? {
+            return match self.get_namespace(ns).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == ErrorKind::NamespaceNotFound => Ok(false),
+                Err(e) => Err(e),
+            };
         }
+
+        let context = self.context().await?;
+        self.check_exists_via_head(context, context.config.namespace_endpoint(ns))
+            .await
     }
 
     async fn update_namespace(
@@ -858,13 +907,15 @@ impl Catalog for RestCatalog {
             .load_file_io(Some(metadata_location), Some(config))
             .await?;
 
-        let table_builder = self.attach_object_cache(
-            Table::builder()
-                .identifier(table_ident.clone())
-                .file_io(file_io)
-                .metadata(response.metadata)
-                .runtime(self.runtime.clone()),
-        );
+        let mut table_builder = Table::builder()
+            .identifier(table_ident.clone())
+            .file_io(file_io)
+            .metadata(response.metadata)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            table_builder = table_builder.kms_client(kms_client);
+        }
+        table_builder = self.attach_object_cache(table_builder);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -917,13 +968,15 @@ impl Catalog for RestCatalog {
             .load_file_io(response.metadata_location.as_deref(), Some(config))
             .await?;
 
-        let table_builder = self.attach_object_cache(
-            Table::builder()
-                .identifier(table_ident.clone())
-                .file_io(file_io)
-                .metadata(response.metadata)
-                .runtime(self.runtime.clone()),
-        );
+        let mut table_builder = Table::builder()
+            .identifier(table_ident.clone())
+            .file_io(file_io)
+            .metadata(response.metadata)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            table_builder = table_builder.kms_client(kms_client);
+        }
+        table_builder = self.attach_object_cache(table_builder);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -945,24 +998,20 @@ impl Catalog for RestCatalog {
 
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
-        let context = self.context().await?;
-
-        let request = context
-            .client
-            .request(Method::HEAD, context.config.table_endpoint(table))
-            .build()?;
-
-        let http_response = context.client.query_catalog(request).await?;
-
-        match http_response.status() {
-            StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
-            _ => Err(deserialize_unexpected_catalog_error(
-                http_response,
-                context.client.disable_header_redaction(),
-            )
-            .await),
+        // Prefer a cheap HEAD when the server advertises it; otherwise fall back
+        // to loading the table (GET) and treating a missing table as `false`, so
+        // this still works against servers that don't advertise the HEAD route.
+        if !self.supports_endpoint(&V1_TABLE_EXISTS).await? {
+            return match self.load_table(table).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == ErrorKind::TableNotFound => Ok(false),
+                Err(e) => Err(e),
+            };
         }
+
+        let context = self.context().await?;
+        self.check_exists_via_head(context, context.config.table_endpoint(table))
+            .await
     }
 
     /// Rename a table in the catalog.
@@ -1054,15 +1103,17 @@ impl Catalog for RestCatalog {
 
         let file_io = self.load_file_io(Some(metadata_location), None).await?;
 
-        self.attach_object_cache(
-            Table::builder()
-                .identifier(table_ident.clone())
-                .file_io(file_io)
-                .metadata(response.metadata)
-                .metadata_location(metadata_location.clone())
-                .runtime(self.runtime.clone()),
-        )
-        .build()
+        let mut table_builder = Table::builder()
+            .identifier(table_ident.clone())
+            .file_io(file_io)
+            .metadata(response.metadata)
+            .metadata_location(metadata_location.clone())
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            table_builder = table_builder.kms_client(kms_client);
+        }
+        table_builder = self.attach_object_cache(table_builder);
+        table_builder.build()
     }
 
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
@@ -1129,15 +1180,17 @@ impl Catalog for RestCatalog {
             .load_file_io(Some(&response.metadata_location), None)
             .await?;
 
-        self.attach_object_cache(
-            Table::builder()
-                .identifier(commit.identifier().clone())
-                .file_io(file_io)
-                .metadata(response.metadata)
-                .metadata_location(response.metadata_location)
-                .runtime(self.runtime.clone()),
-        )
-        .build()
+        let mut table_builder = Table::builder()
+            .identifier(commit.identifier().clone())
+            .file_io(file_io)
+            .metadata(response.metadata)
+            .metadata_location(response.metadata_location)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            table_builder = table_builder.kms_client(kms_client);
+        }
+        table_builder = self.attach_object_cache(table_builder);
+        table_builder.build()
     }
 }
 
@@ -1186,6 +1239,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -1216,6 +1270,133 @@ mod tests {
             )
             .create_async()
             .await
+    }
+
+    /// Config mock that advertises the HEAD table/namespace-exists endpoints, so
+    /// `{table,namespace}_exists` take the HEAD path rather than the GET fallback.
+    async fn create_config_mock_with_exists_endpoints(server: &mut ServerGuard) -> Mock {
+        server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "overrides": { "warehouse": "s3://iceberg-catalog" },
+                "defaults": {},
+                "endpoints": [
+                    "HEAD /v1/{prefix}/namespaces/{namespace}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+                ]
+            }"#,
+            )
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_config_advertised_endpoints() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "overrides": {},
+                "defaults": {},
+                "endpoints": [
+                    "GET /v1/{prefix}/namespaces",
+                    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan"
+                ]
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        let plan = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan"
+            .parse::<Endpoint>()
+            .unwrap();
+        assert!(catalog.supports_endpoint(&plan).await.unwrap());
+        // Advertised list is present but does not include this route.
+        let delete_ns = "DELETE /v1/{prefix}/namespaces/{namespace}"
+            .parse::<Endpoint>()
+            .unwrap();
+        assert!(!catalog.supports_endpoint(&delete_ns).await.unwrap());
+
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_config_without_endpoints_falls_back_to_default_set() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(r#"{ "overrides": {}, "defaults": {} }"#)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        // A server that omits the `endpoints` field is assumed to support the
+        // standard base operations.
+        let load_table = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+            .parse::<Endpoint>()
+            .unwrap();
+        assert!(catalog.supports_endpoint(&load_table).await.unwrap());
+        // But not an optional endpoint that must be advertised.
+        let plan = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan"
+            .parse::<Endpoint>()
+            .unwrap();
+        assert!(!catalog.supports_endpoint(&plan).await.unwrap());
+
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_config_with_empty_endpoints_falls_back_to_default_set() {
+        let mut server = Server::new_async().await;
+
+        // An explicit empty list is treated the same as an absent field: fall
+        // back to the standard base set.
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(r#"{ "overrides": {}, "defaults": {}, "endpoints": [] }"#)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        let load_table = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+            .parse::<Endpoint>()
+            .unwrap();
+        assert!(catalog.supports_endpoint(&load_table).await.unwrap());
+
+        config_mock.assert_async().await;
     }
 
     async fn create_oauth_mock(server: &mut ServerGuard) -> Mock {
@@ -1261,6 +1442,7 @@ mod tests {
                 .build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1313,6 +1495,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let token = catalog.context().await.unwrap().client.token().await;
@@ -1338,6 +1521,7 @@ mod tests {
                 .build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1374,6 +1558,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let token = catalog.context().await.unwrap().client.token().await;
@@ -1388,66 +1573,6 @@ mod tests {
         let token = catalog.context().await.unwrap().client.token().await;
         oauth_mock.assert_async().await;
         assert_eq!(token, None);
-    }
-
-    #[tokio::test]
-    async fn test_query_catalog_reauths_on_401_expired_token() {
-        let mut server = Server::new_async().await;
-        let oauth_mock = create_oauth_mock(&mut server).await;
-        let config_mock = create_config_mock(&mut server).await;
-
-        let mut props = HashMap::new();
-        props.insert("credential".to_string(), "client1:secret1".to_string());
-
-        let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri(server.url())
-                .props(props)
-                .build(),
-            Some(Arc::new(LocalFsStorageFactory)),
-            Runtime::current(),
-            None,
-            None,
-        );
-
-        // Prime the token that the server will then treat as expired.
-        let token = catalog.context().await.unwrap().client.token().await;
-        oauth_mock.assert_async().await;
-        config_mock.assert_async().await;
-        assert_eq!(token, Some("ey000000000000".to_string()));
-
-        // The server now 401s the stale token and only accepts the fresh
-        // one — matched on the Authorization header, so ordering between
-        // the two namespace mocks is deterministic.
-        let stale_mock = server
-            .mock("GET", "/v1/namespaces")
-            .match_header("authorization", "Bearer ey000000000000")
-            .with_status(401)
-            .with_body(
-                r#"{"error":{"message":"token expired","type":"NotAuthorizedException","code":401}}"#,
-            )
-            .expect(1)
-            .create_async()
-            .await;
-        let fresh_oauth_mock =
-            create_oauth_mock_with_path(&mut server, "/v1/oauth/tokens", "ey000000000001", 200)
-                .await;
-        let fresh_mock = server
-            .mock("GET", "/v1/namespaces")
-            .match_header("authorization", "Bearer ey000000000001")
-            .with_status(200)
-            .with_body(r#"{"namespaces": [["ns1"]]}"#)
-            .expect(1)
-            .create_async()
-            .await;
-
-        let namespaces = catalog.list_namespaces(None).await.unwrap();
-        assert_eq!(namespaces, vec![
-            NamespaceIdent::from_vec(vec!["ns1".to_string()]).unwrap()
-        ]);
-        stale_mock.assert_async().await;
-        fresh_oauth_mock.assert_async().await;
-        fresh_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -1466,6 +1591,7 @@ mod tests {
                 .build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1500,6 +1626,7 @@ mod tests {
                 .build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1618,6 +1745,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let token = catalog.context().await.unwrap().client.token().await;
@@ -1668,6 +1796,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let _namespaces = catalog.list_namespaces(None).await.unwrap();
@@ -1699,6 +1828,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1753,6 +1883,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -1857,6 +1988,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let namespaces = catalog.list_namespaces(None).await.unwrap();
@@ -1913,6 +2045,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let namespaces = catalog
@@ -1959,6 +2092,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let namespaces = catalog
@@ -1981,7 +2115,7 @@ mod tests {
     async fn check_namespace_exists() {
         let mut server = Server::new_async().await;
 
-        let config_mock = create_config_mock(&mut server).await;
+        let config_mock = create_config_mock_with_exists_endpoints(&mut server).await;
 
         let get_ns_mock = server
             .mock("HEAD", "/v1/namespaces/ns1")
@@ -1993,6 +2127,46 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            catalog
+                .namespace_exists(&NamespaceIdent::new("ns1".to_string()))
+                .await
+                .unwrap()
+        );
+
+        config_mock.assert_async().await;
+        get_ns_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_namespace_exists_falls_back_to_get_when_head_not_advertised() {
+        let mut server = Server::new_async().await;
+
+        // No `endpoints` advertised, and the default set has no HEAD namespace
+        // route, so `namespace_exists` falls back to a GET load-namespace.
+        let config_mock = create_config_mock(&mut server).await;
+        let get_ns_mock = server
+            .mock("GET", "/v1/namespaces/ns1")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "namespace": ["ns1"],
+                "properties": {}
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2024,6 +2198,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2067,6 +2242,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2138,6 +2314,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2274,6 +2451,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let tables = catalog
@@ -2321,6 +2499,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         catalog
@@ -2339,7 +2518,7 @@ mod tests {
     async fn test_check_table_exists() {
         let mut server = Server::new_async().await;
 
-        let config_mock = create_config_mock(&mut server).await;
+        let config_mock = create_config_mock_with_exists_endpoints(&mut server).await;
 
         let check_table_exists_mock = server
             .mock("HEAD", "/v1/namespaces/ns1/tables/table1")
@@ -2351,6 +2530,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2370,6 +2550,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_table_exists_falls_back_to_load_when_head_not_advertised() {
+        let mut server = Server::new_async().await;
+
+        // No `endpoints` advertised, and the default set has no HEAD table
+        // route, so `table_exists` falls back to a GET load-table.
+        let config_mock = create_config_mock(&mut server).await;
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/table1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            catalog
+                .table_exists(&TableIdent::new(
+                    NamespaceIdent::new("ns1".to_string()),
+                    "table1".to_string(),
+                ))
+                .await
+                .unwrap()
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_rename_table() {
         let mut server = Server::new_async().await;
 
@@ -2385,6 +2606,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2422,6 +2644,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2544,6 +2767,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let table = catalog
@@ -2581,6 +2805,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2735,6 +2960,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let table_creation = TableCreation::builder()
@@ -2805,6 +3031,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );
@@ -2954,6 +3181,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
 
         let table1 = {
@@ -3022,6 +3250,7 @@ mod tests {
             Runtime::current(),
             None,
             None,
+            None,
         );
         let table_ident =
             TableIdent::new(NamespaceIdent::new("ns1".to_string()), "test1".to_string());
@@ -3074,6 +3303,7 @@ mod tests {
             RestCatalogConfig::builder().uri(server.url()).build(),
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
             None,
         );

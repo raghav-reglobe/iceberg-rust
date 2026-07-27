@@ -213,6 +213,13 @@ impl ArrowReader {
             return Ok(ProjectionMask::all());
         }
 
+        // NOTE (fork divergence from the upstream #2188 follow-ups): variant
+        // projection is SUPPORTED here — variant leaves (metadata/value and
+        // shredded children, which carry no embedded field ids) are collected
+        // via the DFS below and included in the projection mask, matching
+        // Java's PruneColumns.variant(). Do not reinstate the upstream
+        // reject-on-variant guard.
+
         if use_fallback {
             // Position-based projection necessary because file lacks embedded field IDs
             Self::get_arrow_projection_mask_fallback(field_ids, parquet_schema)
@@ -282,7 +289,7 @@ impl ArrowReader {
 
         // Pre-project only the fields that have been selected, possibly avoiding converting
         // some Arrow types that are not yet supported.
-        let mut projected_fields: HashMap<arrow_schema::FieldRef, i32> = HashMap::new();
+        let mut projected_fields: HashMap<FieldRef, i32> = HashMap::new();
         let projected_arrow_schema = ArrowSchema::new_with_metadata(
             fields.filter_leaves(|_, f| {
                 f.metadata()
@@ -374,6 +381,23 @@ impl ArrowReader {
         } else {
             Ok(ProjectionMask::roots(parquet_schema, root_indices))
         }
+    }
+}
+
+/// Whether `field_type` is, or transitively contains, a variant type.
+fn type_contains_variant(field_type: &Type) -> bool {
+    match field_type {
+        Type::Variant(_) => true,
+        Type::Struct(s) => s
+            .fields()
+            .iter()
+            .any(|f| type_contains_variant(&f.field_type)),
+        Type::List(l) => type_contains_variant(&l.element_field.field_type),
+        Type::Map(m) => {
+            type_contains_variant(&m.key_field.field_type)
+                || type_contains_variant(&m.value_field.field_type)
+        }
+        Type::Primitive(_) => false,
     }
 }
 
@@ -872,7 +896,7 @@ message schema {
                     NestedField::required(
                         1,
                         "parent",
-                        Type::Struct(crate::spec::StructType::new(vec![
+                        Type::Struct(StructType::new(vec![
                             NestedField::required(2, "c2", Type::Primitive(PrimitiveType::String))
                                 .into(),
                             NestedField::required(3, "v", Type::Variant(VariantType)).into(),
@@ -1684,7 +1708,7 @@ message schema {
                     NestedField::required(
                         2,
                         "person",
-                        Type::Struct(crate::spec::StructType::new(vec![
+                        Type::Struct(StructType::new(vec![
                             NestedField::required(
                                 3,
                                 "name",
@@ -2224,7 +2248,7 @@ message schema {
                     NestedField::required(
                         1,
                         "person",
-                        Type::Struct(crate::spec::StructType::new(vec![
+                        Type::Struct(StructType::new(vec![
                             NestedField::required(
                                 5,
                                 "name",
@@ -2243,7 +2267,7 @@ message schema {
                             element_field: NestedField::required(
                                 7,
                                 "element",
-                                Type::Struct(crate::spec::StructType::new(vec![
+                                Type::Struct(StructType::new(vec![
                                     NestedField::required(
                                         8,
                                         "name",
@@ -2440,6 +2464,7 @@ message schema {
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                key_metadata: None,
                 file_size_in_bytes: std::fs::metadata(path).unwrap().len(),
                 start: 0,
                 length: 0,

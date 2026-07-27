@@ -117,7 +117,7 @@ impl DeleteVector {
         let serialized_bitmap_size = self.inner.serialized_size();
         let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap_size) as u32;
         let mut data = Vec::with_capacity(
-            std::mem::size_of_val(&combined_length)
+            size_of_val(&combined_length)
                 + DELETION_VECTOR_MAGIC_BYTES.len()
                 + serialized_bitmap_size
                 + 4,
@@ -189,7 +189,7 @@ impl DeleteVector {
         }
 
         let combined_length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let expected_len = std::mem::size_of_val(&combined_length) + combined_length as usize + 4;
+        let expected_len = size_of_val(&combined_length) + combined_length as usize + 4;
         if expected_len != data.len() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,

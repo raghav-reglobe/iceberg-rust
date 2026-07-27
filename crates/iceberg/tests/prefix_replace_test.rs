@@ -603,7 +603,7 @@ async fn prefix_replace_local_parquet_input() {
 
     // Zero-row file: delete-only (removes the row appended above).
     let empty = warehouse.path().join("empty-input.parquet");
-    let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+    let w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
         std::fs::File::create(&empty).unwrap(),
         b.schema(),
         None,

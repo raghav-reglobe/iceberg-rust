@@ -311,9 +311,9 @@ fn strip_qualifiers(expr: Expr) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     expr.transform(|e| {
         Ok(match e {
-            Expr::Column(c) if c.relation.is_some() => Transformed::yes(Expr::Column(
-                datafusion::common::Column::new_unqualified(c.name),
-            )),
+            Expr::Column(c) if c.relation.is_some() => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+            }
             other => Transformed::no(other),
         })
     })

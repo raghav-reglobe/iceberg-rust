@@ -658,7 +658,7 @@ async fn merge_variant_output_is_annotated_compressed_and_null_faithful() {
 
     let canonical_fields = Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
     ]);
     let doc_array = |rows: &[Option<(Vec<u8>, Vec<u8>)>]| -> ArrayRef {
         let metas = BinaryArray::from_iter_values(
@@ -1087,7 +1087,7 @@ fn doc_with_tags(a: i64, tags: &[i64]) -> (Vec<u8>, Vec<u8>) {
 fn variant_canonical_fields() -> Fields {
     Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
     ])
 }
 
@@ -1807,7 +1807,7 @@ async fn test_scoped_mount_merge_and_out_of_scope_fails() {
     // fresh session with a SCOPED provider: db -> [t] only
     let ctx = SessionContext::new();
     register_variant_functions(&ctx);
-    let provider = iceberg_datafusion::IcebergCatalogProvider::try_new_scoped(
+    let provider = IcebergCatalogProvider::try_new_scoped(
         Arc::clone(&catalog),
         Map::from([(NS.to_string(), vec![TABLE.to_string()])]),
     )
