@@ -43,12 +43,14 @@ fn parse_type(s: &str) -> PyResult<Type> {
     {
         let mut it = args.splitn(2, ',');
         let (p, sc) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
-        let precision: u32 = p.trim().parse().map_err(|_| {
-            PyValueError::new_err(format!("bad decimal precision in `{s}`"))
-        })?;
-        let scale: u32 = sc.trim().parse().map_err(|_| {
-            PyValueError::new_err(format!("bad decimal scale in `{s}`"))
-        })?;
+        let precision: u32 = p
+            .trim()
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("bad decimal precision in `{s}`")))?;
+        let scale: u32 = sc
+            .trim()
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("bad decimal scale in `{s}`")))?;
         return Ok(Type::Primitive(PrimitiveType::Decimal { precision, scale }));
     }
     Ok(match norm.as_str() {

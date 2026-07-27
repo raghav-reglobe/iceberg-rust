@@ -260,7 +260,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
@@ -294,7 +294,7 @@ mod tests {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 1.to_string(),
             )])),
-            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+            Field::new("name", DataType::LargeUtf8, false).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 2.to_string(),
             )])),
@@ -337,7 +337,7 @@ mod tests {
 
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            Arc::new(LargeStringArray::from(vec!["Alice", "Bob", "Charlie"])),
         ])?;
 
         // Write data
@@ -411,7 +411,7 @@ mod tests {
                 .collect();
 
             let int_array = Arc::new(Int32Array::from(int_values)) as ArrayRef;
-            let str_array = Arc::new(StringArray::from(str_values)) as ArrayRef;
+            let str_array = Arc::new(LargeStringArray::from(str_values)) as ArrayRef;
 
             let batch =
                 RecordBatch::try_new(Arc::clone(&arrow_schema_ref), vec![int_array, str_array])

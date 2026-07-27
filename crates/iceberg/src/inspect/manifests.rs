@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::builder::{
-    BooleanBuilder, GenericListBuilder, ListBuilder, PrimitiveBuilder, StringBuilder, StructBuilder,
+    BooleanBuilder, GenericListBuilder, LargeStringBuilder, ListBuilder, PrimitiveBuilder,
+    StructBuilder,
 };
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_schema::{DataType, Field, Fields};
@@ -148,7 +149,7 @@ impl<'a> ManifestsTable<'a> {
         let schema = schema_to_arrow_schema(&self.schema())?;
 
         let mut content = PrimitiveBuilder::<Int32Type>::new();
-        let mut path = StringBuilder::new();
+        let mut path = LargeStringBuilder::new();
         let mut length = PrimitiveBuilder::<Int64Type>::new();
         let mut partition_spec_id = PrimitiveBuilder::<Int32Type>::new();
         let mut added_snapshot_id = PrimitiveBuilder::<Int64Type>::new();
@@ -255,7 +256,7 @@ impl<'a> ManifestsTable<'a> {
                 .append_option(summary.contains_nan);
 
             partition_summaries_builder
-                .field_builder::<StringBuilder>(2)
+                .field_builder::<LargeStringBuilder>(2)
                 .unwrap()
                 .append_option(summary.lower_bound.as_ref().map(|v| {
                     Datum::try_from_bytes(v, field.field_type.as_primitive_type().unwrap().clone())
@@ -263,7 +264,7 @@ impl<'a> ManifestsTable<'a> {
                         .to_string()
                 }));
             partition_summaries_builder
-                .field_builder::<StringBuilder>(3)
+                .field_builder::<LargeStringBuilder>(3)
                 .unwrap()
                 .append_option(summary.upper_bound.as_ref().map(|v| {
                     Datum::try_from_bytes(v, field.field_type.as_primitive_type().unwrap().clone())
@@ -295,7 +296,7 @@ mod tests {
             record_batch.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
                 Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
-                Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
+                Field { "path": LargeUtf8, metadata: {"PARQUET:field_id": "1"} },
                 Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
                 Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
@@ -305,7 +306,7 @@ mod tests {
                 Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
                 Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
                 Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
-                Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
+                Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": LargeUtf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": LargeUtf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
             expect![[r#"
                 content: PrimitiveArray<Int32>
                 [
@@ -363,13 +364,13 @@ mod tests {
                 [
                   false,
                 ]
-                -- child 2: "lower_bound" (Utf8)
-                StringArray
+                -- child 2: "lower_bound" (LargeUtf8)
+                LargeStringArray
                 [
                   "100",
                 ]
-                -- child 3: "upper_bound" (Utf8)
-                StringArray
+                -- child 3: "upper_bound" (LargeUtf8)
+                LargeStringArray
                 [
                   "300",
                 ]

@@ -373,7 +373,7 @@ mod test {
             vec![Arc::new(Int32Array::from_iter_values(vec![1; 1024]))],
             None,
         ));
-        let col2 = Arc::new(arrow_array::StringArray::from_iter_values(vec![
+        let col2 = Arc::new(arrow_array::LargeStringArray::from_iter_values(vec![
             "test";
             1024
         ])) as ArrayRef;
@@ -649,7 +649,7 @@ mod test {
             arrow_array::TimestampNanosecondArray::from(vec![Some(0), Some(1), Some(3)])
                 .with_timezone_utc(),
         ) as ArrayRef;
-        let col10 = Arc::new(arrow_array::StringArray::from(vec![
+        let col10 = Arc::new(arrow_array::LargeStringArray::from(vec![
             Some("a"),
             Some("b"),
             Some("d"),

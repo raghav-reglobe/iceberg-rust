@@ -320,19 +320,22 @@ async fn byte_range_entries_split_one_file_disjoint_and_complete() {
     // ONE file, many tiny row groups (max_row_group_size=2 over 10 rows -> 5 RGs)
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         ParquetWriterBuilder::new(
-            WriterProperties::builder().set_max_row_group_size(2).build(),
+            WriterProperties::builder()
+                .set_max_row_group_size(2)
+                .build(),
             table.metadata().current_schema().clone(),
         ),
         table.file_io().clone(),
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
         DefaultFileNameGenerator::new("rg".to_string(), None, DataFileFormat::Parquet),
     );
-    let mut writer = DataFileWriterBuilder::new(rolling).build(None).await.unwrap();
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .unwrap();
     // FAT rows (incompressible-ish payload) so data bytes >> footer bytes —
     // else every row-group midpoint lands in the first byte-range half.
-    let payloads: Vec<String> = (0..10)
-        .map(|i| format!("{i}-").repeat(2000))
-        .collect();
+    let payloads: Vec<String> = (0..10).map(|i| format!("{i}-").repeat(2000)).collect();
     let rows: Vec<(i32, &str)> = payloads
         .iter()
         .enumerate()
@@ -366,7 +369,10 @@ async fn byte_range_entries_split_one_file_disjoint_and_complete() {
     let all_ids = read_ids(&all, "t").await;
 
     assert_eq!(all_ids, (0..10).collect::<Vec<_>>());
-    assert!(!lo_ids.is_empty() && !hi_ids.is_empty(), "both ranges own rows");
+    assert!(
+        !lo_ids.is_empty() && !hi_ids.is_empty(),
+        "both ranges own rows"
+    );
     let mut union = [lo_ids.clone(), hi_ids.clone()].concat();
     union.sort();
     assert_eq!(union, all_ids, "disjoint + complete cover (no dup, no gap)");

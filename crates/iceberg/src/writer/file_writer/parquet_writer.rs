@@ -1142,7 +1142,7 @@ mod tests {
             ],
             None,
         ));
-        let col2 = Arc::new(arrow_array::StringArray::from_iter_values(
+        let col2 = Arc::new(arrow_array::LargeStringArray::from_iter_values(
             (0..1024).map(|n| n.to_string()),
         )) as ArrayRef;
         let col3 = Arc::new({
@@ -1191,7 +1191,7 @@ mod tests {
         let col5 = Arc::new({
             let mut map_array_builder = MapBuilder::new(
                 None,
-                arrow_array::builder::StringBuilder::new(),
+                arrow_array::builder::LargeStringBuilder::new(),
                 arrow_array::builder::ListBuilder::new(arrow_array::builder::PrimitiveBuilder::<
                     Int64Type,
                 >::new()),
@@ -1371,7 +1371,7 @@ mod tests {
             None,
             Some(3.5),
         ])) as ArrayRef;
-        let col5 = Arc::new(arrow_array::StringArray::from(vec![
+        let col5 = Arc::new(arrow_array::LargeStringArray::from(vec![
             Some("a"),
             Some("b"),
             None,

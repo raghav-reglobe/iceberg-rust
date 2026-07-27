@@ -35,8 +35,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -98,7 +98,7 @@ fn field(id: i32, name: &str, dt: DataType, nullable: bool) -> Field {
 fn scd2_arrow_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
         field(1, "id", DataType::Int32, false),
-        field(2, "val", DataType::Utf8, true),
+        field(2, "val", DataType::LargeUtf8, true),
         field(3, "_valid_from", DataType::Int64, false),
         field(4, "_valid_to", DataType::Int64, true),
         field(5, "_is_current", DataType::Boolean, false),
@@ -112,7 +112,7 @@ fn scd2_batch(rows: &[(i32, &str, i64, Option<i64>, bool, i64)]) -> RecordBatch 
         Arc::new(Int32Array::from(
             rows.iter().map(|r| r.0).collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
+        Arc::new(LargeStringArray::from(
             rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
         )),
         Arc::new(Int64Array::from(
@@ -328,7 +328,11 @@ async fn read_state(ctx: &SessionContext) -> Vec<(i32, String, i64, Option<i64>,
     let mut out = Vec::new();
     for b in &batches {
         let id = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let val = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let val = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         let vf = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let vt = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
         let cur = b.column(4).as_any().downcast_ref::<BooleanArray>().unwrap();

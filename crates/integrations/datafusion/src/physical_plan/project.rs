@@ -344,8 +344,8 @@ mod tests {
             .unwrap();
 
         let struct_fields = Fields::from(vec![
-            Field::new("street", DataType::Utf8, false),
-            Field::new("city", DataType::Utf8, false),
+            Field::new("street", DataType::LargeUtf8, false),
+            Field::new("city", DataType::LargeUtf8, false),
         ]);
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
@@ -353,22 +353,22 @@ mod tests {
             Field::new("address", DataType::Struct(struct_fields), false),
         ]));
 
-        let street_array = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+        let street_array = Arc::new(datafusion::arrow::array::LargeStringArray::from(vec![
             "123 Main St",
             "456 Oak Ave",
         ]));
-        let city_array = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+        let city_array = Arc::new(datafusion::arrow::array::LargeStringArray::from(vec![
             "New York",
             "Los Angeles",
         ]));
 
         let struct_array = StructArray::from(vec![
             (
-                Arc::new(Field::new("street", DataType::Utf8, false)),
+                Arc::new(Field::new("street", DataType::LargeUtf8, false)),
                 street_array as ArrayRef,
             ),
             (
-                Arc::new(Field::new("city", DataType::Utf8, false)),
+                Arc::new(Field::new("city", DataType::LargeUtf8, false)),
                 city_array as ArrayRef,
             ),
         ]);
@@ -387,7 +387,7 @@ mod tests {
             .column_by_name("city_partition")
             .unwrap()
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
             .unwrap();
 
         assert_eq!(city_partition.value(0), "New York");
@@ -435,7 +435,7 @@ mod tests {
         // Create Arrow schema matching the table schema
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("name", DataType::LargeUtf8, false),
         ]));
 
         let input = Arc::new(EmptyExec::new(arrow_schema));
@@ -494,7 +494,7 @@ mod tests {
         // Create Arrow schema with different field name (mismatched)
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
-            Field::new("different_name", DataType::Utf8, false), // Wrong field name
+            Field::new("different_name", DataType::LargeUtf8, false), // Wrong field name
         ]));
 
         let input = Arc::new(EmptyExec::new(arrow_schema));
@@ -567,7 +567,7 @@ mod tests {
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false).with_metadata(metadata.clone()),
-            Field::new("name", DataType::Utf8, false).with_metadata(metadata),
+            Field::new("name", DataType::LargeUtf8, false).with_metadata(metadata),
         ]));
 
         let input = Arc::new(EmptyExec::new(arrow_schema));

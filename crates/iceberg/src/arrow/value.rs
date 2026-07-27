@@ -736,10 +736,22 @@ pub(crate) fn create_primitive_array_single_element(
             Ok(Arc::new(StringArray::from(vec![v.as_str()])))
         }
         (DataType::Utf8, None) => Ok(Arc::new(StringArray::from(vec![Option::<&str>::None]))),
+        (DataType::LargeUtf8, Some(PrimitiveLiteral::String(v))) => {
+            Ok(Arc::new(LargeStringArray::from(vec![v.as_str()])))
+        }
+        (DataType::LargeUtf8, None) => {
+            Ok(Arc::new(LargeStringArray::from(vec![Option::<&str>::None])))
+        }
         (DataType::Binary, Some(PrimitiveLiteral::Binary(v))) => {
             Ok(Arc::new(BinaryArray::from_vec(vec![v.as_slice()])))
         }
         (DataType::Binary, None) => Ok(Arc::new(BinaryArray::from_opt_vec(vec![
+            Option::<&[u8]>::None,
+        ]))),
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(v))) => {
+            Ok(Arc::new(LargeBinaryArray::from_vec(vec![v.as_slice()])))
+        }
+        (DataType::LargeBinary, None) => Ok(Arc::new(LargeBinaryArray::from_opt_vec(vec![
             Option::<&[u8]>::None,
         ]))),
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
@@ -824,10 +836,21 @@ pub(crate) fn create_primitive_array_single_element(
                         DataType::Utf8 => {
                             Ok(Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef)
                         }
+                        DataType::LargeUtf8 => {
+                            Ok(Arc::new(LargeStringArray::from(vec![Option::<&str>::None]))
+                                as ArrayRef)
+                        }
                         DataType::Binary => {
                             Ok(
                                 Arc::new(BinaryArray::from_opt_vec(vec![Option::<&[u8]>::None]))
                                     as ArrayRef,
+                            )
+                        }
+                        DataType::LargeBinary => {
+                            Ok(
+                                Arc::new(LargeBinaryArray::from_opt_vec(vec![
+                                    Option::<&[u8]>::None,
+                                ])) as ArrayRef,
                             )
                         }
                         _ => Err(Error::new(
@@ -949,12 +972,26 @@ pub(crate) fn create_primitive_array_repeated(
             let vals: Vec<Option<String>> = vec![None; num_rows];
             Arc::new(StringArray::from(vals))
         }
+        (DataType::LargeUtf8, Some(PrimitiveLiteral::String(value))) => {
+            Arc::new(LargeStringArray::from(vec![value.clone(); num_rows]))
+        }
+        (DataType::LargeUtf8, None) => {
+            let vals: Vec<Option<String>> = vec![None; num_rows];
+            Arc::new(LargeStringArray::from(vals))
+        }
         (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => {
             Arc::new(BinaryArray::from_vec(vec![value; num_rows]))
         }
         (DataType::Binary, None) => {
             let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
             Arc::new(BinaryArray::from_opt_vec(vals))
+        }
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => {
+            Arc::new(LargeBinaryArray::from_vec(vec![value; num_rows]))
+        }
+        (DataType::LargeBinary, None) => {
+            let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
+            Arc::new(LargeBinaryArray::from_opt_vec(vals))
         }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
             Arc::new(

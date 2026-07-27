@@ -399,7 +399,7 @@ mod tests {
             .unwrap();
 
         result[0].columns()[0]
-            .as_string_opt::<i32>()
+            .as_string_opt::<i64>()
             .unwrap()
             .iter()
             .map(|v| v.map(ToOwned::to_owned))

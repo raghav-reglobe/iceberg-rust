@@ -912,9 +912,11 @@ async fn atomic_partition_replace_scan(
 
 /// Extract a (possibly nested) string leaf from a record batch by dotted
 /// path — `_cdc.key` walks the `_cdc` struct column to its `key` child.
-/// Cast to Utf8 is not attempted: the replace contract requires STRING key
-/// and op columns.
-fn string_leaf<'a>(batch: &'a RecordBatch, dotted: &str) -> Result<&'a StringArray> {
+/// The leaf may decode as Utf8 or LargeUtf8 (reader offset widening); the
+/// wide form is folded back to Utf8 — key/op values are small, so the
+/// per-batch cast is bounded. Non-string leaves still refuse: the replace
+/// contract requires STRING key and op columns.
+fn string_leaf(batch: &RecordBatch, dotted: &str) -> Result<StringArray> {
     let mut parts = dotted.split('.');
     let root = parts.next().expect("non-empty dotted path");
     let mut current: &ArrayRef = batch.column(
@@ -940,9 +942,20 @@ fn string_leaf<'a>(batch: &'a RecordBatch, dotted: &str) -> Result<&'a StringArr
             )
         })?;
     }
-    current
-        .as_any()
+    if !matches!(
+        current.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("`{dotted}` must be a string column"),
+        ));
+    }
+    let utf8 = arrow_cast::cast(current.as_ref(), &DataType::Utf8)
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("`{dotted}` cast: {e}")))?;
+    utf8.as_any()
         .downcast_ref::<StringArray>()
+        .cloned()
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,

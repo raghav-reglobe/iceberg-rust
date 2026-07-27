@@ -216,7 +216,7 @@ impl RecordBatchPartitionSplitter {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Int32Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -269,7 +269,7 @@ mod tests {
 
         let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
         let id_array = Int32Array::from(vec![1, 2, 1, 3, 2, 3, 1]);
-        let data_array = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"]);
+        let data_array = LargeStringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"]);
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
             Arc::new(id_array),
             Arc::new(data_array),
@@ -295,7 +295,7 @@ mod tests {
         {
             // check the first partition
             let expected_id_array = Int32Array::from(vec![1, 1, 1]);
-            let expected_data_array = StringArray::from(vec!["a", "c", "g"]);
+            let expected_data_array = LargeStringArray::from(vec!["a", "c", "g"]);
             let expected_batch = RecordBatch::try_new(arrow_schema.clone(), vec![
                 Arc::new(expected_id_array),
                 Arc::new(expected_data_array),
@@ -306,7 +306,7 @@ mod tests {
         {
             // check the second partition
             let expected_id_array = Int32Array::from(vec![2, 2]);
-            let expected_data_array = StringArray::from(vec!["b", "e"]);
+            let expected_data_array = LargeStringArray::from(vec!["b", "e"]);
             let expected_batch = RecordBatch::try_new(arrow_schema.clone(), vec![
                 Arc::new(expected_id_array),
                 Arc::new(expected_data_array),
@@ -317,7 +317,7 @@ mod tests {
         {
             // check the third partition
             let expected_id_array = Int32Array::from(vec![3, 3]);
-            let expected_data_array = StringArray::from(vec!["d", "f"]);
+            let expected_data_array = LargeStringArray::from(vec!["d", "f"]);
             let expected_batch = RecordBatch::try_new(arrow_schema.clone(), vec![
                 Arc::new(expected_id_array),
                 Arc::new(expected_data_array),

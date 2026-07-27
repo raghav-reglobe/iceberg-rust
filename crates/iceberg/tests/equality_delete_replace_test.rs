@@ -36,7 +36,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray, StructArray};
+use arrow_array::{
+    BooleanArray, Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
+};
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use iceberg::delete_vector::DeleteVector;
@@ -131,13 +133,13 @@ fn batch(table: &Table, rows: &[(i32, &str, &str, Option<bool>)]) -> RecordBatch
     let ops: Vec<&str> = rows.iter().map(|r| r.2).collect();
     let cdc = StructArray::from(vec![(
         cdc_field,
-        Arc::new(StringArray::from(ops)) as arrow_array::ArrayRef,
+        Arc::new(LargeStringArray::from(ops)) as arrow_array::ArrayRef,
     )]);
     RecordBatch::try_new(schema, vec![
         Arc::new(Int32Array::from(
             rows.iter().map(|r| r.0).collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
+        Arc::new(LargeStringArray::from(
             rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
         )),
         Arc::new(cdc),
@@ -246,7 +248,7 @@ async fn read_rows(table: &Table) -> Vec<(i32, String, String)> {
         let payloads = b
             .column(payload_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         let cdc = b
             .column(cdc_idx)
@@ -257,7 +259,7 @@ async fn read_rows(table: &Table) -> Vec<(i32, String, String)> {
             .column_by_name("op")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         for i in 0..b.num_rows() {
             out.push((
@@ -750,9 +752,7 @@ mod replace_api {
             "_is_backfill",
             Literal::bool(true),
             &["id".to_string()],
-            iceberg::atomic_replace::ReplaceInput::LocalParquet(
-                path.to_str().unwrap().to_string(),
-            ),
+            iceberg::atomic_replace::ReplaceInput::LocalParquet(path.to_str().unwrap().to_string()),
             6,
             false,
         )
@@ -951,4 +951,3 @@ mod replace_api {
         }
     }
 }
-

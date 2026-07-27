@@ -28,9 +28,14 @@
 //! authenticated clients instead of re-fetching config/tokens per call.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+    TrackConsumersPool, UnboundedMemoryPool,
+};
 use datafusion::physical_plan::displayable;
 use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::RestCatalogBuilder;
@@ -143,13 +148,95 @@ fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult
     Ok(out)
 }
 
+/// A [`MemoryPool`] wrapper recording the pool-wide high-water mark of
+/// reserved bytes. `TrackConsumersPool` keeps per-consumer peaks, but
+/// `unregister` DROPS a consumer's entry the moment its operator finishes —
+/// an end-of-query read misses everything already deregistered. A global
+/// `fetch_max` after every grow survives all deregistrations and reflects
+/// the true concurrent peak, not a sum of non-coincident per-consumer peaks.
+///
+/// Scope caveat: this observes only DataFusion-REGISTERED reservations
+/// (join builds, sorts, aggregates) — arrow allocations made directly by the
+/// merge exec nodes (fetch batches, evaluated SET stores, writer buffers)
+/// are byte-bounded separately and do not pass through the pool.
+#[derive(Debug)]
+struct PeakTrackingPool {
+    inner: Arc<dyn MemoryPool>,
+    peak: AtomicUsize,
+}
+
+impl PeakTrackingPool {
+    fn new(inner: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            inner,
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.peak
+            .fetch_max(self.inner.reserved(), Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Display for PeakTrackingPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PeakTrackingPool(inner: {})", self.inner)
+    }
+}
+
+impl MemoryPool for PeakTrackingPool {
+    fn name(&self) -> &str {
+        "peak_tracking"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+        self.bump();
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::common::Result<()> {
+        self.inner.try_grow(reservation, additional)?;
+        self.bump();
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
+
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
     mut scan_files: ScanFiles,
     mut scoped_tables: ScopedTables,
     local_tables: HashMap<String, String>,
     options: Option<Arc<MorMergeOptions>>,
-) -> PyResult<SessionContext> {
+) -> PyResult<(SessionContext, Arc<PeakTrackingPool>)> {
     // Preserve identifier case (duckdb/Spark semantics): mongo-derived columns
     // are mixed-case, and the in-flight MERGE planner drops the quote flag on
     // INSERT/SET column names, so normalization would lowercase them anyway.
@@ -175,29 +262,36 @@ async fn session_with_catalogs(
     // memory — width varies per table). Env-configured so the worker sizes
     // it to the pod: MERGE_DF_MEMORY_LIMIT_MB (unset = unbounded, the
     // previous behavior) + MERGE_DF_SPILL_DIR (unset = OS temp dir).
-    let ctx = match std::env::var("MERGE_DF_MEMORY_LIMIT_MB")
+    //
+    // A pool is installed EVEN when unbounded, wrapped in the peak tracker,
+    // so every call reports its pool-visible high-water mark
+    // (`peak_mem_bytes` in the result). The bounded shape mirrors what
+    // `RuntimeEnvBuilder::with_memory_limit` builds (Greedy inside
+    // TrackConsumersPool), keeping the top-consumers OOM report.
+    let inner: Arc<dyn MemoryPool> = match std::env::var("MERGE_DF_MEMORY_LIMIT_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        None => SessionContext::new_with_config(config),
-        Some(limit_mb) => {
-            let mut rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-                .with_memory_limit(limit_mb * 1024 * 1024, 1.0);
-            if let Ok(dir) = std::env::var("MERGE_DF_SPILL_DIR") {
-                rt = rt.with_disk_manager_builder(
-                    datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(
-                        datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![
-                            dir.into(),
-                        ]),
-                    ),
-                );
-            }
-            let rt = rt
-                .build_arc()
-                .map_err(|e| PyValueError::new_err(format!("building runtime env: {e}")))?;
-            SessionContext::new_with_config_rt(config, rt)
-        }
+        None => Arc::new(UnboundedMemoryPool::default()),
+        Some(limit_mb) => Arc::new(TrackConsumersPool::new(
+            GreedyMemoryPool::new(limit_mb * 1024 * 1024),
+            std::num::NonZeroUsize::new(5).expect("non-zero"),
+        )),
     };
+    let pool = Arc::new(PeakTrackingPool::new(inner));
+    let mut rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>);
+    if let Ok(dir) = std::env::var("MERGE_DF_SPILL_DIR") {
+        rt = rt.with_disk_manager_builder(
+            datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(
+                datafusion::execution::disk_manager::DiskManagerMode::Directories(vec![dir.into()]),
+            ),
+        );
+    }
+    let rt = rt
+        .build_arc()
+        .map_err(|e| PyValueError::new_err(format!("building runtime env: {e}")))?;
+    let ctx = SessionContext::new_with_config_rt(config, rt);
     register_variant_functions(&ctx);
     register_parity_functions(&ctx);
     for (name, props) in catalogs {
@@ -243,7 +337,7 @@ async fn session_with_catalogs(
                 PyValueError::new_err(format!("register local table `{name}` from `{path}`: {e}"))
             })?;
     }
-    Ok(ctx)
+    Ok((ctx, pool))
 }
 
 /// Await `fut`, raising when the merge deadline passes first. Only used for
@@ -285,7 +379,9 @@ async fn doorway_deadline<T>(
 /// from the delete files; pass False as the kill switch restoring the
 /// whole-file fetch (both produce identical commits). Returns a dict with
 /// `count` — the number of rows appended by the merge (inserts plus updated
-/// row versions). Raises `ValueError` on planning or execution failure, and
+/// row versions) — and `peak_mem_bytes`, the DataFusion memory pool's
+/// high-water mark for this call (pool-registered operators: joins, sorts,
+/// aggregates). Raises `ValueError` on planning or execution failure, and
 /// on deadline expiry.
 #[pyfunction]
 #[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None, late_materialization=None, local_tables=None))]
@@ -315,8 +411,16 @@ fn merge_into(
                 deadline,
                 write_workers,
                 late_materialization: late_materialization.unwrap_or(true),
+                // Byte target for write-path batches (consume chunks + the
+                // late-fetch decode batch size). Env-tunable alongside the
+                // pool knobs; unset = the engine default.
+                chunk_target_bytes: std::env::var("MERGE_MOR_CHUNK_TARGET_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|mb| *mb > 0)
+                    .map(|mb| mb * 1024 * 1024),
             });
-            let ctx = doorway_deadline(
+            let (ctx, pool) = doorway_deadline(
                 deadline,
                 "mounting catalogs",
                 session_with_catalogs(
@@ -346,6 +450,10 @@ fn merge_into(
                 }
             }
             let mut out = HashMap::from([("count".to_string(), count.to_string())]);
+            // Pool-visible peak memory for this merge — the governor's
+            // per-slice pressure signal. The worker's existing "-> {out}"
+            // slice log prints it with zero new plumbing.
+            out.insert("peak_mem_bytes".to_string(), pool.peak().to_string());
             // Cumulative per-process cache stats (manifest + data tiers) —
             // the worker logs this result line per slice, so cache
             // effectiveness lands in run-pod logs with zero new plumbing.
@@ -377,7 +485,7 @@ fn dry_run_inspect(
     let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx =
+            let (ctx, _pool) =
                 session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
                     .await?;
             let df = ctx
@@ -424,7 +532,9 @@ fn sql_collect(
     let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let ctx = session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None).await?;
+            let (ctx, _pool) =
+                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
+                    .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -491,7 +601,7 @@ fn sql_collect_ipc(
     let local_tables = local_tables.unwrap_or_default();
     let buf: Vec<u8> = py.detach(|| {
         runtime().block_on(async move {
-            let ctx =
+            let (ctx, _pool) =
                 session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
                     .await?;
             let df = ctx

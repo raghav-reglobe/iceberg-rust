@@ -727,8 +727,8 @@ mod test {
     use std::sync::Arc;
 
     use arrow_array::{
-        Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
+        RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -742,6 +742,14 @@ mod test {
     /// Returns empty string for null values
     fn get_string_value(array: &dyn Array, index: usize) -> String {
         if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+            if string_array.is_null(index) {
+                String::new()
+            } else {
+                string_array.value(index).to_string()
+            }
+        } else if let Some(string_array) = array.as_any().downcast_ref::<LargeStringArray>() {
+            // Data columns carry 64-bit offsets since the LargeUtf8 flip;
+            // REE partition constants below keep 32-bit values.
             if string_array.is_null(index) {
                 String::new()
             } else {
@@ -891,7 +899,7 @@ mod test {
         let name_column = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(name_column.value(0), "Alice");
         assert_eq!(name_column.value(1), "Bob");
@@ -968,7 +976,7 @@ mod test {
         let data_column = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(data_column.value(0), "a");
         assert_eq!(data_column.value(1), "b");
@@ -1010,7 +1018,7 @@ mod test {
             arrow_schema_no_promotion_addition_or_renaming_required(),
             vec![
                 Arc::new(Int32Array::from(vec![Some(2001), Some(2002), Some(2003)])), // d
-                Arc::new(StringArray::from(vec![
+                Arc::new(LargeStringArray::from(vec![
                     Some("Apache"),
                     Some("Iceberg"),
                     Some("Rocks"),
@@ -1022,7 +1030,7 @@ mod test {
 
     pub fn expected_record_batch_migration_required() -> RecordBatch {
         RecordBatch::try_new(arrow_schema_already_same_as_target(), vec![
-            Arc::new(StringArray::from(Vec::<Option<String>>::from([
+            Arc::new(LargeStringArray::from(Vec::<Option<String>>::from([
                 None, None, None,
             ]))), // a
             Arc::new(Int64Array::from(vec![Some(1001), Some(1002), Some(1003)])), // b
@@ -1031,12 +1039,12 @@ mod test {
                 Some(23.375),
                 Some(34.875),
             ])), // c
-            Arc::new(StringArray::from(vec![
+            Arc::new(LargeStringArray::from(vec![
                 Some("Apache"),
                 Some("Iceberg"),
                 Some("Rocks"),
             ])), // e (d skipped by projection)
-            Arc::new(StringArray::from(vec![
+            Arc::new(LargeStringArray::from(vec![
                 Some("(╯°□°）╯"),
                 Some("(╯°□°）╯"),
                 Some("(╯°□°）╯"),
@@ -1064,11 +1072,11 @@ mod test {
 
     fn arrow_schema_already_same_as_target() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            simple_field("a", DataType::Utf8, true, "10"),
+            simple_field("a", DataType::LargeUtf8, true, "10"),
             simple_field("b", DataType::Int64, false, "11"),
             simple_field("c", DataType::Float64, false, "12"),
-            simple_field("e", DataType::Utf8, true, "14"),
-            simple_field("f", DataType::Utf8, false, "15"),
+            simple_field("e", DataType::LargeUtf8, true, "14"),
+            simple_field("f", DataType::LargeUtf8, false, "15"),
         ]))
     }
 
@@ -1084,7 +1092,7 @@ mod test {
     fn arrow_schema_no_promotion_addition_or_renaming_required() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             simple_field("d", DataType::Int32, false, "13"),
-            simple_field("e", DataType::Utf8, true, "14"),
+            simple_field("e", DataType::LargeUtf8, true, "14"),
         ]))
     }
 
@@ -1185,21 +1193,21 @@ mod test {
         let name_column = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(name_column.value(0), "John Doe");
 
         let dept_column = result
             .column(2)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(dept_column.value(0), "hr");
 
         let subdept_column = result
             .column(3)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(subdept_column.value(0), "communications");
     }
@@ -1315,7 +1323,7 @@ mod test {
         let name_column = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(name_column.value(0), "Alice");
         assert_eq!(name_column.value(1), "Bob");
@@ -1545,7 +1553,7 @@ mod test {
         let name_column = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(name_column.value(0), "Alice");
         assert_eq!(name_column.value(1), "Bob");

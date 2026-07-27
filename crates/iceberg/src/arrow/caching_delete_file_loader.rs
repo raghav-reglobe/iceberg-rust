@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Not;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+use arrow_array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StructArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
@@ -467,12 +467,19 @@ impl CachingDeleteFileLoader {
             let schema = batch.schema();
             let columns = batch.columns();
 
-            let Some(file_paths) = columns[0].as_any().downcast_ref::<StringArray>() else {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Could not downcast file paths array to StringArray",
-                ));
-            };
+            // file_path decodes as Utf8 or LargeUtf8 depending on the reader's
+            // offset widening — accept both.
+            let file_paths: Box<dyn Iterator<Item = Option<&str>>> =
+                if let Some(a) = columns[0].as_any().downcast_ref::<StringArray>() {
+                    Box::new(a.iter())
+                } else if let Some(a) = columns[0].as_any().downcast_ref::<LargeStringArray>() {
+                    Box::new(a.iter())
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Could not downcast file paths array to a string array",
+                    ));
+                };
             let Some(positions) = columns[1].as_any().downcast_ref::<Int64Array>() else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -480,7 +487,7 @@ impl CachingDeleteFileLoader {
                 ));
             };
 
-            for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
+            for (file_path, pos) in file_paths.zip(positions.iter()) {
                 let (Some(file_path), Some(pos)) = (file_path, pos) else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
@@ -992,7 +999,7 @@ mod tests {
         assert_eq!(batch.num_columns(), 1); // Only 'data' column
 
         // Verify the actual values are preserved after schema evolution
-        let data_col = batch.column(0).as_string::<i32>();
+        let data_col = batch.column(0).as_string::<i64>();
         assert_eq!(data_col.value(0), "a");
         assert_eq!(data_col.value(1), "d");
         assert_eq!(data_col.value(2), "g");

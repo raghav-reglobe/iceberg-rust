@@ -37,6 +37,7 @@ use super::{
 };
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::large_offsets::widen_variable_length_types;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::cache::DataBytesCache;
@@ -293,6 +294,29 @@ impl FileScanTaskReader {
                         ErrorKind::Unexpected,
                         format!(
                             "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
+                        ),
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else {
+            arrow_metadata
+        };
+
+        // Widen 32-bit-offset string/binary columns to their 64-bit forms so
+        // decode materializes LargeUtf8/LargeBinary directly — a wide-TEXT
+        // batch would overflow a 32-bit Utf8 array's 2GiB value cap before any
+        // post-decode cast could run. Same schema-hint mechanism as INT96.
+        let arrow_metadata = if let Some(widened_schema) =
+            widen_variable_length_types(arrow_metadata.schema(), &task.schema)
+        {
+            let options = ArrowReaderOptions::new().with_schema(Arc::clone(&widened_schema));
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Failed to create ArrowReaderMetadata with the large-offset schema: {widened_schema}"
                         ),
                     )
                     .with_source(e)

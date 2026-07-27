@@ -732,20 +732,17 @@ mod tests {
             additional_properties: prev_props,
         };
 
-        let new_props: HashMap<String, String> = [(
-            REMOVED_EQUALITY_DELETES.to_string(),
-            "7".to_string(),
-        )]
-        .into_iter()
-        .collect();
+        let new_props: HashMap<String, String> =
+            [(REMOVED_EQUALITY_DELETES.to_string(), "7".to_string())]
+                .into_iter()
+                .collect();
 
         let summary = Summary {
             operation: Operation::Replace,
             additional_properties: new_props,
         };
 
-        let updated =
-            update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
 
         assert_eq!(
             updated

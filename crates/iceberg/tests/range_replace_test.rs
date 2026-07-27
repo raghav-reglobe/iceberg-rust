@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow_array::{BooleanArray, LargeStringArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use iceberg::atomic_replace::atomic_partition_replace_key_range;
@@ -113,15 +113,15 @@ fn batch(table: &Table, rows: &[(&str, &str, &str, Option<bool>)]) -> RecordBatc
     let cdc = StructArray::from(vec![
         (
             op_field,
-            Arc::new(StringArray::from(ops)) as arrow_array::ArrayRef,
+            Arc::new(LargeStringArray::from(ops)) as arrow_array::ArrayRef,
         ),
         (
             key_field,
-            Arc::new(StringArray::from(keys)) as arrow_array::ArrayRef,
+            Arc::new(LargeStringArray::from(keys)) as arrow_array::ArrayRef,
         ),
     ]);
     RecordBatch::try_new(schema, vec![
-        Arc::new(StringArray::from(
+        Arc::new(LargeStringArray::from(
             rows.iter().map(|r| r.0.to_string()).collect::<Vec<_>>(),
         )),
         Arc::new(cdc),
@@ -185,7 +185,7 @@ async fn read_rows(table: &Table) -> Vec<(String, String, String)> {
         let afters = b
             .column(schema.index_of("after").unwrap())
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         let cdc = b
             .column(schema.index_of("_cdc").unwrap())
@@ -196,13 +196,13 @@ async fn read_rows(table: &Table) -> Vec<(String, String, String)> {
             .column_by_name("op")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         let keys = cdc
             .column_by_name("key")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         for i in 0..b.num_rows() {
             out.push((

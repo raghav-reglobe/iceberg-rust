@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow_array::{BooleanArray, LargeStringArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use iceberg::atomic_replace::atomic_partition_replace_prefix;
@@ -123,15 +123,15 @@ fn batch(table: &Table, rows: &[(&str, &str, &str, Option<bool>)]) -> RecordBatc
     let cdc = StructArray::from(vec![
         (
             op_field,
-            Arc::new(StringArray::from(ops)) as arrow_array::ArrayRef,
+            Arc::new(LargeStringArray::from(ops)) as arrow_array::ArrayRef,
         ),
         (
             key_field,
-            Arc::new(StringArray::from(keys)) as arrow_array::ArrayRef,
+            Arc::new(LargeStringArray::from(keys)) as arrow_array::ArrayRef,
         ),
     ]);
     RecordBatch::try_new(schema, vec![
-        Arc::new(StringArray::from(
+        Arc::new(LargeStringArray::from(
             rows.iter().map(|r| r.0.to_string()).collect::<Vec<_>>(),
         )),
         Arc::new(cdc),
@@ -196,7 +196,7 @@ async fn read_rows(table: &Table) -> Vec<(String, String, String)> {
         let afters = b
             .column(schema.index_of("after").unwrap())
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         let cdc = b
             .column(schema.index_of("_cdc").unwrap())
@@ -207,13 +207,13 @@ async fn read_rows(table: &Table) -> Vec<(String, String, String)> {
             .column_by_name("op")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         let keys = cdc
             .column_by_name("key")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         for i in 0..b.num_rows() {
             out.push((
@@ -238,7 +238,8 @@ async fn live_delete_entries(table: &Table) -> Vec<(String, DataFileFormat)> {
         .read()
         .await
         .unwrap();
-    let manifest_list = ManifestList::parse_with_version(&bytes, metadata.format_version()).unwrap();
+    let manifest_list =
+        ManifestList::parse_with_version(&bytes, metadata.format_version()).unwrap();
     let mut out = Vec::new();
     for mf in manifest_list.entries() {
         if mf.content != ManifestContentType::Deletes {
@@ -391,10 +392,26 @@ async fn prefix_replace_deletes_prefix_scoped_and_appends() {
     assert_eq!(read_rows(&table).await, vec![
         ("c-aa01".into(), "c".into(), "{\"$oid\": \"aa01\"}".into()), // CDC survives
         ("c-zz01".into(), "c".into(), "{\"$oid\": \"zz01\"}".into()),
-        ("r-new-aa01".into(), "R".into(), "{\"$oid\": \"aa01\"}".into()),
-        ("r-new-aa03".into(), "R".into(), "{\"$oid\": \"aa03\"}".into()),
-        ("r-old-ab99".into(), "r".into(), "{\"$oid\": \"ab99\"}".into()), // other prefix
-        ("r-old-bb01".into(), "r".into(), "{\"$oid\": \"bb01\"}".into()),
+        (
+            "r-new-aa01".into(),
+            "R".into(),
+            "{\"$oid\": \"aa01\"}".into()
+        ),
+        (
+            "r-new-aa03".into(),
+            "R".into(),
+            "{\"$oid\": \"aa03\"}".into()
+        ),
+        (
+            "r-old-ab99".into(),
+            "r".into(),
+            "{\"$oid\": \"ab99\"}".into()
+        ), // other prefix
+        (
+            "r-old-bb01".into(),
+            "r".into(),
+            "{\"$oid\": \"bb01\"}".into()
+        ),
     ]);
 }
 
@@ -441,9 +458,11 @@ async fn prefix_replace_zero_rows_still_deletes() {
 
     let table = catalog.load_table(&ident).await.unwrap();
     let rows = read_rows(&table).await;
-    assert!(!rows.iter().any(|(_, op, key)| {
-        (op == "r" || op == "R") && key.starts_with(&oid_prefix())
-    }));
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, op, key)| { (op == "r" || op == "R") && key.starts_with(&oid_prefix()) })
+    );
     assert_eq!(rows.len(), 4); // 2 CDC + ab99 + bb01
 }
 
@@ -500,8 +519,16 @@ async fn prefix_replace_consolidates_prior_dvs() {
     assert_eq!(read_rows(&table).await, vec![
         ("c-aa01".into(), "c".into(), "{\"$oid\": \"aa01\"}".into()),
         ("c-zz01".into(), "c".into(), "{\"$oid\": \"zz01\"}".into()),
-        ("r-new-aa01".into(), "R".into(), "{\"$oid\": \"aa01\"}".into()),
-        ("r-old-ab99".into(), "r".into(), "{\"$oid\": \"ab99\"}".into()),
+        (
+            "r-new-aa01".into(),
+            "R".into(),
+            "{\"$oid\": \"aa01\"}".into()
+        ),
+        (
+            "r-old-ab99".into(),
+            "r".into(),
+            "{\"$oid\": \"ab99\"}".into()
+        ),
     ]);
     // Exactly ONE live DV references the seed file; the prior DV file is
     // superseded (not a live entry anymore).
@@ -521,7 +548,12 @@ async fn prefix_replace_local_parquet_input() {
     seed(&catalog, &ident).await;
     let table = catalog.load_table(&ident).await.unwrap();
 
-    let b = batch(&table, &[("r-file-aa01", "R", "{\"$oid\": \"aa01\"}", Some(true))]);
+    let b = batch(&table, &[(
+        "r-file-aa01",
+        "R",
+        "{\"$oid\": \"aa01\"}",
+        Some(true),
+    )]);
     let path = warehouse.path().join("chunk-input.parquet");
     let mut w = parquet::arrow::arrow_writer::ArrowWriter::try_new(
         std::fs::File::create(&path).unwrap(),
@@ -552,9 +584,21 @@ async fn prefix_replace_local_parquet_input() {
     assert_eq!(read_rows(&table).await, vec![
         ("c-aa01".into(), "c".into(), "{\"$oid\": \"aa01\"}".into()),
         ("c-zz01".into(), "c".into(), "{\"$oid\": \"zz01\"}".into()),
-        ("r-file-aa01".into(), "R".into(), "{\"$oid\": \"aa01\"}".into()),
-        ("r-old-ab99".into(), "r".into(), "{\"$oid\": \"ab99\"}".into()),
-        ("r-old-bb01".into(), "r".into(), "{\"$oid\": \"bb01\"}".into()),
+        (
+            "r-file-aa01".into(),
+            "R".into(),
+            "{\"$oid\": \"aa01\"}".into()
+        ),
+        (
+            "r-old-ab99".into(),
+            "r".into(),
+            "{\"$oid\": \"ab99\"}".into()
+        ),
+        (
+            "r-old-bb01".into(),
+            "r".into(),
+            "{\"$oid\": \"bb01\"}".into()
+        ),
     ]);
 
     // Zero-row file: delete-only (removes the row appended above).
@@ -584,9 +628,11 @@ async fn prefix_replace_local_parquet_input() {
     assert_eq!((out.rows_appended, out.delete_tuples), (0, 1));
     let table = catalog.load_table(&ident).await.unwrap();
     let rows = read_rows(&table).await;
-    assert!(!rows.iter().any(|(_, op, key)| {
-        (op == "r" || op == "R") && key.starts_with(&oid_prefix())
-    }));
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, op, key)| { (op == "r" || op == "R") && key.starts_with(&oid_prefix()) })
+    );
 }
 
 #[tokio::test]
@@ -624,14 +670,14 @@ async fn prefix_replace_rejects_equality_deletes() {
         .unwrap();
     let eq_batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
-            arrow_schema::Field::new("after", DataType::Utf8, true).with_metadata(HashMap::from(
-                [(
+            arrow_schema::Field::new("after", DataType::LargeUtf8, true).with_metadata(
+                HashMap::from([(
                     parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
                     after_id.to_string(),
-                )],
-            )),
+                )]),
+            ),
         ])),
-        vec![Arc::new(StringArray::from(vec!["r-old-aa01"])) as arrow_array::ArrayRef],
+        vec![Arc::new(LargeStringArray::from(vec!["r-old-aa01"])) as arrow_array::ArrayRef],
     )
     .unwrap();
     w.write(eq_batch).await.unwrap();

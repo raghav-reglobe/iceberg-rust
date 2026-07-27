@@ -728,8 +728,8 @@ pub mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, LargeStringArray,
+        RecordBatch, StringArray,
     };
     use futures::{TryStreamExt, stream};
     use minijinja::value::Value;
@@ -2040,7 +2040,7 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 512);
 
         let col = batches[0].column_by_name("a").unwrap();
-        let string_arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+        let string_arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
         assert_eq!(string_arr.value(0), "Iceberg");
     }
 
@@ -2064,7 +2064,7 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 512);
 
         let col = batches[0].column_by_name("a").unwrap();
-        let string_arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+        let string_arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
         assert_eq!(string_arr.value(0), "Apache");
     }
 
@@ -2089,7 +2089,7 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 512);
 
         let col = batches[0].column_by_name("a").unwrap();
-        let string_arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+        let string_arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
         assert_eq!(string_arr.value(0), "Iceberg");
     }
 
@@ -2114,7 +2114,7 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 512);
 
         let col = batches[0].column_by_name("a").unwrap();
-        let string_arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+        let string_arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
         assert_eq!(string_arr.value(0), "Apache");
     }
 

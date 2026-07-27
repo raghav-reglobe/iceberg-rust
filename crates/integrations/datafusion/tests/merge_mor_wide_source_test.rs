@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -608,7 +608,13 @@ async fn read_state(ctx: &SessionContext) -> Vec<(i32, Option<String>, i64, Opti
     let mut out = Vec::new();
     for b in &batches {
         let id = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let payload = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        // Iceberg `string` scans as LargeUtf8 (64-bit offsets) since the
+        // wide-TEXT overflow fix — the downcast IS the type assertion.
+        let payload = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         let vf = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let vt = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
         let cur = b.column(4).as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -958,4 +964,86 @@ async fn narrow_and_wide_statements_commit_identical_results() {
     assert_eq!(state.iter().filter(|r| r.0 == 31).count(), 1);
     // id=32's surviving 'R' inserted.
     assert_eq!(state.iter().filter(|r| r.0 == 32).count(), 1);
+}
+
+/// The i32-offset overflow class, structurally: string columns decode, merge
+/// and write as LargeUtf8 (64-bit offsets) end-to-end — `read_state`'s
+/// LargeStringArray downcast is the type assertion — and the evaluated-SET
+/// store stays CHUNKED for the merge's lifetime. A 1-byte chunk target forces
+/// the minimum chunk rows, so the 72 updates spread across several store
+/// chunks and every late-fetched row must resolve its SET values through
+/// (clause, chunk, row) addressing: a wrong chunk index would stamp the WRONG
+/// payload on a row, which the per-id exact-payload asserts catch.
+#[tokio::test]
+async fn chunked_update_store_and_large_utf8_offsets() {
+    const WIDTH: usize = 2048;
+    const N_SEED: i32 = 80;
+    const N_UPDATES: i32 = 72;
+    const N_INSERTS: i32 = 8;
+
+    let warehouse = TempDir::new().unwrap();
+    let (silver_rows, bronze_rows) = scenario(N_SEED, N_UPDATES, N_INSERTS, WIDTH);
+    let catalog = setup_tables(&warehouse, &silver_rows, &bronze_rows).await;
+
+    let config = SessionConfig::new()
+        .with_target_partitions(4)
+        .with_extension(Arc::new(MorMergeOptions {
+            // Force byte-derived chunking to its floor: multiple store
+            // chunks + byte-aware late-fetch batches on modest test data.
+            chunk_target_bytes: Some(1),
+            ..Default::default()
+        }));
+    let ctx = SessionContext::new_with_config(config);
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(Arc::clone(&catalog))
+            .await
+            .unwrap(),
+    );
+    ctx.register_catalog(CATALOG, provider);
+
+    let sql = narrow_scd2_merge_sql();
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+
+    let table = load_silver(&catalog).await;
+    // One atomic snapshot; every updated seed row demoted through ONE DV.
+    assert_eq!(table.metadata().snapshots().count(), 2);
+    assert_eq!(dv_cardinalities(&table).await, vec![N_UPDATES as u64]);
+
+    let state = read_state(&ctx).await;
+    assert_eq!(
+        state.len(),
+        (N_SEED + N_UPDATES + N_INSERTS) as usize,
+        "seed rows + update versions + inserts"
+    );
+    assert_eq!(
+        state.iter().filter(|r| r.4).count(),
+        (N_SEED + N_INSERTS) as usize,
+        "one current per live id"
+    );
+    // Cross-chunk correctness: each updated id's CURRENT row carries exactly
+    // its own update payload (scenario: off = 100_000 + id) at its own
+    // business time (10_000 + id).
+    for id in 1..=N_UPDATES {
+        let current: Vec<_> = state.iter().filter(|r| r.0 == id && r.4).collect();
+        assert_eq!(current.len(), 1, "id={id} must have one current row");
+        let row = current[0];
+        assert_eq!(
+            row.1.as_deref(),
+            Some(payload(id, 100_000 + id as i64, WIDTH).as_str()),
+            "id={id} current payload must be its own update's payload"
+        );
+        assert_eq!(row.2, 10_000 + id as i64, "id={id} business time");
+        // The demoted seed row closed at the update's business time.
+        let seed: Vec<_> = state.iter().filter(|r| r.0 == id && !r.4).collect();
+        assert_eq!(seed.len(), 1);
+        assert_eq!(seed[0].3, Some(10_000 + id as i64));
+    }
+
+    // Idempotent replay: +0 snapshots.
+    ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        load_silver(&catalog).await.metadata().snapshots().count(),
+        2,
+        "replay must commit nothing"
+    );
 }

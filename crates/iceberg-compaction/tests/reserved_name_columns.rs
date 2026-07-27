@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use iceberg::spec::{
@@ -155,7 +155,11 @@ async fn compaction_handles_data_columns_with_reserved_metadata_names() {
         .unwrap();
     let mut paths: Vec<String> = Vec::new();
     for b in &batches {
-        let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         paths.extend((0..b.num_rows()).map(|i| col.value(i).to_string()));
     }
     paths.sort();

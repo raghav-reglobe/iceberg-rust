@@ -116,7 +116,7 @@ async fn test_provider_plan_stream_schema() -> Result<()> {
     let table = schema.table("my_table").await.unwrap().unwrap();
     let table_schema = table.schema();
 
-    let expected = [("foo1", &DataType::Int32), ("foo2", &DataType::Utf8)];
+    let expected = [("foo1", &DataType::Int32), ("foo2", &DataType::LargeUtf8)];
 
     for (field, exp) in table_schema.fields().iter().zip(expected.iter()) {
         assert_eq!(field.name(), exp.0);
@@ -138,7 +138,7 @@ async fn test_provider_plan_stream_schema() -> Result<()> {
     assert_eq!(
         stream.schema().as_ref(),
         &ArrowSchema::new(vec![
-            Field::new("foo2", DataType::Utf8, false).with_metadata(HashMap::from([(
+            Field::new("foo2", DataType::LargeUtf8, false).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "2".to_string(),
             )]))
@@ -352,9 +352,9 @@ async fn test_metadata_table() -> Result<()> {
             Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
             Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
             Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
-            Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
-            Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
-            Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
+            Field { "operation": nullable LargeUtf8, metadata: {"PARQUET:field_id": "4"} },
+            Field { "manifest_list": nullable LargeUtf8, metadata: {"PARQUET:field_id": "5"} },
+            Field { "summary": nullable Map("key_value": non-null Struct("key": non-null LargeUtf8, metadata: {"PARQUET:field_id": "7"}, "value": LargeUtf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
         expect![[r#"
             committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
             [
@@ -365,10 +365,10 @@ async fn test_metadata_table() -> Result<()> {
             parent_id: PrimitiveArray<Int64>
             [
             ],
-            operation: StringArray
+            operation: LargeStringArray
             [
             ],
-            manifest_list: StringArray
+            manifest_list: LargeStringArray
             [
             ],
             summary: MapArray
@@ -389,7 +389,7 @@ async fn test_metadata_table() -> Result<()> {
         manifests,
         expect![[r#"
             Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
-            Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
+            Field { "path": LargeUtf8, metadata: {"PARQUET:field_id": "1"} },
             Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
             Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
             Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
@@ -399,12 +399,12 @@ async fn test_metadata_table() -> Result<()> {
             Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
             Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
             Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
-            Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
+            Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": LargeUtf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": LargeUtf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
         expect![[r#"
             content: PrimitiveArray<Int32>
             [
             ],
-            path: StringArray
+            path: LargeStringArray
             [
             ],
             length: PrimitiveArray<Int64>
@@ -465,7 +465,7 @@ async fn test_insert_into() -> Result<()> {
     let table = schema.table("my_table").await.unwrap().unwrap();
     let table_schema = table.schema();
 
-    let expected = [("foo1", &DataType::Int32), ("foo2", &DataType::Utf8)];
+    let expected = [("foo1", &DataType::Int32), ("foo2", &DataType::LargeUtf8)];
     for (field, exp) in table_schema.fields().iter().zip(expected.iter()) {
         assert_eq!(field.name(), exp.0);
         assert_eq!(field.data_type(), exp.1);
@@ -507,14 +507,14 @@ async fn test_insert_into() -> Result<()> {
         batches,
         expect![[r#"
             Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+            Field { "foo2": LargeUtf8, metadata: {"PARQUET:field_id": "2"} }"#]],
         expect![[r#"
             foo1: PrimitiveArray<Int32>
             [
               1,
               2,
             ],
-            foo2: StringArray
+            foo2: LargeStringArray
             [
               "alan",
               "turing",
@@ -661,15 +661,15 @@ async fn test_insert_into_nested() -> Result<()> {
         batches,
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#]],
+            Field { "name": LargeUtf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "profile": nullable Struct("address": Struct("street": LargeUtf8, metadata: {"PARQUET:field_id": "6"}, "city": LargeUtf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": LargeUtf8, metadata: {"PARQUET:field_id": "9"}, "phone": LargeUtf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
               1,
               2,
             ],
-            name: StringArray
+            name: LargeStringArray
             [
               "Alice",
               "Bob",
@@ -681,7 +681,7 @@ async fn test_insert_into_nested() -> Result<()> {
               valid,
             ]
             [
-            -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
+            -- child 0: "address" (Struct([Field { name: "street", data_type: LargeUtf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: LargeUtf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
             StructArray
             -- validity:
             [
@@ -689,14 +689,14 @@ async fn test_insert_into_nested() -> Result<()> {
               valid,
             ]
             [
-            -- child 0: "street" (Utf8)
-            StringArray
+            -- child 0: "street" (LargeUtf8)
+            LargeStringArray
             [
               "123 Main St",
               "456 Market St",
             ]
-            -- child 1: "city" (Utf8)
-            StringArray
+            -- child 1: "city" (LargeUtf8)
+            LargeStringArray
             [
               "San Francisco",
               "San Jose",
@@ -708,7 +708,7 @@ async fn test_insert_into_nested() -> Result<()> {
               95113,
             ]
             ]
-            -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
+            -- child 1: "contact" (Struct([Field { name: "email", data_type: LargeUtf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: LargeUtf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
             StructArray
             -- validity:
             [
@@ -716,14 +716,14 @@ async fn test_insert_into_nested() -> Result<()> {
               valid,
             ]
             [
-            -- child 0: "email" (Utf8)
-            StringArray
+            -- child 0: "email" (LargeUtf8)
+            LargeStringArray
             [
               "alice@example.com",
               "bob@example.com",
             ]
-            -- child 1: "phone" (Utf8)
-            StringArray
+            -- child 1: "phone" (LargeUtf8)
+            LargeStringArray
             [
               "555-1234",
               null,
@@ -760,29 +760,29 @@ async fn test_insert_into_nested() -> Result<()> {
         batches,
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} },
+            Field { "name": LargeUtf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable LargeUtf8, metadata: {"PARQUET:field_id": "6"} },
+            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable LargeUtf8, metadata: {"PARQUET:field_id": "7"} },
             Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#]],
+            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable LargeUtf8, metadata: {"PARQUET:field_id": "9"} },
+            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable LargeUtf8, metadata: {"PARQUET:field_id": "10"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
               1,
               2,
             ],
-            name: StringArray
+            name: LargeStringArray
             [
               "Alice",
               "Bob",
             ],
-            catalog.test_insert_nested.nested_table.profile[address][street]: StringArray
+            catalog.test_insert_nested.nested_table.profile[address][street]: LargeStringArray
             [
               "123 Main St",
               "456 Market St",
             ],
-            catalog.test_insert_nested.nested_table.profile[address][city]: StringArray
+            catalog.test_insert_nested.nested_table.profile[address][city]: LargeStringArray
             [
               "San Francisco",
               "San Jose",
@@ -792,12 +792,12 @@ async fn test_insert_into_nested() -> Result<()> {
               94105,
               95113,
             ],
-            catalog.test_insert_nested.nested_table.profile[contact][email]: StringArray
+            catalog.test_insert_nested.nested_table.profile[contact][email]: LargeStringArray
             [
               "alice@example.com",
               "bob@example.com",
             ],
-            catalog.test_insert_nested.nested_table.profile[contact][phone]: StringArray
+            catalog.test_insert_nested.nested_table.profile[contact][phone]: LargeStringArray
             [
               "555-1234",
               null,
@@ -887,8 +887,8 @@ async fn test_insert_into_partitioned() -> Result<()> {
         batches,
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+            Field { "category": LargeUtf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "value": LargeUtf8, metadata: {"PARQUET:field_id": "3"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
@@ -898,7 +898,7 @@ async fn test_insert_into_partitioned() -> Result<()> {
               4,
               5,
             ],
-            category: StringArray
+            category: LargeStringArray
             [
               "electronics",
               "electronics",
@@ -906,7 +906,7 @@ async fn test_insert_into_partitioned() -> Result<()> {
               "books",
               "clothing",
             ],
-            value: StringArray
+            value: LargeStringArray
             [
               "laptop",
               "phone",

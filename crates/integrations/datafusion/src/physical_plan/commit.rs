@@ -678,11 +678,15 @@ mod tests {
 
         println!("Physical plan:\n{actual_plan}");
 
+        // The Utf8 source column is auto-coerced to the table's LargeUtf8
+        // (iceberg `string` = 64-bit offsets) by the insert projection —
+        // pinned here: foreign 32-bit-offset sources must cast, not error.
         let expected_plan = "\
 IcebergCommitExec: table=test_namespace.test_table
   CoalescePartitionsExec
     IcebergWriteExec: table=test_namespace.test_table
-      DataSourceExec: partitions=3, partition_sizes=[1, 1, 1]";
+      ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name]
+        DataSourceExec: partitions=3, partition_sizes=[1, 1, 1]";
 
         assert_eq!(
             actual_plan.trim(),

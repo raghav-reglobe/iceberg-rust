@@ -289,7 +289,8 @@ impl RowDeltaAction {
 
                 // Snapshot isolation: pure data appends are allowed; anything
                 // touching files this commit references needs the file-level check.
-                let added_deletes = mf.content == ManifestContentType::Deletes && mf.has_added_files();
+                let added_deletes =
+                    mf.content == ManifestContentType::Deletes && mf.has_added_files();
                 if !added_deletes && !mf.has_deleted_files() {
                     continue;
                 }
@@ -612,10 +613,14 @@ mod tests {
 
     /// Commit a RowDelta adding `dv` and return the table advanced to it.
     async fn dv_snapshot(table: &Table, dv: DataFile) -> Table {
-        let mut c = Arc::new(Transaction::new(table).row_delta().add_delete_files(vec![dv]))
-            .commit(table)
-            .await
-            .unwrap();
+        let mut c = Arc::new(
+            Transaction::new(table)
+                .row_delta()
+                .add_delete_files(vec![dv]),
+        )
+        .commit(table)
+        .await
+        .unwrap();
         let snap = if let TableUpdate::AddSnapshot { snapshot } =
             c.take_updates().into_iter().next().unwrap()
         {
@@ -744,7 +749,11 @@ mod tests {
 
         let action = Transaction::new(&table_s2)
             .row_delta()
-            .add_delete_files(vec![make_dv(&table_s2, "test/my-dv.parquet", "test/data.parquet")])
+            .add_delete_files(vec![make_dv(
+                &table_s2,
+                "test/my-dv.parquet",
+                "test/data.parquet",
+            )])
             .validate_from_snapshot(s1);
         let err = match Arc::new(action).commit(&table_s2).await {
             Ok(_) => panic!("expected conflict"),
@@ -763,18 +772,25 @@ mod tests {
                 "snapshot".to_string(),
             )]),
         );
-        let table_s1 =
-            append_snapshot(&base, &["test/data.parquet", "test/other.parquet"]).await;
+        let table_s1 = append_snapshot(&base, &["test/data.parquet", "test/other.parquet"]).await;
         let s1 = table_s1.metadata().current_snapshot_id().unwrap();
         let table_s2 = dv_snapshot(
             &table_s1,
-            make_dv(&table_s1, "test/concurrent-dv.parquet", "test/other.parquet"),
+            make_dv(
+                &table_s1,
+                "test/concurrent-dv.parquet",
+                "test/other.parquet",
+            ),
         )
         .await;
 
         let action = Transaction::new(&table_s2)
             .row_delta()
-            .add_delete_files(vec![make_dv(&table_s2, "test/my-dv.parquet", "test/data.parquet")])
+            .add_delete_files(vec![make_dv(
+                &table_s2,
+                "test/my-dv.parquet",
+                "test/data.parquet",
+            )])
             .validate_from_snapshot(s1);
         assert!(
             Arc::new(action).commit(&table_s2).await.is_ok(),

@@ -49,7 +49,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::compute::{cast, concat, filter_record_batch, take};
+use datafusion::arrow::compute::{cast, filter_record_batch, take};
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -102,14 +102,38 @@ use crate::to_datafusion_error;
 /// Name of the clause-routing column appended by [`IcebergMorMergeExec`].
 pub(crate) const MOR_CLAUSE_COL: &str = "__mor_clause";
 
-/// Rows per processing chunk inside the write node. The hash join emits its
-/// unmatched-build output — the entire NOT MATCHED (insert) set — as ONE
-/// batch, bypassing the output coalescer's target size. Processing that
-/// whole defeats file rolling (the rolling writer only checks size between
-/// write calls) and multiplies wide-row memory through every filter /
+/// Row CEILING per processing chunk inside the write node. The hash join
+/// emits its unmatched-build output — the entire NOT MATCHED (insert) set —
+/// as ONE batch, bypassing the output coalescer's target size. Processing
+/// that whole defeats file rolling (the rolling writer only checks size
+/// between write calls) and multiplies wide-row memory through every filter /
 /// evaluate / cast copy. Slicing is zero-copy; everything downstream then
-/// works on bounded rows.
+/// works on bounded rows. The effective chunk is the SMALLER of this ceiling
+/// and the byte-derived row count ([`byte_bounded_chunk_rows`]) — a fixed
+/// row count alone lets wide-TEXT rows blow the byte budget (8192 rows at
+/// 500 KB/row is 4 GB).
 const MOR_WRITE_CHUNK_ROWS: usize = 8192;
+
+/// Default byte target for materialized write-path batches (see
+/// [`MorMergeOptions::chunk_target_bytes`]). Peak write-path memory scales
+/// roughly as target x (workers x channel depth + in-flight), so 32 MiB
+/// keeps the default pool under ~0.5 GiB while staying decode-efficient.
+const MOR_CHUNK_TARGET_BYTES_DEFAULT: usize = 32 * 1024 * 1024;
+
+/// Floor for byte-derived batch row counts — protects decode efficiency
+/// against pathological width estimates.
+const MOR_CHUNK_MIN_ROWS: usize = 32;
+
+/// Rows per chunk for `batch` under `target_bytes`: the measured in-memory
+/// row width divides the byte target, clamped to
+/// [[`MOR_CHUNK_MIN_ROWS`], [`MOR_WRITE_CHUNK_ROWS`]].
+fn byte_bounded_chunk_rows(batch: &RecordBatch, target_bytes: usize) -> usize {
+    if batch.num_rows() == 0 {
+        return MOR_WRITE_CHUNK_ROWS;
+    }
+    let row_bytes = (batch.get_array_memory_size() / batch.num_rows()).max(1);
+    (target_bytes / row_bytes).clamp(MOR_CHUNK_MIN_ROWS, MOR_WRITE_CHUNK_ROWS)
+}
 
 /// How many existing data files to probe (parquet footers) when deriving the
 /// variant shredding layout under `write.parquet.shred-variants`. First
@@ -156,6 +180,20 @@ pub struct MorMergeOptions {
     /// prior-delete state is reconstructed by inverting that scan. Both
     /// paths commit byte-identical results.
     pub late_materialization: bool,
+    /// Byte target for materialized batches on the write path (consume-loop
+    /// chunks and the late-fetch decode batch size). Row counts are derived
+    /// from this against the measured/estimated row width, so wide-TEXT rows
+    /// get proportionally smaller batches. `None` = the built-in default
+    /// ([`MOR_CHUNK_TARGET_BYTES_DEFAULT`]).
+    pub chunk_target_bytes: Option<usize>,
+}
+
+impl MorMergeOptions {
+    fn chunk_target_bytes(&self) -> usize {
+        self.chunk_target_bytes
+            .unwrap_or(MOR_CHUNK_TARGET_BYTES_DEFAULT)
+            .max(1)
+    }
 }
 
 impl Default for MorMergeOptions {
@@ -164,6 +202,7 @@ impl Default for MorMergeOptions {
             deadline: None,
             write_workers: None,
             late_materialization: true,
+            chunk_target_bytes: None,
         }
     }
 }
@@ -217,7 +256,8 @@ enum WriteItem {
         batch: RecordBatch,
         rows: Vec<u32>,
         stored: Vec<MatchedRow>,
-        update_values: Arc<Vec<Vec<ArrayRef>>>,
+        /// Chunked evaluated SET values: [clause][chunk][assignment column].
+        update_values: Arc<Vec<Vec<Vec<ArrayRef>>>>,
     },
 }
 
@@ -416,33 +456,37 @@ async fn writer_task(
 }
 
 /// Build the updated row versions for one late-fetch batch: the fetched row
-/// with the claiming clause's SET columns overridden, grouped by clause
-/// (different clauses assign different columns).
+/// with the claiming clause's SET columns overridden, grouped by
+/// (clause, store chunk) — different clauses assign different columns, and
+/// the evaluated SET values live in per-chunk arrays that are indexed
+/// directly (never concatenated into one whole-merge array).
 fn build_update_rows(
     fbatch: &RecordBatch,
     fetch_rows: &[u32],
     stored: &[MatchedRow],
     clauses: &[MorClausePlan],
-    update_values: &[Vec<ArrayRef>],
+    update_values: &[Vec<Vec<ArrayRef>>],
     table_arrow: &ArrowSchemaRef,
     shred_overrides: &HashMap<String, DataType>,
 ) -> DFResult<Vec<RecordBatch>> {
     let fb_schema = fbatch.schema();
-    let mut by_clause: HashMap<u32, (Vec<u32>, Vec<u64>)> = HashMap::new();
+    let mut by_clause_chunk: HashMap<(u32, u32), (Vec<u32>, Vec<u32>)> = HashMap::new();
     for (i, m) in stored.iter().enumerate() {
-        let e = by_clause.entry(m.clause).or_default();
+        let e = by_clause_chunk
+            .entry((m.clause, m.update_chunk))
+            .or_default();
         e.0.push(fetch_rows[i]);
-        e.1.push(m.update_row as u64);
+        e.1.push(m.update_row);
     }
-    let mut out_batches = Vec::with_capacity(by_clause.len());
-    for (clause, (rows, store_rows)) in by_clause {
+    let mut out_batches = Vec::with_capacity(by_clause_chunk.len());
+    for ((clause, chunk), (rows, store_rows)) in by_clause_chunk {
         let MorActionPlan::Update(assignments) = &clauses[clause as usize].action else {
             return Err(DataFusionError::Internal(
                 "only update clauses collect fetch rows".to_string(),
             ));
         };
         let take_idx = UInt32Array::from(rows);
-        let store_idx = UInt64Array::from(store_rows);
+        let store_idx = UInt32Array::from(store_rows);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_arrow.fields().len());
         let mut out_fields: Vec<FieldRef> = Vec::with_capacity(table_arrow.fields().len());
         for field in table_arrow.fields() {
@@ -450,7 +494,11 @@ fn build_update_rows(
                 .iter()
                 .position(|(name, _)| name == field.name());
             let arr = match assigned {
-                Some(a) => take(update_values[clause as usize][a].as_ref(), &store_idx, None)?,
+                Some(a) => take(
+                    update_values[clause as usize][chunk as usize][a].as_ref(),
+                    &store_idx,
+                    None,
+                )?,
                 None => {
                     let src_idx = fb_schema
                         .index_of(field.name())
@@ -1067,7 +1115,12 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
 #[derive(Clone, Copy)]
 struct MatchedRow {
     clause: u32,
-    update_row: usize,
+    /// Which evaluated-SET-values chunk of the clause's store holds this
+    /// row's values (chunks are never concatenated — a whole-merge concat
+    /// would build one giant contiguous array per SET column).
+    update_chunk: u32,
+    /// Row within that chunk (chunks are at most `MOR_WRITE_CHUNK_ROWS`).
+    update_row: u32,
 }
 
 /// Derive per-variant-column PLAIN shredding types for the merge output by
@@ -1230,20 +1283,29 @@ async fn run_mor_write(
     let pos_idx = clause_idx_col - 1;
     let file_idx = clause_idx_col - 2;
 
-    // Per-UPDATE-clause store of evaluated SET values (one array per
-    // assignment, concatenated across batches at the end).
+    // Per-UPDATE-clause store of evaluated SET values, kept CHUNKED for the
+    // merge's lifetime — rows are addressed as (chunk, row) and taken per
+    // chunk at write time. Never concatenate the store: one whole-merge
+    // concat per SET column materializes a single giant contiguous array
+    // (2x peak memory, and the historical i32 offset-overflow site on
+    // wide-TEXT columns).
     let n_clauses = clauses.len();
     let mut update_stores: Vec<Vec<Vec<ArrayRef>>> = vec![Vec::new(); n_clauses];
-    let mut update_store_rows: Vec<usize> = vec![0; n_clauses];
     // (file, pos) -> matched bookkeeping. Duplicate claims are an error.
     let mut matched: HashMap<(String, u64), MatchedRow> = HashMap::new();
+    let chunk_target_bytes = options.chunk_target_bytes();
 
     while let Some(batch) =
         with_deadline(deadline, "reading the merge input", input.try_next()).await??
     {
+        // Byte-budgeted chunking: MOR_WRITE_CHUNK_ROWS is only the row
+        // CEILING — wide rows shrink the chunk so the materialized copies
+        // downstream (filter, SET evaluation, full-width build) stay near
+        // the byte target regardless of row width.
+        let chunk_rows = byte_bounded_chunk_rows(&batch, chunk_target_bytes);
         let mut chunk_start = 0;
         while chunk_start < batch.num_rows() {
-            let chunk_len = MOR_WRITE_CHUNK_ROWS.min(batch.num_rows() - chunk_start);
+            let chunk_len = chunk_rows.min(batch.num_rows() - chunk_start);
             let chunk = batch.slice(chunk_start, chunk_len);
             chunk_start += chunk_len;
 
@@ -1281,10 +1343,9 @@ async fn run_mor_write(
                             file_idx,
                             pos_idx,
                             ci as u32,
-                            update_store_rows[ci],
+                            update_stores[ci].len() as u32,
                             &mut matched,
                         )?;
-                        update_store_rows[ci] += subset.num_rows();
                         update_stores[ci].push(evaluated);
                     }
                     MorActionPlan::Delete => {
@@ -1295,24 +1356,9 @@ async fn run_mor_write(
         }
     }
 
-    // Concatenate each update clause's evaluated assignment arrays.
-    let update_values: Vec<Vec<ArrayRef>> = update_stores
-        .into_iter()
-        .map(|chunks| -> DFResult<Vec<ArrayRef>> {
-            if chunks.is_empty() {
-                return Ok(Vec::new());
-            }
-            let n_cols = chunks[0].len();
-            (0..n_cols)
-                .map(|c| {
-                    let parts: Vec<&dyn Array> =
-                        chunks.iter().map(|chunk| chunk[c].as_ref()).collect();
-                    concat(&parts).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                })
-                .collect()
-        })
-        .collect::<DFResult<_>>()?;
-    let update_values: Arc<Vec<Vec<ArrayRef>>> = Arc::new(update_values);
+    // Hand the CHUNKED store to the writers as-is — (chunk, row) addressing
+    // replaces the former whole-merge per-column concat.
+    let update_values: Arc<Vec<Vec<Vec<ArrayRef>>>> = Arc::new(update_stores);
 
     let mut new_delete_files: Vec<DataFile> = Vec::new();
     let mut removed_delete_files: Vec<DataFile> = Vec::new();
@@ -1412,9 +1458,33 @@ async fn run_mor_write(
                     .any(|(name, _)| ctx.shred_overrides.contains_key(name)),
                 _ => false,
             });
+        // The fetch task list: late -> sub-file byte-range tasks covering
+        // only the row groups holding matched positions (whole-file fallback
+        // per file when its layout cannot be ranged exactly), plus the
+        // widest per-file uncompressed row width from the footers; legacy ->
+        // the whole affected files.
+        let (read_tasks, est_row_bytes): (Vec<FileScanTask>, Option<usize>) = if late {
+            with_deadline(
+                deadline,
+                "planning the ranged late-materialization fetch",
+                plan_ranged_fetch_tasks(&table, &fetch_tasks, &positions_by_file),
+            )
+            .await??
+        } else {
+            (fetch_tasks.clone(), None)
+        };
+
         let mut reader_builder = table.reader_builder();
         if passthrough_ok {
             reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
+        }
+        // Byte-aware decode batches: without a hint the parquet reader's
+        // default row-count batches multiply per-row width unboundedly —
+        // wide-TEXT rows get proportionally fewer rows per batch.
+        if let Some(row_bytes) = est_row_bytes {
+            let batch_rows = (chunk_target_bytes / row_bytes.max(1))
+                .clamp(MOR_CHUNK_MIN_ROWS, MOR_WRITE_CHUNK_ROWS);
+            reader_builder = reader_builder.with_batch_size(batch_rows);
         }
         let reader = reader_builder.build();
 
@@ -1435,20 +1505,6 @@ async fn run_mor_write(
             HashMap::new()
         };
 
-        // The fetch task list: late -> sub-file byte-range tasks covering
-        // only the row groups holding matched positions (whole-file fallback
-        // per file when its layout cannot be ranged exactly); legacy -> the
-        // whole affected files.
-        let read_tasks: Vec<FileScanTask> = if late {
-            with_deadline(
-                deadline,
-                "planning the ranged late-materialization fetch",
-                plan_ranged_fetch_tasks(&table, &fetch_tasks, &positions_by_file),
-            )
-            .await??
-        } else {
-            fetch_tasks.clone()
-        };
         let task_stream = Box::pin(futures::stream::iter(
             read_tasks.into_iter().map(Ok).collect::<Vec<_>>(),
         )) as iceberg::scan::FileScanTaskStream;
@@ -1640,11 +1696,16 @@ async fn run_mor_write(
 /// exactly as under a whole-file read. A file whose layout cannot be ranged
 /// exactly falls back to its whole-file task. Footer reads are cheap
 /// metadata GETs, issued with bounded concurrency.
+///
+/// Also returns the WIDEST per-file mean uncompressed row width seen in the
+/// footers (bytes/row from row-group `total_byte_size`), which sizes the
+/// fetch decode batches by bytes — the footers are already in hand, so the
+/// estimate is free.
 async fn plan_ranged_fetch_tasks(
     table: &Table,
     fetch_tasks: &[FileScanTask],
     positions_by_file: &HashMap<String, Vec<u64>>,
-) -> DFResult<Vec<FileScanTask>> {
+) -> DFResult<(Vec<FileScanTask>, Option<usize>)> {
     let mut plans = Vec::with_capacity(fetch_tasks.len());
     for task in fetch_tasks {
         let positions = positions_by_file
@@ -1657,20 +1718,26 @@ async fn plan_ranged_fetch_tasks(
             positions,
         ));
     }
-    let nested: Vec<Vec<FileScanTask>> = futures::stream::iter(plans)
+    let nested: Vec<(Vec<FileScanTask>, Option<usize>)> = futures::stream::iter(plans)
         .buffered(MOR_FETCH_FOOTER_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(nested.into_iter().flatten().collect())
+    let max_row_bytes = nested.iter().filter_map(|(_, w)| *w).max();
+    Ok((
+        nested.into_iter().flat_map(|(tasks, _)| tasks).collect(),
+        max_row_bytes,
+    ))
 }
 
 /// Clip ONE affected file's task to the byte ranges owning its matched
 /// positions (whole-file fallback when the layout cannot be ranged exactly).
+/// The second element is the file's mean UNCOMPRESSED bytes/row from its
+/// row-group stats (None when the footer reports no rows).
 async fn plan_one_ranged_fetch(
     table: Table,
     task: FileScanTask,
     positions: Vec<u64>,
-) -> DFResult<Vec<FileScanTask>> {
+) -> DFResult<(Vec<FileScanTask>, Option<usize>)> {
     let input = table
         .file_io()
         .new_input(task.data_file_path())
@@ -1693,9 +1760,17 @@ async fn plan_one_ranged_fetch(
                 .into(),
             )
         })?;
+    let (total_bytes, total_rows) = meta
+        .metadata()
+        .row_groups()
+        .iter()
+        .fold((0i64, 0i64), |(b, r), rg| {
+            (b + rg.total_byte_size(), r + rg.num_rows())
+        });
+    let row_bytes = (total_rows > 0).then(|| ((total_bytes / total_rows).max(1)) as usize);
     let ranges = IcebergArrowReader::byte_ranges_for_row_positions(meta.metadata(), &positions)
         .map_err(to_datafusion_error)?;
-    Ok(match ranges {
+    let tasks = match ranges {
         Some(ranges) => ranges
             .into_iter()
             .map(|(start, length)| {
@@ -1709,7 +1784,8 @@ async fn plan_one_ranged_fetch(
             })
             .collect(),
         None => vec![task],
-    })
+    };
+    Ok((tasks, row_bytes))
 }
 
 /// Append the computed `_partition` column for partitioned tables; pass
@@ -1734,7 +1810,7 @@ fn with_partition_column(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Record each row of `subset` as matched (file, pos) -> (clause, store row).
+/// Record each row of `subset` as matched (file, pos) -> (clause, chunk, row).
 /// A row already claimed by another source row is an error (SQL MERGE forbids
 /// updating or deleting the same target row twice).
 fn record_matched(
@@ -1742,7 +1818,7 @@ fn record_matched(
     file_idx: usize,
     pos_idx: usize,
     clause: u32,
-    store_base: usize,
+    store_chunk: u32,
     matched: &mut HashMap<(String, u64), MatchedRow>,
 ) -> DFResult<()> {
     let file_arr = subset
@@ -1760,7 +1836,8 @@ fn record_matched(
         if matched
             .insert(key, MatchedRow {
                 clause,
-                update_row: store_base + row,
+                update_chunk: store_chunk,
+                update_row: row as u32,
             })
             .is_some()
         {
@@ -2041,5 +2118,57 @@ impl IcebergMorMergeCommitExec {
             Arc::new(UInt64Array::from(vec![count])) as ArrayRef,
         ])
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int64Array, LargeStringArray, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+    use super::{MOR_CHUNK_MIN_ROWS, MOR_WRITE_CHUNK_ROWS, byte_bounded_chunk_rows};
+
+    fn batch(rows: usize, payload: &str) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::LargeUtf8, false),
+        ]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(LargeStringArray::from_iter_values(std::iter::repeat_n(
+                payload, rows,
+            ))),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn narrow_rows_use_the_row_ceiling() {
+        let b = batch(1024, "x");
+        assert_eq!(
+            byte_bounded_chunk_rows(&b, 32 * 1024 * 1024),
+            MOR_WRITE_CHUNK_ROWS
+        );
+    }
+
+    #[test]
+    fn wide_rows_shrink_the_chunk() {
+        // ~64 KiB rows against a 1 MiB target -> low-double-digit rows,
+        // never the 8192-row ceiling that would materialize 512 MiB copies.
+        let b = batch(64, &"y".repeat(64 * 1024));
+        let rows = byte_bounded_chunk_rows(&b, 1024 * 1024);
+        assert!(rows < 64, "wide rows must shrink the chunk, got {rows}");
+        assert!(rows >= MOR_CHUNK_MIN_ROWS);
+    }
+
+    #[test]
+    fn floor_holds_for_pathological_widths() {
+        let b = batch(4, &"z".repeat(8 * 1024 * 1024));
+        assert_eq!(byte_bounded_chunk_rows(&b, 1), MOR_CHUNK_MIN_ROWS);
+        // Empty batches fall back to the ceiling (nothing to measure).
+        let empty = batch(0, "x");
+        assert_eq!(byte_bounded_chunk_rows(&empty, 1), MOR_WRITE_CHUNK_ROWS);
     }
 }

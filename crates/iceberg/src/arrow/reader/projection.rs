@@ -1156,7 +1156,7 @@ message schema {
         assert_eq!(batch.num_columns(), 2);
 
         // Verify position-based mapping: field_id 1 → position 0, field_id 2 → position 1
-        let name_array = batch.column(0).as_string::<i32>();
+        let name_array = batch.column(0).as_string::<i64>();
         assert_eq!(name_array.value(0), "Alice");
         assert_eq!(name_array.value(1), "Bob");
         assert_eq!(name_array.value(2), "Charlie");
@@ -1259,7 +1259,7 @@ message schema {
         assert_eq!(batch.num_columns(), 2);
 
         // field 2 (`name`) must come from physical column 0, not be NULL-filled.
-        let name_array = batch.column(0).as_string::<i32>();
+        let name_array = batch.column(0).as_string::<i64>();
         assert_eq!(
             name_array.null_count(),
             0,
@@ -1270,7 +1270,7 @@ message schema {
         assert_eq!(name_array.value(2), "Charlie");
 
         // field 4 (`subdept`) must come from physical column 1.
-        let subdept_array = batch.column(1).as_string::<i32>();
+        let subdept_array = batch.column(1).as_string::<i64>();
         assert_eq!(subdept_array.null_count(), 0);
         assert_eq!(subdept_array.value(0), "comms");
         assert_eq!(subdept_array.value(1), "tax");
@@ -1369,9 +1369,9 @@ message schema {
         );
 
         let batch = &result[0];
-        let name_array = batch.column(0).as_string::<i32>();
+        let name_array = batch.column(0).as_string::<i64>();
         assert_eq!(name_array.value(0), "Alice");
-        let subdept_array = batch.column(1).as_string::<i32>();
+        let subdept_array = batch.column(1).as_string::<i64>();
         assert_eq!(subdept_array.value(0), "Bob");
     }
 
@@ -1459,11 +1459,11 @@ message schema {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 2);
 
-        let col1_array = batch.column(0).as_string::<i32>();
+        let col1_array = batch.column(0).as_string::<i64>();
         assert_eq!(col1_array.value(0), "a");
         assert_eq!(col1_array.value(1), "b");
 
-        let col3_array = batch.column(1).as_string::<i32>();
+        let col3_array = batch.column(1).as_string::<i64>();
         assert_eq!(col3_array.value(0), "c");
         assert_eq!(col3_array.value(1), "d");
     }
@@ -1546,7 +1546,7 @@ message schema {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
 
-        let name_array = batch.column(0).as_string::<i32>();
+        let name_array = batch.column(0).as_string::<i64>();
         assert_eq!(name_array.value(0), "Alice");
         assert_eq!(name_array.value(1), "Bob");
 
@@ -1557,7 +1557,7 @@ message schema {
         assert_eq!(age_array.value(1), 25);
 
         // Verify missing column filled with NULLs
-        let city_array = batch.column(2).as_string::<i32>();
+        let city_array = batch.column(2).as_string::<i64>();
         assert_eq!(city_array.null_count(), 2);
         assert!(city_array.is_null(0));
         assert!(city_array.is_null(1));
@@ -1648,7 +1648,7 @@ message schema {
         let mut all_values = Vec::new();
 
         for batch in &result {
-            let name_array = batch.column(0).as_string::<i32>();
+            let name_array = batch.column(0).as_string::<i64>();
             let value_array = batch
                 .column(1)
                 .as_primitive::<arrow_array::types::Int32Type>();
@@ -1786,7 +1786,7 @@ message schema {
         let person_array = batch.column(1).as_struct();
         assert_eq!(person_array.num_columns(), 2);
 
-        let name_array = person_array.column(0).as_string::<i32>();
+        let name_array = person_array.column(0).as_string::<i64>();
         assert_eq!(name_array.value(0), "Alice");
         assert_eq!(name_array.value(1), "Bob");
 
@@ -2139,7 +2139,7 @@ message schema {
         assert_eq!(id_col.value(2), 9);
         assert_eq!(id_col.value(3), 13);
 
-        let name_col = batch.column(1).as_string::<i32>();
+        let name_col = batch.column(1).as_string::<i64>();
         assert_eq!(name_col.value(0), "Alice");
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_array::builder::{MapBuilder, MapFieldNames, PrimitiveBuilder, StringBuilder};
+use arrow_array::builder::{LargeStringBuilder, MapBuilder, MapFieldNames, PrimitiveBuilder};
 use arrow_array::types::{Int64Type, TimestampMicrosecondType};
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, stream};
@@ -86,27 +86,28 @@ impl<'a> SnapshotsTable<'a> {
             PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone("+00:00");
         let mut snapshot_id = PrimitiveBuilder::<Int64Type>::new();
         let mut parent_id = PrimitiveBuilder::<Int64Type>::new();
-        let mut operation = StringBuilder::new();
-        let mut manifest_list = StringBuilder::new();
+        // String columns build as LargeUtf8 to match the iceberg-derived
+        // arrow schema (the LargeUtf8 flip).
+        let mut operation = LargeStringBuilder::new();
+        let mut manifest_list = LargeStringBuilder::new();
         let mut summary = MapBuilder::new(
             Some(MapFieldNames {
                 entry: DEFAULT_MAP_FIELD_NAME.to_string(),
                 key: MAP_KEY_FIELD_NAME.to_string(),
                 value: MAP_VALUE_FIELD_NAME.to_string(),
             }),
-            StringBuilder::new(),
-            StringBuilder::new(),
+            LargeStringBuilder::new(),
+            LargeStringBuilder::new(),
         )
         .with_keys_field(Arc::new(
-            Field::new(MAP_KEY_FIELD_NAME, DataType::Utf8, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "7".to_string(),
-            )])),
+            Field::new(MAP_KEY_FIELD_NAME, DataType::LargeUtf8, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())]),
+            ),
         ))
         .with_values_field(Arc::new(
-            Field::new(MAP_VALUE_FIELD_NAME, DataType::Utf8, true).with_metadata(HashMap::from([
-                (PARQUET_FIELD_ID_META_KEY.to_string(), "8".to_string()),
-            ])),
+            Field::new(MAP_VALUE_FIELD_NAME, DataType::LargeUtf8, true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "8".to_string())]),
+            ),
         ));
         for snapshot in self.table.metadata().snapshots() {
             committed_at.append_value(snapshot.timestamp_ms() * 1000);
@@ -154,9 +155,9 @@ mod tests {
                 Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
-                Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
-                Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
-                Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
+                Field { "operation": nullable LargeUtf8, metadata: {"PARQUET:field_id": "4"} },
+                Field { "manifest_list": nullable LargeUtf8, metadata: {"PARQUET:field_id": "5"} },
+                Field { "summary": nullable Map("key_value": non-null Struct("key": non-null LargeUtf8, metadata: {"PARQUET:field_id": "7"}, "value": LargeUtf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
             expect![[r#"
                 committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
                 [
@@ -173,7 +174,7 @@ mod tests {
                   null,
                   3051729675574597004,
                 ],
-                operation: StringArray
+                operation: LargeStringArray
                 [
                   "append",
                   "append",
@@ -186,12 +187,12 @@ mod tests {
                 [
                 ]
                 [
-                -- child 0: "key" (Utf8)
-                StringArray
+                -- child 0: "key" (LargeUtf8)
+                LargeStringArray
                 [
                 ]
-                -- child 1: "value" (Utf8)
-                StringArray
+                -- child 1: "value" (LargeUtf8)
+                LargeStringArray
                 [
                 ]
                 ],
@@ -200,12 +201,12 @@ mod tests {
                 [
                 ]
                 [
-                -- child 0: "key" (Utf8)
-                StringArray
+                -- child 0: "key" (LargeUtf8)
+                LargeStringArray
                 [
                 ]
-                -- child 1: "value" (Utf8)
-                StringArray
+                -- child 1: "value" (LargeUtf8)
+                LargeStringArray
                 [
                 ]
                 ],

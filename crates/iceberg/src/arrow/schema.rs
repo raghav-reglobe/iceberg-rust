@@ -676,7 +676,11 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
             )),
             crate::spec::PrimitiveType::String => {
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Utf8))
+                // LargeUtf8 (64-bit offsets): a single i32-offset Utf8 array
+                // caps at 2GiB of string data, which wide-TEXT tables exceed
+                // per batch/concat. Parquet physical bytes are unchanged
+                // (BYTE_ARRAY either way); Binary already maps to LargeBinary.
+                Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeUtf8))
             }
             crate::spec::PrimitiveType::Uuid => Ok(ArrowSchemaOrFieldOrType::Type(
                 DataType::FixedSizeBinary(16),
@@ -1625,7 +1629,7 @@ mod tests {
     fn arrow_schema_for_schema_to_arrow_schema_test() -> ArrowSchema {
         let fields = Fields::from(vec![
             simple_field("key", DataType::Int32, false, "28"),
-            simple_field("value", DataType::Utf8, true, "29"),
+            simple_field("value", DataType::LargeUtf8, true, "29"),
         ]);
 
         let r#struct = DataType::Struct(fields);
@@ -1636,7 +1640,7 @@ mod tests {
 
         let fields = Fields::from(vec![
             simple_field("aa", DataType::Int32, false, "18"),
-            simple_field("bb", DataType::Utf8, true, "19"),
+            simple_field("bb", DataType::LargeUtf8, true, "19"),
             simple_field(
                 "cc",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1650,8 +1654,8 @@ mod tests {
         ArrowSchema::new(vec![
             simple_field("a", DataType::Int32, false, "2"),
             simple_field("b", DataType::Int64, false, "1"),
-            simple_field("c", DataType::Utf8, false, "3"),
-            simple_field("n", DataType::Utf8, false, "21"),
+            simple_field("c", DataType::LargeUtf8, false, "3"),
+            simple_field("n", DataType::LargeUtf8, false, "21"),
             simple_field(
                 "d",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1694,7 +1698,7 @@ mod tests {
                 "large_list",
                 DataType::List(Arc::new(simple_field(
                     "element",
-                    DataType::Utf8,
+                    DataType::LargeUtf8,
                     false,
                     "23",
                 ))),
@@ -1999,7 +2003,19 @@ mod tests {
                 .into(),
             ]));
             assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
-            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+            // Iceberg `string` converts to LargeUtf8 (64-bit offsets) — the
+            // Utf8 -> string -> LargeUtf8 round trip is asymmetric by design.
+            let arrow_type_large = DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int64, false).with_metadata(HashMap::from_iter([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    1.to_string(),
+                )])),
+                Field::new("b", DataType::LargeUtf8, true).with_metadata(HashMap::from_iter([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    2.to_string(),
+                )])),
+            ]));
+            assert_eq!(arrow_type_large, type_to_arrow_type(&iceberg_type).unwrap());
 
             // initial_default and write_default is ignored
             let iceberg_type = Type::Struct(StructType::new(vec![
@@ -2026,7 +2042,7 @@ mod tests {
                 }
                 .into(),
             ]));
-            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+            assert_eq!(arrow_type_large, type_to_arrow_type(&iceberg_type).unwrap());
         }
 
         // test dictionary type

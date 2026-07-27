@@ -327,8 +327,7 @@ impl OpenDalStorage {
                         match cache.get(bucket) {
                             Some(op) => op.clone(),
                             None => {
-                                let op =
-                                    s3_config_build(config, customized_credential_load, path)?;
+                                let op = s3_config_build(config, customized_credential_load, path)?;
                                 cache.insert(bucket.to_string(), op.clone());
                                 op
                             }
