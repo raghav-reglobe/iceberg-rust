@@ -1576,6 +1576,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_catalog_reauths_on_401_expired_token() {
+        let mut server = Server::new_async().await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+            None,
+            None,
+        );
+
+        // Prime the token that the server will then treat as expired.
+        let token = catalog.context().await.unwrap().client.token().await;
+        oauth_mock.assert_async().await;
+        config_mock.assert_async().await;
+        assert_eq!(token, Some("ey000000000000".to_string()));
+
+        // The server now 401s the stale token and only accepts the fresh
+        // one — matched on the Authorization header, so ordering between
+        // the two namespace mocks is deterministic.
+        let stale_mock = server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", "Bearer ey000000000000")
+            .with_status(401)
+            .with_body(
+                r#"{"error":{"message":"token expired","type":"NotAuthorizedException","code":401}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let fresh_oauth_mock =
+            create_oauth_mock_with_path(&mut server, "/v1/oauth/tokens", "ey000000000001", 200)
+                .await;
+        let fresh_mock = server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", "Bearer ey000000000001")
+            .with_status(200)
+            .with_body(r#"{"namespaces": [["ns1"]]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let namespaces = catalog.list_namespaces(None).await.unwrap();
+        assert_eq!(namespaces, vec![
+            NamespaceIdent::from_vec(vec!["ns1".to_string()]).unwrap()
+        ]);
+        stale_mock.assert_async().await;
+        fresh_oauth_mock.assert_async().await;
+        fresh_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_regenerate_token() {
         let mut server = Server::new_async().await;
         let oauth_mock = create_oauth_mock(&mut server).await;
