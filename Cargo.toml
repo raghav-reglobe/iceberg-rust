@@ -79,13 +79,10 @@ chrono = "0.4.41"
 clap = { version = "4.5.48", features = ["derive", "cargo"] }
 crc32fast = "1.5"
 dashmap = "6"
-# 54.0.0 (not upstream's 54.1.0): the [patch.crates-io] vendored DataFusion
-# (pulse-integration MERGE branch) is version 54.0.0 — the patch only applies
-# when the requirement matches it.
-datafusion = "54.0.0"
-datafusion-cli = "54.0.0"
-datafusion-ffi = "54.0.0"
-datafusion-sqllogictest = "54.0.0"
+datafusion = "54.1.0"
+datafusion-cli = "54.1.0"
+datafusion-ffi = "54.1.0"
+datafusion-sqllogictest = "54.1.0"
 derive_builder = "0.20"
 dirs = "6"
 enum-ordinalize = "4.3.0"
