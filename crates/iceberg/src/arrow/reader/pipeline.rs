@@ -396,11 +396,14 @@ impl FileScanTaskReader {
             .collect();
 
         // Augment the Parquet projection with any equality delete key columns
-        // that the user didn't request. Guard: when the user's projection is
-        // empty, ProjectionMask::all() reads all columns — no augmentation needed.
-        let augmented_field_ids: Vec<i32> = if !eq_delete_key_field_ids.is_empty()
-            && !project_field_ids_without_metadata.is_empty()
-        {
+        // that the user didn't request. An EMPTY user projection (count-style
+        // scans) is NOT exempt: the parquet mask may read all columns, but the
+        // RecordBatchTransformer then trims the batch to the (empty) user
+        // projection BEFORE the eq-delete filter runs — the key column vanishes
+        // and the filter errors ("key column not found in batch"). So with eq
+        // deletes present, an empty projection becomes exactly the key columns
+        // (also narrows the read); they are stripped again after filtering.
+        let augmented_field_ids: Vec<i32> = if !eq_delete_key_field_ids.is_empty() {
             let user_set: HashSet<i32> =
                 project_field_ids_without_metadata.iter().copied().collect();
             let mut augmented = project_field_ids_without_metadata.clone();
@@ -435,19 +438,20 @@ impl FileScanTaskReader {
         // column re-ordering, partition constants, and virtual field addition (like _file).
         // When equality delete key columns were added to the projection, the transformer
         // must also know about them so it can apply type promotion correctly.
-        let transformer_field_ids: Vec<i32> =
-            if !eq_delete_key_field_ids.is_empty() && !task.project_field_ids.is_empty() {
-                let user_set: HashSet<i32> = task.project_field_ids.iter().copied().collect();
-                let mut ids = task.project_field_ids.to_vec();
-                for &id in &eq_delete_key_field_ids {
-                    if !user_set.contains(&id) {
-                        ids.push(id);
-                    }
+        let transformer_field_ids: Vec<i32> = if !eq_delete_key_field_ids.is_empty() {
+            // Empty user projection included — the transformer must carry the
+            // key columns through to the filter (see augmentation note above).
+            let user_set: HashSet<i32> = task.project_field_ids.iter().copied().collect();
+            let mut ids = task.project_field_ids.to_vec();
+            for &id in &eq_delete_key_field_ids {
+                if !user_set.contains(&id) {
+                    ids.push(id);
                 }
-                ids
-            } else {
-                task.project_field_ids.to_vec()
-            };
+            }
+            ids
+        } else {
+            task.project_field_ids.to_vec()
+        };
 
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), &transformer_field_ids);
@@ -633,11 +637,12 @@ impl FileScanTaskReader {
         // so keeping the first `task.project_field_ids.len()` columns restores
         // the user's projection exactly.)
         let user_cols_to_keep = if !eq_delete_key_field_ids.is_empty()
-            && !task.project_field_ids.is_empty()
             && eq_delete_key_field_ids
                 .iter()
                 .any(|id| !task.project_field_ids.contains(id))
         {
+            // May be 0 (count-style scans): strip to a zero-column batch that
+            // explicitly preserves num_rows.
             Some(task.project_field_ids.len())
         } else {
             None
@@ -769,6 +774,23 @@ impl ArrowReader {
     /// projection solely for delete evaluation. The extra columns are always
     /// appended at the end by the augmentation logic in `process_file_scan_task`.
     fn strip_extra_columns(batch: RecordBatch, num_cols_to_keep: usize) -> Result<RecordBatch> {
+        if num_cols_to_keep == 0 {
+            // Zero-column result (empty user projection, e.g. COUNT scans):
+            // build explicitly with a preserved row count — arrow's project()
+            // semantics for an empty index set are not relied upon.
+            use arrow_array::RecordBatchOptions;
+            return RecordBatch::try_new_with_options(
+                Arc::new(arrow_schema::Schema::empty()),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("stripping eq delete key columns (empty projection): {e}"),
+                )
+            });
+        }
         let indices: Vec<usize> = (0..num_cols_to_keep).collect();
         batch.project(&indices).map_err(|e| {
             Error::new(
@@ -1020,6 +1042,54 @@ fn unshred_variant_columns(batch: RecordBatch, skip: &HashSet<String>) -> Result
     let new_schema =
         Arc::new(ArrowSchema::new(new_fields).with_metadata(schema.metadata().clone()));
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    use super::ArrowReader;
+
+    /// Empty user projection (count-style scans) + eq-delete key stripping:
+    /// the zero-column result batch must preserve num_rows explicitly —
+    /// the regression behind "Equality delete key column not found in batch"
+    /// was the projection/transformer dropping the key before the filter;
+    /// this pins the final strip-to-zero step.
+    #[test]
+    fn strip_to_zero_columns_preserves_row_count() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![
+            1, 2, 3, 4, 5,
+        ]))])
+        .unwrap();
+        let out = ArrowReader::strip_extra_columns(batch, 0).unwrap();
+        assert_eq!(out.num_columns(), 0);
+        assert_eq!(out.num_rows(), 5);
+    }
+
+    #[test]
+    fn strip_keeps_leading_user_columns() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ])
+        .unwrap();
+        let out = ArrowReader::strip_extra_columns(batch, 1).unwrap();
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.schema().field(0).name(), "a");
+        assert_eq!(out.num_rows(), 2);
+    }
 }
 
 #[cfg(test)]
