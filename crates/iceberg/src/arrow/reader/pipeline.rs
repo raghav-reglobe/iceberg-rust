@@ -20,11 +20,12 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
+use arrow_select::filter::filter_record_batch;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -36,9 +37,12 @@ use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
 };
-use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::caching_delete_file_loader::{
+    CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet,
+};
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::large_offsets::widen_variable_length_types;
+use crate::arrow::value::arrow_primitive_to_literal;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::cache::DataBytesCache;
@@ -50,7 +54,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::Datum;
+use crate::spec::{DataContentType, Datum};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -378,13 +382,45 @@ impl FileScanTaskReader {
             .copied()
             .collect();
 
-        // Create projection mask based on field IDs
+        // Collect equality delete key field IDs from the task's delete files.
+        // These may reference columns NOT in the user's projection. We must
+        // include them in the Parquet read so equality deletes can be applied,
+        // then strip them from the output batches afterward.
+        let eq_delete_key_field_ids: BTreeSet<i32> = task
+            .deletes
+            .iter()
+            .filter(|d| matches!(d.file_type, DataContentType::EqualityDeletes))
+            .filter_map(|d| d.equality_ids.as_ref())
+            .flatten()
+            .copied()
+            .collect();
+
+        // Augment the Parquet projection with any equality delete key columns
+        // that the user didn't request. Guard: when the user's projection is
+        // empty, ProjectionMask::all() reads all columns — no augmentation needed.
+        let augmented_field_ids: Vec<i32> = if !eq_delete_key_field_ids.is_empty()
+            && !project_field_ids_without_metadata.is_empty()
+        {
+            let user_set: HashSet<i32> =
+                project_field_ids_without_metadata.iter().copied().collect();
+            let mut augmented = project_field_ids_without_metadata.clone();
+            for &id in &eq_delete_key_field_ids {
+                if !user_set.contains(&id) && !is_metadata_field(id) {
+                    augmented.push(id);
+                }
+            }
+            augmented
+        } else {
+            project_field_ids_without_metadata.clone()
+        };
+
+        // Create projection mask based on field IDs (augmented with eq delete keys)
         // - If file has embedded IDs: field-ID-based projection
         // - If name mapping applied: field-ID-based projection using the IDs the name
         //   mapping assigned to the Arrow schema
         // - Otherwise: position-based fallback projection
         let projection_mask = ArrowReader::get_arrow_projection_mask(
-            &project_field_ids_without_metadata,
+            &augmented_field_ids,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
@@ -396,9 +432,25 @@ impl FileScanTaskReader {
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
         // that come back from the file, such as type promotion, default column insertion,
-        // column re-ordering, partition constants, and virtual field addition (like _file)
+        // column re-ordering, partition constants, and virtual field addition (like _file).
+        // When equality delete key columns were added to the projection, the transformer
+        // must also know about them so it can apply type promotion correctly.
+        let transformer_field_ids: Vec<i32> =
+            if !eq_delete_key_field_ids.is_empty() && !task.project_field_ids.is_empty() {
+                let user_set: HashSet<i32> = task.project_field_ids.iter().copied().collect();
+                let mut ids = task.project_field_ids.to_vec();
+                for &id in &eq_delete_key_field_ids {
+                    if !user_set.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            } else {
+                task.project_field_ids.to_vec()
+            };
+
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), &transformer_field_ids);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -460,36 +512,23 @@ impl FileScanTaskReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let eq_delete_sets = delete_filter.build_equality_delete_sets(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
+        // The scan predicate (if any) is applied via the Parquet RowFilter.
+        // Equality deletes are applied as a separate post-read filter step using
+        // a HashSet for O(1) per-row lookups instead of O(N) predicate evaluation.
+        let final_predicate = task.predicate.clone();
 
-        // There are three possible sources for potential lists of selected RowGroup indices,
+        // There are two possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
-        // Selected RowGroup index lists can come from three sources:
+        // Selected RowGroup index lists can come from two sources:
         //   * When task.start and task.length specify a byte range (file splitting);
-        //   * When there are equality delete files that are applicable;
         //   * When there is a scan predicate and row_group_filtering_enabled = true.
         // `RowSelection`s can be created in either or both of the following cases:
         //   * When there are positional delete files that are applicable;
         //   * When there is a scan predicate and row_selection_enabled = true
-        // Note that row group filtering from predicates only happens when
-        // there is a scan predicate AND row_group_filtering_enabled = true,
-        // but we perform row selection filtering if there are applicable
-        // equality delete files OR (there is a scan predicate AND row_selection_enabled),
-        // since the only implemented method of applying positional deletes is
-        // by using a `RowSelection`.
+        // Equality deletes are applied as a post-read hash-based filter (not via
+        // RowFilter or RowSelection) for O(1) per-row lookups.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
 
@@ -587,8 +626,27 @@ impl FileScanTaskReader {
                 record_batch_stream_builder.with_row_groups(selected_row_group_indices);
         }
 
+        // If we augmented the projection with equality delete key columns that
+        // the user didn't request, strip those extra columns after applying
+        // deletes so the output schema matches the user's original projection.
+        // (The extras are always appended at the END of transformer_field_ids,
+        // so keeping the first `task.project_field_ids.len()` columns restores
+        // the user's projection exactly.)
+        let user_cols_to_keep = if !eq_delete_key_field_ids.is_empty()
+            && !task.project_field_ids.is_empty()
+            && eq_delete_key_field_ids
+                .iter()
+                .any(|id| !task.project_field_ids.contains(id))
+        {
+            Some(task.project_field_ids.len())
+        } else {
+            None
+        };
+
         // Build the batch stream and send all the RecordBatches that it generates
-        // to the requester.
+        // to the requester. Equality delete filtering runs as a post-read step
+        // AFTER the transformer (hash-based, O(1) per row — never a predicate
+        // tree); augmentation-only key columns are stripped last.
         let record_batch_stream =
             record_batch_stream_builder
                 .build()?
@@ -601,7 +659,17 @@ impl FileScanTaskReader {
                         // physical shredded shape; the transformer targets that type.
                         let batch = unshred_variant_columns(batch, &fold_skip)?;
                         // Process the record batch (type promotion, column reordering, virtual fields, etc.)
-                        record_batch_transformer.process_record_batch(batch)
+                        let mut batch = record_batch_transformer.process_record_batch(batch)?;
+                        // Apply equality deletes via hash-set lookup. Multiple
+                        // sets occur only when delete files use different
+                        // equality_ids column sets.
+                        for eq_delete_set in &eq_delete_sets {
+                            batch = ArrowReader::apply_eq_delete_filter(&batch, eq_delete_set)?;
+                        }
+                        if let Some(keep) = user_cols_to_keep {
+                            batch = ArrowReader::strip_extra_columns(batch, keep)?;
+                        }
+                        Ok(batch)
                     }
                     Err(err) => Err(err.into()),
                 });
@@ -611,6 +679,105 @@ impl FileScanTaskReader {
 }
 
 impl ArrowReader {
+    /// Filters a record batch by removing rows whose equality-delete key columns
+    /// match an entry in the delete set. Uses O(1) hash lookups per row.
+    fn apply_eq_delete_filter(batch: &RecordBatch, delete_set: &EqDeleteSet) -> Result<RecordBatch> {
+        // For each delete key field, locate the corresponding column in the
+        // batch (by field_id from the Arrow field metadata, falling back to
+        // name) and convert it to a Vec<Option<Datum>> for hash lookups.
+        let datum_columns: Vec<Vec<Option<Datum>>> = delete_set
+            .fields
+            .iter()
+            .map(|(field_name, field_id)| {
+                let col = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(col_idx, field)| {
+                        let id = field
+                            .metadata()
+                            .get(PARQUET_FIELD_ID_META_KEY)?
+                            .parse::<i32>()
+                            .ok()?;
+                        (id == *field_id).then(|| batch.column(col_idx))
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        batch
+                            .schema()
+                            .index_of(field_name)
+                            .map(|idx| batch.column(idx))
+                            .map_err(|_| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    format!(
+                                        "Equality delete key column '{field_name}' (field_id={field_id}) not found in batch"
+                                    ),
+                                )
+                            })
+                    })?;
+                let iceberg_type = crate::arrow::arrow_type_to_type(col.data_type())?;
+                let literals = arrow_primitive_to_literal(col, &iceberg_type)?;
+                let primitive_type = iceberg_type
+                    .as_primitive_type()
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Unexpected, "field is not a primitive type")
+                    })?
+                    .clone();
+                let datums = literals
+                    .into_iter()
+                    .map(|opt_lit| {
+                        opt_lit
+                            .and_then(|lit| lit.as_primitive_literal())
+                            .map(|prim_lit| Datum::new(primitive_type.clone(), prim_lit))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(datums)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let num_rows = batch.num_rows();
+        let num_cols = datum_columns.len();
+        let mut keep = vec![true; num_rows];
+
+        // Reuse a single EqDeleteKey allocation across all rows to avoid
+        // per-row Vec allocation + clone.
+        let mut probe_key = EqDeleteKey(vec![None; num_cols]);
+
+        for (row_idx, keep_row) in keep.iter_mut().enumerate() {
+            for (col_idx, col) in datum_columns.iter().enumerate() {
+                probe_key.0[col_idx].clone_from(&col[row_idx]);
+            }
+            if delete_set.keys.contains(&probe_key) {
+                *keep_row = false;
+            }
+        }
+
+        let mask = BooleanArray::from(keep);
+        filter_record_batch(batch, &mask).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to filter record batch: {e}"),
+            )
+        })
+    }
+
+    /// Strips columns beyond `num_cols_to_keep` from the batch.
+    ///
+    /// Used to remove equality delete key columns that were added to the
+    /// projection solely for delete evaluation. The extra columns are always
+    /// appended at the end by the augmentation logic in `process_file_scan_task`.
+    fn strip_extra_columns(batch: RecordBatch, num_cols_to_keep: usize) -> Result<RecordBatch> {
+        let indices: Vec<usize> = (0..num_cols_to_keep).collect();
+        batch.project(&indices).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("stripping eq delete key columns: {e}"),
+            )
+        })
+    }
+
     /// Opens a Parquet file and loads its metadata, wrapping the reader with
     /// [`CountingFileRead`] so all I/O is accumulated into `bytes_read`.
     ///
