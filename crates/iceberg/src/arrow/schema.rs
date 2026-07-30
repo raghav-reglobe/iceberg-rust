@@ -47,6 +47,16 @@ pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
 /// UTC time zone for Arrow timestamp type.
 pub const UTC_TIME_ZONE: &str = "+00:00";
 
+/// Whether an Arrow timestamp time-zone string denotes UTC. Writers spell
+/// UTC differently — Spark and Doris emit the IANA alias `Etc/UTC`, others
+/// `UTC`, `+00:00`, or `Z` — and all of them carry identical timestamptz
+/// semantics (the stored value is UTC micros/nanos regardless). Rejecting an
+/// alias fails whole-file reads over data that is bit-identical to accepted
+/// files ("Unsupported Arrow data type: Timestamp(µs, Etc/UTC)").
+fn is_utc_zone(zone: &str) -> bool {
+    matches!(zone, "UTC" | "+00:00" | "Etc/UTC" | "Z" | "utc" | "+0000" | "00:00")
+}
+
 /// The canonical Arrow [`arrow.parquet.variant`] extension type.
 ///
 /// Iceberg stores a Variant as a `Struct { metadata: Binary, value: Binary }`. Attaching this
@@ -543,14 +553,12 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                 Ok(Type::Primitive(PrimitiveType::TimestampNs))
             }
             DataType::Timestamp(unit, Some(zone))
-                if unit == &TimeUnit::Microsecond
-                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+                if unit == &TimeUnit::Microsecond && is_utc_zone(zone.as_ref()) =>
             {
                 Ok(Type::Primitive(PrimitiveType::Timestamptz))
             }
             DataType::Timestamp(unit, Some(zone))
-                if unit == &TimeUnit::Nanosecond
-                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+                if unit == &TimeUnit::Nanosecond && is_utc_zone(zone.as_ref()) =>
             {
                 Ok(Type::Primitive(PrimitiveType::TimestamptzNs))
             }
