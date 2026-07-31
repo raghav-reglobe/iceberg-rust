@@ -112,6 +112,12 @@ enum DeleteFileContext {
 enum ParsedDeleteFileContext {
     DelVecs {
         file_path: String,
+        /// The load-unit identity to finish: `Some(blob offset)` for a V3
+        /// deletion vector (a Puffin container may pack multiple blobs, each
+        /// an independent load unit), `None` for a whole-file Parquet
+        /// positional-delete stream. Must match the key used at
+        /// `try_start_pos_del_load`.
+        content_offset: Option<u64>,
         results: HashMap<String, DeleteVector>,
     },
     EqDel,
@@ -255,12 +261,17 @@ impl CachingDeleteFileLoader {
 
                 while let Some(item) = results_stream.next().await {
                     let item = item?;
-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
+                    if let ParsedDeleteFileContext::DelVecs {
+                        file_path,
+                        content_offset,
+                        results,
+                    } = item
+                    {
                         for (data_file_path, delete_vector) in results.into_iter() {
                             del_filter.upsert_delete_vector(data_file_path, delete_vector);
                         }
-                        // Mark the positional delete file as fully loaded so waiters can proceed
-                        del_filter.finish_pos_del_load(&file_path);
+                        // Mark the positional delete load unit as fully loaded so waiters can proceed
+                        del_filter.finish_pos_del_load(&file_path, content_offset);
                     }
                 }
 
@@ -282,7 +293,16 @@ impl CachingDeleteFileLoader {
     ) -> Result<DeleteFileContext> {
         match task.file_type {
             DataContentType::PositionDeletes => {
-                match del_filter.try_start_pos_del_load(&task.file_path) {
+                // Load-unit identity: for a Puffin container, the DV blob's
+                // content offset (one container may pack multiple blobs, each
+                // referencing a different data file — every blob must load);
+                // None for a whole-file Parquet positional-delete stream.
+                let load_offset = if task.file_format == DataFileFormat::Puffin {
+                    task.content_offset.map(|o| o as u64)
+                } else {
+                    None
+                };
+                match del_filter.try_start_pos_del_load(&task.file_path, load_offset) {
                     PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
                     PosDelLoadAction::WaitFor(notified) => {
                         // Positional deletes are accessed synchronously by ArrowReader.
@@ -393,6 +413,7 @@ impl CachingDeleteFileLoader {
                 let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
                 Ok(ParsedDeleteFileContext::DelVecs {
                     file_path,
+                    content_offset: None,
                     results: del_vecs,
                 })
             }
@@ -408,7 +429,11 @@ impl CachingDeleteFileLoader {
                         .await?;
                 let mut results = HashMap::default();
                 results.insert(referenced_data_file, delete_vector);
-                Ok(ParsedDeleteFileContext::DelVecs { file_path, results })
+                Ok(ParsedDeleteFileContext::DelVecs {
+                    file_path,
+                    content_offset: Some(content_offset),
+                    results,
+                })
             }
             DeleteFileContext::FreshEqDel {
                 sender,
@@ -1472,6 +1497,120 @@ mod tests {
         let mut positions: Vec<u64> = dv_handle.lock().unwrap().iter().collect();
         positions.sort();
         assert_eq!(positions, vec![1, 3]);
+    }
+
+    /// Regression: ONE Puffin container packing MULTIPLE `deletion-vector-v1`
+    /// blobs (Doris and iceberg-java's DVFileWriter both write this shape) —
+    /// N delete-file entries share the container's `file_path`, distinguished
+    /// only by `content_offset`, each referencing a DIFFERENT data file. The
+    /// load-state dedupe used to key on `file_path` alone, so only the first
+    /// blob loaded; the rest returned AlreadyLoaded and their deletes were
+    /// silently unapplied (deleted rows resurfaced). Every blob must load.
+    #[tokio::test]
+    async fn test_multi_blob_puffin_container_loads_every_dv() {
+        use crate::delete_vector::{
+            DELETION_VECTOR_PROPERTY_CARDINALITY, DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
+        };
+        use crate::puffin::{CompressionCodec, PuffinWriter};
+        use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Type};
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path();
+        let file_io = FileIO::new_with_fs();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let data_file_1 = format!("{}/data-1.parquet", table_location.to_str().unwrap());
+        let data_file_2 = format!("{}/data-2.parquet", table_location.to_str().unwrap());
+
+        let mut dv1 = DeleteVector::default();
+        dv1.insert(1);
+        dv1.insert(3);
+        let mut dv2 = DeleteVector::default();
+        dv2.insert(0);
+        dv2.insert(2);
+
+        let dv_properties = |referenced: &str, cardinality: u64| {
+            HashMap::from([
+                (
+                    DELETION_VECTOR_PROPERTY_CARDINALITY.to_string(),
+                    cardinality.to_string(),
+                ),
+                (
+                    DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE.to_string(),
+                    referenced.to_string(),
+                ),
+            ])
+        };
+        let blob1 = dv1.to_puffin_blob(dv_properties(&data_file_1, 2)).unwrap();
+        let blob2 = dv2.to_puffin_blob(dv_properties(&data_file_2, 2)).unwrap();
+
+        // ONE container holding BOTH blobs.
+        let container_path = format!(
+            "{}/delete_dv_multi.puffin",
+            table_location.to_str().unwrap()
+        );
+        let output_file = file_io.new_output(&container_path).unwrap();
+        let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false)
+            .await
+            .unwrap();
+        writer.add(blob1, CompressionCodec::None).await.unwrap();
+        writer.add(blob2, CompressionCodec::None).await.unwrap();
+        let result = writer.close_with_metadata().await.unwrap();
+        let file_size = result.file_size_in_bytes;
+        assert_eq!(result.blobs_metadata.len(), 2);
+
+        // Two delete-file entries: same file_path, distinct content offsets,
+        // different referenced data files — the manifest shape a packing
+        // writer produces.
+        let entries: Vec<FileScanTaskDeleteFile> = result
+            .blobs_metadata
+            .iter()
+            .zip([data_file_1.clone(), data_file_2.clone()])
+            .map(|(blob_meta, referenced)| FileScanTaskDeleteFile {
+                key_metadata: None,
+                file_path: container_path.clone(),
+                file_size_in_bytes: file_size,
+                file_type: DataContentType::PositionDeletes,
+                partition_spec_id: 0,
+                equality_ids: None,
+                content_offset: Some(blob_meta.offset() as i64),
+                content_size_in_bytes: Some(blob_meta.length() as i64),
+                file_format: DataFileFormat::Puffin,
+                referenced_data_file: Some(referenced),
+            })
+            .collect();
+
+        let delete_file_loader =
+            CachingDeleteFileLoader::new(file_io.clone(), 10, Runtime::current());
+        let delete_filter = delete_file_loader
+            .load_deletes(&entries, schema)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // BOTH referenced data files must have their delete vectors — keying
+        // the load state by path alone drops whichever blob loses the race.
+        let dv1_handle = delete_filter
+            .get_delete_vector_for_path(&data_file_1)
+            .expect("expected a deletion vector for data file 1");
+        let mut positions_1: Vec<u64> = dv1_handle.lock().unwrap().iter().collect();
+        positions_1.sort();
+        assert_eq!(positions_1, vec![1, 3]);
+
+        let dv2_handle = delete_filter
+            .get_delete_vector_for_path(&data_file_2)
+            .expect("expected a deletion vector for data file 2 — the second blob in the container must load");
+        let mut positions_2: Vec<u64> = dv2_handle.lock().unwrap().iter().collect();
+        positions_2.sort();
+        assert_eq!(positions_2, vec![0, 2]);
     }
 
     #[tokio::test]

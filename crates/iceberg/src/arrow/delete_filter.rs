@@ -47,11 +47,23 @@ enum PosDelState {
     Loaded,
 }
 
+/// Identity of one positional-delete LOAD UNIT: the file path plus, for V3
+/// deletion vectors, the blob's content offset within its Puffin container.
+///
+/// A container may pack MULTIPLE DV blobs (Doris and iceberg-java's
+/// DVFileWriter both do this): N delete-file entries share one `file_path`,
+/// distinguished only by `content_offset`, each referencing a DIFFERENT data
+/// file. Keying load state by path alone loads only the FIRST blob — the
+/// rest report AlreadyLoaded and their deletes are silently unapplied
+/// (deleted rows resurface). `None` = a whole-file positional delete
+/// (Parquet pos-del stream), which keeps path-level identity.
+type PosDelKey = (String, Option<u64>);
+
 #[derive(Debug, Default)]
 struct DeleteFileFilterState {
     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
     equality_deletes: HashMap<String, EqDelState>,
-    positional_deletes: HashMap<String, PosDelState>,
+    positional_deletes: HashMap<PosDelKey, PosDelState>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,10 +135,15 @@ impl DeleteFilter {
     ///
     /// Returns an action dictating whether the caller should load the file,
     /// wait for another task to load it, or do nothing.
-    pub(crate) fn try_start_pos_del_load(&self, file_path: &str) -> PosDelLoadAction {
+    pub(crate) fn try_start_pos_del_load(
+        &self,
+        file_path: &str,
+        content_offset: Option<u64>,
+    ) -> PosDelLoadAction {
         let mut state = self.state.write().unwrap();
 
-        if let Some(state) = state.positional_deletes.get(file_path) {
+        let key: PosDelKey = (file_path.to_string(), content_offset);
+        if let Some(state) = state.positional_deletes.get(&key) {
             match state {
                 PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
                 PosDelState::Loading(notify) => {
@@ -138,18 +155,19 @@ impl DeleteFilter {
         let notifier = Arc::new(Notify::new());
         state
             .positional_deletes
-            .insert(file_path.to_string(), PosDelState::Loading(notifier));
+            .insert(key, PosDelState::Loading(notifier));
 
         PosDelLoadAction::Load
     }
 
-    /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
+    /// Marks a positional delete load unit (file, or DV blob within a Puffin
+    /// container) as successfully loaded and notifies any waiting tasks.
+    pub(crate) fn finish_pos_del_load(&self, file_path: &str, content_offset: Option<u64>) {
         let notify = {
             let mut state = self.state.write().unwrap();
             if let Some(PosDelState::Loading(notify)) = state
                 .positional_deletes
-                .insert(file_path.to_string(), PosDelState::Loaded)
+                .insert((file_path.to_string(), content_offset), PosDelState::Loaded)
             {
                 Some(notify)
             } else {
@@ -339,16 +357,24 @@ pub(crate) mod tests {
         let path = "s3://bucket/pos-delete.parquet";
 
         assert!(matches!(
-            filter.try_start_pos_del_load(path),
+            filter.try_start_pos_del_load(path, None),
             PosDelLoadAction::Load
         ));
 
-        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
+        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path, None) else {
             panic!("expected WaitFor for an in-progress load");
         };
 
         // Loader completes and signals before the waiter awaits.
-        filter.finish_pos_del_load(path);
+        filter.finish_pos_del_load(path, None);
+
+        // Distinct content offsets in the SAME container are independent load
+        // units: a second blob at another offset must be a fresh Load, not
+        // AlreadyLoaded (the multi-blob puffin container class).
+        assert!(matches!(
+            filter.try_start_pos_del_load(path, Some(42)),
+            PosDelLoadAction::Load
+        ));
 
         let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
         assert!(
