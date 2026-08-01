@@ -26,9 +26,9 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation,
+    PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector,
+    Struct, StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -255,9 +255,58 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
+    /// New manifest writer bound to the table's current DEFAULT partition
+    /// spec. Correct for manifests of NEWLY added files only — added files are
+    /// validated against the default spec. To rewrite an EXISTING manifest use
+    /// [`Self::new_manifest_writer_for_spec_id`] with the source manifest's
+    /// spec id.
     pub(crate) fn new_manifest_writer(
         &mut self,
         content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
+        let partition_spec = self
+            .table
+            .metadata()
+            .default_partition_spec()
+            .as_ref()
+            .clone();
+        self.new_manifest_writer_with_spec(content, partition_spec)
+    }
+
+    /// New manifest writer bound to a specific partition spec, looked up from
+    /// table metadata. A manifest binds exactly ONE partition spec (Java
+    /// parity: `SnapshotProducer`/`ManifestFilterManager` keep manifests
+    /// grouped by spec id), so rewriting an existing manifest MUST bind the
+    /// output to the SOURCE manifest's spec: its entries carry partition
+    /// tuples of that spec's shape, and a writer bound to a different spec
+    /// corrupts the partition summaries (the summary builder panics on a
+    /// field-count mismatch).
+    pub(crate) fn new_manifest_writer_for_spec_id(
+        &mut self,
+        content: ManifestContentType,
+        partition_spec_id: i32,
+    ) -> Result<ManifestWriter> {
+        let partition_spec = self
+            .table
+            .metadata()
+            .partition_spec_by_id(partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot write a manifest bound to partition spec {partition_spec_id}: the spec is not present in table metadata"
+                    ),
+                )
+            })?
+            .as_ref()
+            .clone();
+        self.new_manifest_writer_with_spec(content, partition_spec)
+    }
+
+    fn new_manifest_writer_with_spec(
+        &mut self,
+        content: ManifestContentType,
+        partition_spec: PartitionSpec,
     ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}-m{}.{}",
@@ -267,12 +316,6 @@ impl<'a> SnapshotProducer<'a> {
             DataFileFormat::Avro
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
-        let partition_spec = self
-            .table
-            .metadata()
-            .default_partition_spec()
-            .as_ref()
-            .clone();
         let schema = self.table.metadata().current_schema().clone();
 
         let builder = if let Some(em) = self.table.encryption_manager() {
@@ -308,6 +351,11 @@ impl<'a> SnapshotProducer<'a> {
     /// Shared by `RowDelta` (remove data + reabsorb deletes) and `RewriteFiles`
     /// (compaction: swap data files + reabsorb their DVs in one snapshot). Mirrors
     /// Java's `ManifestFilterManager.filterManifestWithDeletedFiles`.
+    ///
+    /// Each rewritten manifest is bound to its SOURCE manifest's partition spec
+    /// (one manifest = one spec): the current snapshot can hold live manifests
+    /// from older specs, whose entries' partition tuples do not fit the table's
+    /// current default spec.
     pub(crate) async fn rewrite_existing_manifests_removing(
         &mut self,
         removed_data_files: &[DataFile],
@@ -351,8 +399,15 @@ impl<'a> SnapshotProducer<'a> {
             }
 
             // Removed files → DELETED (new snapshot_id, original seq nums
-            // preserved), survivors → EXISTING. Preserve the manifest's content.
-            let mut writer = self.new_manifest_writer(manifest_file.content)?;
+            // preserved), survivors → EXISTING. Preserve the manifest's content
+            // AND its partition spec: the current snapshot can hold live
+            // manifests from OLDER specs (e.g. a table evolved from
+            // unpartitioned to partitioned), and their entries' partition
+            // tuples only fit a writer bound to the SOURCE manifest's spec.
+            let mut writer = self.new_manifest_writer_for_spec_id(
+                manifest_file.content,
+                manifest_file.partition_spec_id,
+            )?;
             for entry in manifest.entries() {
                 if deleted_paths.contains(entry.data_file().file_path()) {
                     // Removed by this operation → DELETED.
