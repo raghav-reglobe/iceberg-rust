@@ -28,7 +28,10 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::runtime::Runtime;
 use crate::scan::TableScanBuilder;
-use crate::spec::{ManifestListReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef};
+use crate::spec::{
+    Manifest, ManifestFile, ManifestListReader, SchemaRef, SnapshotRef, TableMetadata,
+    TableMetadataRef,
+};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -302,6 +305,21 @@ impl Table {
     /// Returns this table's object cache
     pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Load one manifest through this table's object cache — parsed-manifest
+    /// reuse shared with the scan path (manifest files are immutable, so the
+    /// path-keyed cache is always valid); falls back to a direct read when
+    /// caching is disabled. Public so external planners (e.g. the Python
+    /// bindings' metadata doorway) get cache hits on re-walks instead of
+    /// re-fetching + re-parsing every manifest.
+    pub async fn load_manifest_cached(
+        &self,
+        manifest_file: &ManifestFile,
+    ) -> Result<Arc<Manifest>> {
+        self.object_cache()
+            .get_manifest(manifest_file, &self.metadata_ref())
+            .await
     }
 
     /// Returns this table's whole-file data cache, if configured.

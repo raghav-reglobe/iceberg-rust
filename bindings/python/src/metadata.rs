@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 
+use futures::stream::{StreamExt, TryStreamExt};
 use iceberg::spec::ManifestContentType;
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -205,23 +206,45 @@ fn append_window(
                 .load()
                 .await
                 .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
+            // Manifest-level prune: every entry's data seq <= its manifest's
+            // seq (spec invariant), so an at-or-below-cursor manifest holds
+            // only consumed files.
+            let candidates: Vec<_> = mlist
+                .entries()
+                .iter()
+                .filter(|mf| {
+                    mf.content == ManifestContentType::Data && mf.sequence_number > after_seq
+                })
+                .collect();
+            // Concurrent manifest loads through the table's PARSED-manifest
+            // cache (shared with the scan path; manifest files are immutable
+            // so path-keyed reuse is always valid — re-walks after a new
+            // commit re-fetch only the NEW manifests). The walk is I/O-bound:
+            // sequential GETs were the dominant cost on trickle-manifest
+            // tables. Completion order is irrelevant — the final (seq, path)
+            // sort normalizes it.
+            let concurrency = std::env::var("ICEBERG_METADATA_MANIFEST_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(16);
+            let loaded: Vec<_> = futures::stream::iter(candidates.into_iter().map(|mf| {
+                let table = &table;
+                async move {
+                    table
+                        .load_manifest_cached(mf)
+                        .await
+                        .map(|m| (mf, m))
+                        .map_err(|e| {
+                            PyValueError::new_err(format!("manifest {}: {e}", mf.manifest_path))
+                        })
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
             let mut files: Vec<FileRow> = Vec::new();
-            for mf in mlist.entries() {
-                if mf.content != ManifestContentType::Data {
-                    continue;
-                }
-                // Manifest-level prune: every entry's data seq <= its
-                // manifest's seq (spec invariant), so an at-or-below-cursor
-                // manifest holds only consumed files.
-                if mf.sequence_number <= after_seq {
-                    continue;
-                }
-                let manifest = mf
-                    .load_manifest_with(table.file_io(), Some(&meta))
-                    .await
-                    .map_err(|e| {
-                        PyValueError::new_err(format!("manifest {}: {e}", mf.manifest_path))
-                    })?;
+            for (mf, manifest) in &loaded {
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;
