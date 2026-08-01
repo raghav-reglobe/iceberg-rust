@@ -24,6 +24,7 @@ mod datafusion_table_provider;
 mod error;
 mod manifest;
 mod merge;
+mod metadata;
 mod replace;
 mod runtime;
 mod schema;
@@ -46,6 +47,7 @@ fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     datafusion_table_provider::register_module(py, m)?;
     transform::register_module(py, m)?;
     manifest::register_module(py, m)?;
+    metadata::register_module(py, m)?;
     compaction::register_module(py, m)?;
     merge::register_module(py, m)?;
     replace::register_module(py, m)?;
