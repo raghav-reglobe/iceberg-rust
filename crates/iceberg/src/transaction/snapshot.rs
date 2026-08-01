@@ -564,6 +564,10 @@ impl<'a> SnapshotProducer<'a> {
         let has_delete_entries = !delete_entries.is_empty();
 
         // Assert current snapshot producer contains new content to add to new snapshot.
+        // An operation that REMOVES files while adding none is real content too
+        // (e.g. a rewrite reabsorbing a fully-superseded data file together with
+        // the delete files that masked it) — the removals materialize as DELETED
+        // entries in the rewritten carried-forward manifests.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
@@ -572,6 +576,8 @@ impl<'a> SnapshotProducer<'a> {
             && self.added_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
             && !has_delete_entries
+            && snapshot_produce_operation.removed_data_files().is_empty()
+            && snapshot_produce_operation.removed_delete_files().is_empty()
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,

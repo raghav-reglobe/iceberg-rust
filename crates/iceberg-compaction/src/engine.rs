@@ -125,7 +125,24 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     for group in &plan.groups {
         let added = read_sort_write(&table, group, cfg).await?;
         if added.is_empty() {
-            continue; // no live rows to write (e.g. fully-deleted group) — never remove without replacement
+            // The group produced no live rows. That is LEGITIMATE when every
+            // row of every input file is masked by the deletes the scan bound
+            // to it — the fully-superseded DELETE-then-INSERT shape, where an
+            // old file is 100% covered by a later equality delete. Those files
+            // must still be REMOVED (and their deletes thereby become
+            // reabsorbable), or the delete pile is pinned forever: the old
+            // "never remove without replacement" rule skipped these groups on
+            // every pass, retaining both the dead files and every delete file
+            // bound to them.
+            //
+            // Safety gate: only proceed when EVERY input file carried at
+            // least one scan-bound delete. A live file with no deletes must
+            // produce its rows, so an empty read from such a group signals a
+            // read-side anomaly — leave it untouched rather than risk
+            // deleting data a broken read failed to surface.
+            if !group.tasks.iter().all(|t| !t.deletes.is_empty()) {
+                continue;
+            }
         }
         all_removed.extend(
             group
@@ -147,7 +164,7 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
         all_added.extend(added);
     }
 
-    if all_added.is_empty() {
+    if all_added.is_empty() && all_removed.is_empty() {
         return Ok(()); // nothing to compact
     }
 
@@ -210,10 +227,11 @@ pub struct DryRunReport {
     pub removed_deletes_resolved: usize,
     /// sample of bound-delete paths NOT found in the manifest map (resolution mismatch)
     pub sample_unresolved_bound_paths: Vec<String>,
-    /// per-group read result: tasks, DV-bound tasks, and rows that READ (DVs applied).
-    /// A DV-bearing group reading 0 rows would be SKIPPED by `compact_table`
-    /// (`added.is_empty()` → continue), so its DVs never reach the commit — the
-    /// `rdel=NULL` path (A). Rows>0 ⇒ not skipped ⇒ the 34 reach the commit (B).
+    /// per-group read result: tasks, delete-bound tasks, and rows that READ
+    /// (deletes applied). A delete-bearing group reading 0 rows is the
+    /// fully-superseded shape: `compact_table` removes it (and its deletes)
+    /// when every input file carried ≥1 bound delete, and skips it otherwise
+    /// (empty read from an undeleted file = read-side anomaly).
     pub group_reads: Vec<String>,
 }
 
