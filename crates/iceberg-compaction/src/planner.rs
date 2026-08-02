@@ -68,6 +68,12 @@ fn is_candidate(size: u64, delete_count: usize, cfg: &Config) -> bool {
     true // undersized: candidate
 }
 
+/// Call-site policy: `rewrite_all` bypasses candidacy (Spark `rewrite-all`
+/// parity); otherwise the iceberg-go candidate rules apply.
+fn should_rewrite(size: u64, delete_count: usize, cfg: &Config) -> bool {
+    cfg.rewrite_all || is_candidate(size, delete_count, cfg)
+}
+
 /// Greedy bin-pack `items` into bins whose summed `weight` stays ~`target`.
 /// Generic so the packing is unit-testable without constructing `FileScanTask`s.
 fn bin_pack<T>(items: Vec<T>, target: u64, weight: impl Fn(&T) -> u64) -> Vec<Vec<T>> {
@@ -118,7 +124,7 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
     // Group candidates by partition (preserve order); non-candidates are skipped.
     let mut buckets: Vec<(String, Vec<FileScanTask>)> = Vec::new();
     for t in tasks {
-        if !is_candidate(t.file_size_in_bytes, t.deletes.len(), cfg) {
+        if !should_rewrite(t.file_size_in_bytes, t.deletes.len(), cfg) {
             plan.skipped_files += 1;
             continue;
         }
@@ -156,7 +162,7 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::{bin_pack, is_candidate};
+    use super::{bin_pack, is_candidate, should_rewrite};
     use crate::config::Config;
 
     // --- is_candidate policy (mirrors iceberg-go isCandidate cases) ---
@@ -202,6 +208,17 @@ mod tests {
             c.delete_file_threshold,
             &c
         ));
+    }
+
+    #[test]
+    fn rewrite_all_bypasses_candidacy() {
+        let mut c = Config::default();
+        c.rewrite_all = true;
+        // optimal and oversized-without-deletes are normally skipped
+        assert!(should_rewrite(c.target_file_size_bytes, 0, &c));
+        assert!(should_rewrite(c.max_file_size_bytes + 1, 0, &c));
+        c.rewrite_all = false;
+        assert!(!should_rewrite(c.target_file_size_bytes, 0, &c));
     }
 
     // --- bin-packing ---

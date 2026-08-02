@@ -45,6 +45,10 @@ pub struct Config {
     /// column pass through unsorted. Table sort-order metadata is NOT read —
     /// this field is the only override.
     pub sort_column: Option<String>,
+    /// Plan EVERY live data file as a rewrite candidate, bypassing the
+    /// size/delete candidacy policy (Spark `rewrite-all` parity). Grouping
+    /// and bin-packing still apply.
+    pub rewrite_all: bool,
 }
 
 impl Default for Config {
@@ -60,6 +64,7 @@ impl Default for Config {
             write_batch_bytes: 32 * 1024 * 1024,  // 32 MiB
             shred_variants: false,
             sort_column: None,
+            rewrite_all: false,
         }
     }
 }

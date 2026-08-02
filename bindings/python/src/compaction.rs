@@ -67,7 +67,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -77,6 +77,7 @@ fn compact(
     delete_file_threshold: Option<usize>,
     shred_variants: Option<bool>,
     sort_column: Option<String>,
+    rewrite_all: Option<bool>,
 ) -> PyResult<()> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
@@ -99,6 +100,10 @@ fn compact(
     // Rewrite sort key override (default `_valid_from`). See `Config::sort_column`.
     if sort_column.is_some() {
         cfg.sort_column = sort_column;
+    }
+    // Plan every live data file (Spark `rewrite-all` parity). See `Config::rewrite_all`.
+    if let Some(v) = rewrite_all {
+        cfg.rewrite_all = v;
     }
     // Wide-row memory bounds, env-tunable per pod (see Config docs):
     // - ICEBERG_COMPACT_CHUNK_MB       — sort-chunk budget (default 1024).
