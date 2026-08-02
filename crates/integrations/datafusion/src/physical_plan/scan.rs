@@ -269,6 +269,16 @@ async fn get_batch_stream(
             }
         }
     }
+    // Page-index row selection (off by default, matching the scan default):
+    // with a pushed-down predicate, build parquet RowSelections from the
+    // column/offset indexes so only matching pages decode — the page-level
+    // pruning a sorted layout unlocks. ICEBERG_SCAN_ROW_SELECTION=1|true.
+    if matches!(
+        std::env::var("ICEBERG_SCAN_ROW_SELECTION").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        scan_builder = scan_builder.with_row_selection_enabled(true);
+    }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
