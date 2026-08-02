@@ -41,6 +41,10 @@ pub struct Config {
     /// identical, but query engines lose `typed_value` pruning on the
     /// rewritten files.
     pub shred_variants: bool,
+    /// Sort key for the rewrite (default `_valid_from`). Tables without the
+    /// column pass through unsorted. Table sort-order metadata is NOT read —
+    /// this field is the only override.
+    pub sort_column: Option<String>,
 }
 
 impl Default for Config {
@@ -55,6 +59,7 @@ impl Default for Config {
             sort_chunk_bytes: 1024 * 1024 * 1024, // 1 GiB
             write_batch_bytes: 32 * 1024 * 1024,  // 32 MiB
             shred_variants: false,
+            sort_column: None,
         }
     }
 }

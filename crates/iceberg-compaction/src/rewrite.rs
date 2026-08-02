@@ -137,7 +137,8 @@ async fn flush_chunk(
     if batches.is_empty() {
         return Ok(());
     }
-    let mut sorted = crate::sort::sort_chunk(batches, cfg.write_batch_bytes)?;
+    let sort_key = cfg.sort_column.as_deref().unwrap_or("_valid_from");
+    let mut sorted = crate::sort::sort_chunk(batches, cfg.write_batch_bytes, sort_key)?;
     while let Some(slice) = sorted.next_batch()? {
         if slice.num_rows() == 0 {
             continue;

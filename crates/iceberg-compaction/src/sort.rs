@@ -1,6 +1,7 @@
-//! Sort compaction inputs by `_valid_from` — a common universal sort key that
-//! gives query engines file-skipping on time filters. Tables without the column
-//! are passed through unsorted.
+//! Sort compaction inputs by a configurable key (default `_valid_from` — a
+//! common universal sort key that gives query engines file-skipping on time
+//! filters; `Config::sort_column` overrides). Tables without the column are
+//! passed through unsorted.
 //!
 //! Wide-row safety: the sort NEVER concatenates the input into one combined
 //! batch. A whole-group concat of multi-KB TEXT rows both (a) overflows
@@ -58,11 +59,15 @@ impl SortedChunk {
     }
 }
 
-/// Sort `batches` (one buffered chunk) by `_valid_from` ascending and return
+/// Sort `batches` (one buffered chunk) by `sort_key` ascending and return
 /// a puller of bounded output batches (~`max_batch_bytes` each). If the sort
 /// column is absent the input batches pass through unchanged (they are
 /// already reader-bounded).
-pub(crate) fn sort_chunk(batches: Vec<RecordBatch>, max_batch_bytes: usize) -> Result<SortedChunk> {
+pub(crate) fn sort_chunk(
+    batches: Vec<RecordBatch>,
+    max_batch_bytes: usize,
+    sort_key: &str,
+) -> Result<SortedChunk> {
     let non_empty: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     let passthrough = |batches: Vec<RecordBatch>| SortedChunk {
         batches,
@@ -76,7 +81,7 @@ pub(crate) fn sort_chunk(batches: Vec<RecordBatch>, max_batch_bytes: usize) -> R
         return Ok(passthrough(non_empty));
     }
     let schema = non_empty[0].schema();
-    let Ok(key_idx) = schema.index_of("_valid_from") else {
+    let Ok(key_idx) = schema.index_of(sort_key) else {
         return Ok(passthrough(non_empty));
     };
 
@@ -166,7 +171,7 @@ mod tests {
         ])
         .unwrap();
 
-        let out = drain(sort_chunk(vec![b1, b2], usize::MAX).unwrap());
+        let out = drain(sort_chunk(vec![b1, b2], usize::MAX, "_valid_from").unwrap());
         assert_eq!(out.len(), 1);
         let vf = out[0]
             .column(0)
@@ -184,10 +189,39 @@ mod tests {
     }
 
     #[test]
+    fn sorts_by_custom_key() {
+        // A PK-primary rewrite: sort_key = "_id", not "_valid_from".
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_valid_from", DataType::Int64, false),
+            Field::new("_id", DataType::Utf8, false),
+        ]));
+        let b = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["c", "a", "b"])),
+        ])
+        .unwrap();
+        let out = drain(sort_chunk(vec![b], usize::MAX, "_id").unwrap());
+        assert_eq!(out.len(), 1);
+        let id = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vf = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.value(0), "a");
+        assert_eq!(id.value(2), "c");
+        assert_eq!(vf.values(), &[2, 3, 1]); // rows moved with the _id order
+    }
+
+    #[test]
     fn coalesces_when_no_valid_from() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
-        let out = drain(sort_chunk(vec![b], usize::MAX).unwrap());
+        let out = drain(sort_chunk(vec![b], usize::MAX, "_valid_from").unwrap());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].num_rows(), 2); // unchanged, just passed through
     }
@@ -217,7 +251,7 @@ mod tests {
                 .unwrap(),
             );
         }
-        let out = drain(sort_chunk(batches, 4 * 1024).unwrap());
+        let out = drain(sort_chunk(batches, 4 * 1024, "_valid_from").unwrap());
         assert!(
             out.len() > 4,
             "small budget must yield many slices: {}",
@@ -278,7 +312,7 @@ mod tests {
         );
 
         // The chunked sort emits bounded slices — drop each after checking.
-        let mut chunk = sort_chunk(batches, 64 * 1024 * 1024).unwrap();
+        let mut chunk = sort_chunk(batches, 64 * 1024 * 1024, "_valid_from").unwrap();
         let mut rows = 0usize;
         let mut last_key = i64::MIN;
         while let Some(b) = chunk.next_batch().unwrap() {
