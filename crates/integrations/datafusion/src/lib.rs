@@ -21,6 +21,8 @@ pub use catalog::*;
 mod error;
 pub use error::*;
 
+pub mod memory_gate;
+
 pub mod functions;
 
 pub mod physical_plan;

@@ -675,10 +675,13 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let table = self.table.clone();
         let snapshot_id = self.snapshot_id;
+        // Decode-memory accounting (crate::memory_gate): the target scan's
+        // reads register against the session pool like any provider scan.
+        let scan_gate = crate::memory_gate::pool_scan_gate(&context.runtime_env().memory_pool);
         let mut select: Vec<String> = self.columns.clone();
         select.push(RESERVED_COL_NAME_FILE.to_string());
         select.push(RESERVED_COL_NAME_POS.to_string());
@@ -694,6 +697,9 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
             }
             if let Some(pred) = predicate {
                 builder = builder.with_filter(pred);
+            }
+            if let Some(gate) = scan_gate {
+                builder = builder.with_scan_memory_gate(gate);
             }
             let scan = builder
                 .select(select)
@@ -1101,6 +1107,7 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
             .session_config()
             .get_extension::<MorMergeOptions>()
             .unwrap_or_default();
+        let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
         let input = execute_input_stream(
             Arc::clone(&self.input),
             self.input.schema(),
@@ -1118,6 +1125,7 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
                 input_schema,
                 clauses,
                 options,
+                memory_pool,
                 &run_schema,
             )
             .await
@@ -1210,8 +1218,19 @@ async fn run_mor_write(
     input_schema: ArrowSchemaRef,
     clauses: Arc<Vec<MorClausePlan>>,
     options: Arc<MorMergeOptions>,
+    memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     result_schema: &ArrowSchemaRef,
 ) -> DFResult<RecordBatch> {
+    // #18 read-RSS accounting: the late-materialization fetch registers
+    // decode working sets, and the merge's own residents (evaluated-SET
+    // store, matched bookkeeping, writer buffers) grow a pool consumer —
+    // so `peak_mem_bytes` reflects true residency and a bounded pool fails
+    // CLEANLY (checkpointable) instead of the kernel killing the process.
+    let scan_gate = crate::memory_gate::pool_scan_gate(&memory_pool);
+    let mut resident_reservation = crate::memory_gate::scan_gate_enabled().then(|| {
+        datafusion::execution::memory_pool::MemoryConsumer::new("mor-merge-residents")
+            .register(&memory_pool)
+    });
     let table_schema = table.metadata().current_schema().clone();
     let table_arrow: ArrowSchemaRef =
         Arc::new(schema_to_arrow_schema(&table_schema).map_err(to_datafusion_error)?);
@@ -1295,6 +1314,14 @@ async fn run_mor_write(
         run_id: Uuid::now_v7(),
         deadline,
     });
+    // Parquet writers buffer pages between row-group flushes; account a
+    // modest 16 MiB floor per worker. (True high-water tracking via the
+    // writers' in-progress sizes is a follow-up — the observed kill classes
+    // are decode + the SET store, both accounted exactly; a large upfront
+    // writer reservation would instead make small bounded pools unusable.)
+    if let Some(r) = resident_reservation.as_mut() {
+        r.try_grow(write_workers * 16 * 1024 * 1024)?;
+    }
     let mut pool = WriterPool::spawn(Arc::clone(&ctx), write_workers);
 
     let clause_idx_col = input_schema
@@ -1367,6 +1394,16 @@ async fn run_mor_write(
                             update_stores[ci].len() as u32,
                             &mut matched,
                         )?;
+                        if let Some(r) = resident_reservation.as_mut() {
+                            // Evaluated arrays live until write time; matched
+                            // bookkeeping adds ~96B/row (path key + entry).
+                            let chunk_bytes: usize = evaluated
+                                .iter()
+                                .map(|a| a.get_array_memory_size())
+                                .sum::<usize>()
+                                + subset.num_rows() * 96;
+                            r.try_grow(chunk_bytes)?;
+                        }
                         update_stores[ci].push(evaluated);
                     }
                     MorActionPlan::Delete => {
@@ -1496,6 +1533,9 @@ async fn run_mor_write(
         };
 
         let mut reader_builder = table.reader_builder();
+        if let Some(gate) = scan_gate.clone() {
+            reader_builder = reader_builder.with_scan_memory_gate(gate);
+        }
         if passthrough_ok {
             reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
         }

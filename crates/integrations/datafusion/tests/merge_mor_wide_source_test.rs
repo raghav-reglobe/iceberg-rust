@@ -738,7 +738,11 @@ fn scenario(
 #[tokio::test]
 async fn wide_statement_exhausts_pool_narrow_statement_survives() {
     const WIDTH: usize = 8_192;
-    const POOL_MB: usize = 320;
+    // 640MB: with #18 read accounting the scan itself holds a clamped
+    // reservation (limit/2 cap) for the wide file's decode working set —
+    // the narrow shape must fit WITH that accounted (pre-gate, 320MB only
+    // "worked" because the ~377MB single-RG page buffer was invisible).
+    const POOL_MB: usize = 640;
 
     let warehouse = TempDir::new().unwrap();
     let (silver_rows, bronze_rows) = scenario(2_000, 2_000, 22_000, WIDTH);
@@ -789,11 +793,11 @@ async fn wide_statement_exhausts_pool_narrow_statement_survives() {
         err.contains("Resources exhausted"),
         "expected pool exhaustion, got: {err}"
     );
-    assert!(
-        err.contains("HashJoinInput"),
-        "exhaustion must come from a hash-join build (the non-spillable \
-         reservation), got: {err}"
-    );
+    // Which consumer trips first (the hash-join build, a sort merge, or the
+    // scan gate) depends on allocation interleaving now that reads are
+    // pool-accounted (#18) — the pinned contract is CLEAN exhaustion + no
+    // commit + the narrow shape surviving the same pool, not the consumer
+    // name.
 
     // A failed merge commits nothing.
     let table = load_silver(&catalog).await;

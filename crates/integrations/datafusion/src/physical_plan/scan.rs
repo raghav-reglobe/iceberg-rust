@@ -145,14 +145,18 @@ impl ExecutionPlan for IcebergTableScan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // Decode-memory accounting: reads register against the session pool
+        // (peak honesty + bounded admission — crate::memory_gate).
+        let gate = crate::memory_gate::pool_scan_gate(&context.runtime_env().memory_pool);
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
             self.file_allowlist.clone(),
+            gate,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -220,6 +224,7 @@ async fn get_batch_stream(
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
     file_allowlist: Option<Arc<HashSet<String>>>,
+    scan_memory_gate: Option<Arc<dyn iceberg::arrow::ScanMemoryGate>>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -278,6 +283,9 @@ async fn get_batch_stream(
         Ok("1") | Ok("true")
     ) {
         scan_builder = scan_builder.with_row_selection_enabled(true);
+    }
+    if let Some(gate) = scan_memory_gate {
+        scan_builder = scan_builder.with_scan_memory_gate(gate);
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
