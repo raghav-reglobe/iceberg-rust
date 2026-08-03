@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::scan_memory_gate::ScanMemoryGate;
 use crate::cache::DataBytesCache;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -63,6 +64,7 @@ pub struct ArrowReaderBuilder {
     runtime: Runtime,
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
     data_bytes_cache: Option<DataBytesCache>,
+    scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
 }
 
 impl ArrowReaderBuilder {
@@ -80,6 +82,7 @@ impl ArrowReaderBuilder {
             runtime,
             shredded_passthrough: None,
             data_bytes_cache: None,
+            scan_memory_gate: None,
         }
     }
 
@@ -92,6 +95,14 @@ impl ArrowReaderBuilder {
     /// the uncached behavior.
     pub fn with_data_bytes_cache(mut self, data_bytes_cache: DataBytesCache) -> Self {
         self.data_bytes_cache = Some(data_bytes_cache);
+        self
+    }
+
+    /// Account each file's estimated decode working set against `gate` before
+    /// its decode begins (see [`crate::arrow::ScanMemoryGate`]). Without a
+    /// gate, reads are unaccounted — the pre-existing behavior.
+    pub fn with_scan_memory_gate(mut self, gate: Arc<dyn ScanMemoryGate>) -> Self {
+        self.scan_memory_gate = Some(gate);
         self
     }
 
@@ -176,6 +187,7 @@ impl ArrowReaderBuilder {
             runtime: self.runtime,
             shredded_passthrough: self.shredded_passthrough,
             data_bytes_cache: self.data_bytes_cache,
+            scan_memory_gate: self.scan_memory_gate,
         }
     }
 }
@@ -201,4 +213,6 @@ pub struct ArrowReader {
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
     /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
     data_bytes_cache: Option<DataBytesCache>,
+    /// See [`ArrowReaderBuilder::with_scan_memory_gate`].
+    scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
 }

@@ -32,7 +32,7 @@ use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
 
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, ScanMemoryGate};
 pub use crate::arrow::{ScanMetrics, ScanResult};
 use crate::cache::DataBytesCache;
 use crate::delete_file_index::DeleteFileIndex;
@@ -63,6 +63,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
     data_file_path_filter: Option<Arc<HashSet<String>>>,
     data_file_path_ranges: Option<Arc<HashMap<String, (u64, u64)>>>,
 }
@@ -83,6 +84,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            scan_memory_gate: None,
             data_file_path_filter: None,
             data_file_path_ranges: None,
         }
@@ -197,6 +199,14 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Account each file's decode working set against `gate` before decode
+    /// (see [`crate::arrow::ScanMemoryGate`]). Threaded into the arrow reader
+    /// built by [`TableScan::to_arrow`].
+    pub fn with_scan_memory_gate(mut self, gate: Arc<dyn ScanMemoryGate>) -> Self {
+        self.scan_memory_gate = Some(gate);
+        self
+    }
+
     /// Determines whether to enable row selection.
     /// When enabled, if a read is performed with a filter predicate,
     /// then (for row groups that have not been skipped) the page index
@@ -245,6 +255,7 @@ impl<'a> TableScanBuilder<'a> {
                         data_file_path_filter: self.data_file_path_filter.clone(),
                         data_file_path_ranges: self.data_file_path_ranges.clone(),
                         data_bytes_cache: self.table.data_bytes_cache().cloned(),
+                        scan_memory_gate: self.scan_memory_gate.clone(),
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -390,6 +401,7 @@ impl<'a> TableScanBuilder<'a> {
             data_file_path_filter: self.data_file_path_filter,
             data_file_path_ranges: self.data_file_path_ranges,
             data_bytes_cache: self.table.data_bytes_cache().cloned(),
+            scan_memory_gate: self.scan_memory_gate,
             runtime: self.table.runtime().clone(),
         })
     }
@@ -427,6 +439,9 @@ pub struct TableScan {
     /// Whole-file data cache inherited from the table (see
     /// [`crate::cache::DataBytesCache`]).
     data_bytes_cache: Option<DataBytesCache>,
+
+    /// See [`TableScanBuilder::with_scan_memory_gate`].
+    scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
 
     runtime: Runtime,
 }
@@ -588,6 +603,10 @@ impl TableScan {
 
         if let Some(dc) = &self.data_bytes_cache {
             arrow_reader_builder = arrow_reader_builder.with_data_bytes_cache(dc.clone());
+        }
+
+        if let Some(gate) = &self.scan_memory_gate {
+            arrow_reader_builder = arrow_reader_builder.with_scan_memory_gate(Arc::clone(gate));
         }
 
         if let Some(batch_size) = self.batch_size {

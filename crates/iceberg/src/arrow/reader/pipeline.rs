@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
-use arrow_select::filter::filter_record_batch;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use arrow_select::filter::filter_record_batch;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, RowNumber};
@@ -37,14 +37,13 @@ use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
 };
-use crate::arrow::caching_delete_file_loader::{
-    CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet,
-};
+use crate::arrow::caching_delete_file_loader::{CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet};
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::large_offsets::widen_variable_length_types;
-use crate::arrow::value::arrow_primitive_to_literal;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::scan_memory_gate::{GateGuard, ScanMemoryGate};
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+use crate::arrow::value::arrow_primitive_to_literal;
 use crate::cache::DataBytesCache;
 use crate::encryption::StandardKeyMetadata;
 use crate::error::Result;
@@ -77,6 +76,7 @@ impl ArrowReader {
             scan_metrics: scan_metrics.clone(),
             shredded_passthrough: self.shredded_passthrough.clone(),
             data_bytes_cache: self.data_bytes_cache.clone(),
+            scan_memory_gate: self.scan_memory_gate.clone(),
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -202,6 +202,8 @@ struct FileScanTaskReader {
     shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
     /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
     data_bytes_cache: Option<DataBytesCache>,
+    /// See [`ArrowReaderBuilder::with_scan_memory_gate`].
+    scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
 }
 
 impl FileScanTaskReader {
@@ -625,6 +627,40 @@ impl FileScanTaskReader {
                 record_batch_stream_builder.with_row_selection(row_selection);
         }
 
+        // Decode-memory accounting: reserve this file's estimated decode
+        // working set BEFORE decode begins. Estimate = the largest SELECTED
+        // row group's projected column chunks, compressed + uncompressed
+        // (the decoder holds the compressed pages while their arrays
+        // materialize), floored at 4 MiB. Projection-aware, so a narrow
+        // late-materialization target scan reserves only what it decodes.
+        let _decode_reservation = match &self.scan_memory_gate {
+            Some(gate) => {
+                let md = record_batch_stream_builder.metadata();
+                let per_rg = |rg: &parquet::file::metadata::RowGroupMetaData| -> u64 {
+                    rg.columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| projection_mask.leaf_included(*i))
+                        .map(|(_, c)| {
+                            c.uncompressed_size().max(0) as u64 + c.compressed_size().max(0) as u64
+                        })
+                        .sum()
+                };
+                let estimate = match &selected_row_group_indices {
+                    Some(sel) => sel
+                        .iter()
+                        .filter_map(|i| md.row_groups().get(*i))
+                        .map(per_rg)
+                        .max(),
+                    None => md.row_groups().iter().map(per_rg).max(),
+                }
+                .unwrap_or(0)
+                .max(4 * 1024 * 1024);
+                Some(GateGuard::acquire(Arc::clone(gate), estimate).await?)
+            }
+            None => None,
+        };
+
         if let Some(selected_row_group_indices) = selected_row_group_indices {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_groups(selected_row_group_indices);
@@ -652,32 +688,34 @@ impl FileScanTaskReader {
         // to the requester. Equality delete filtering runs as a post-read step
         // AFTER the transformer (hash-based, O(1) per row — never a predicate
         // tree); augmentation-only key columns are stripped last.
-        let record_batch_stream =
-            record_batch_stream_builder
-                .build()?
-                .map(move |batch| match batch {
-                    Ok(batch) => {
-                        // Fold any shredded variant columns (`typed_value`) back into a
-                        // plain `{metadata, value}` variant before the transformer maps
-                        // columns by field id (which expects the canonical variant type).
-                        // Columns in `fold_skip` (shredded passthrough) stay in their
-                        // physical shredded shape; the transformer targets that type.
-                        let batch = unshred_variant_columns(batch, &fold_skip)?;
-                        // Process the record batch (type promotion, column reordering, virtual fields, etc.)
-                        let mut batch = record_batch_transformer.process_record_batch(batch)?;
-                        // Apply equality deletes via hash-set lookup. Multiple
-                        // sets occur only when delete files use different
-                        // equality_ids column sets.
-                        for eq_delete_set in &eq_delete_sets {
-                            batch = ArrowReader::apply_eq_delete_filter(&batch, eq_delete_set)?;
-                        }
-                        if let Some(keep) = user_cols_to_keep {
-                            batch = ArrowReader::strip_extra_columns(batch, keep)?;
-                        }
-                        Ok(batch)
+        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
+            // Hold the decode reservation for the stream's lifetime;
+            // released on stream drop (completion, limit, or abort).
+            let _decode_reservation = &_decode_reservation;
+            match batch {
+                Ok(batch) => {
+                    // Fold any shredded variant columns (`typed_value`) back into a
+                    // plain `{metadata, value}` variant before the transformer maps
+                    // columns by field id (which expects the canonical variant type).
+                    // Columns in `fold_skip` (shredded passthrough) stay in their
+                    // physical shredded shape; the transformer targets that type.
+                    let batch = unshred_variant_columns(batch, &fold_skip)?;
+                    // Process the record batch (type promotion, column reordering, virtual fields, etc.)
+                    let mut batch = record_batch_transformer.process_record_batch(batch)?;
+                    // Apply equality deletes via hash-set lookup. Multiple
+                    // sets occur only when delete files use different
+                    // equality_ids column sets.
+                    for eq_delete_set in &eq_delete_sets {
+                        batch = ArrowReader::apply_eq_delete_filter(&batch, eq_delete_set)?;
                     }
-                    Err(err) => Err(err.into()),
-                });
+                    if let Some(keep) = user_cols_to_keep {
+                        batch = ArrowReader::strip_extra_columns(batch, keep)?;
+                    }
+                    Ok(batch)
+                }
+                Err(err) => Err(err.into()),
+            }
+        });
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
@@ -686,7 +724,10 @@ impl FileScanTaskReader {
 impl ArrowReader {
     /// Filters a record batch by removing rows whose equality-delete key columns
     /// match an entry in the delete set. Uses O(1) hash lookups per row.
-    fn apply_eq_delete_filter(batch: &RecordBatch, delete_set: &EqDeleteSet) -> Result<RecordBatch> {
+    fn apply_eq_delete_filter(
+        batch: &RecordBatch,
+        delete_set: &EqDeleteSet,
+    ) -> Result<RecordBatch> {
         // For each delete key field, locate the corresponding column in the
         // batch (by field_id from the Arrow field metadata, falling back to
         // name) and convert it to a Vec<Option<Datum>> for hash lookups.

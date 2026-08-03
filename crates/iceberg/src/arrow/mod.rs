@@ -33,6 +33,8 @@ mod reader;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
+/// Scan decode-memory accounting (engine-pluggable reservation gate)
+pub mod scan_memory_gate;
 mod scan_metrics;
 mod value;
 /// Infer + merge Arrow schemas from Variant values (Spark `SchemaOfVariant` port)
@@ -41,6 +43,7 @@ pub mod variant_schema;
 pub mod variant_shred;
 
 pub use reader::*;
+pub use scan_memory_gate::{GateGuard, ScanMemoryGate};
 pub use scan_metrics::{ScanMetrics, ScanResult};
 pub use value::*;
 pub use variant_schema::{merge_variant_schemas, schema_of_variant};
