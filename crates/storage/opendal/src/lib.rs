@@ -22,6 +22,7 @@
 //! [`StorageFactory`](StorageFactory) traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod sign_retry;
 mod utils;
 
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 use serde::{Deserialize, Serialize};
+pub use sign_retry::SignErrorRetryLayer;
 use utils::from_opendal_error;
 
 cfg_if! {
@@ -408,7 +410,17 @@ impl OpenDalStorage {
         // 10s — surfacing as `io operation timeout reached` (persistent, so
         // RetryLayer does not retry it). 120s keeps hang-detection while
         // giving big uploads real headroom.
+        //
+        // SignErrorRetryLayer sits INNERMOST: reqsign's signer re-loads an
+        // expired credential lazily at sign time, and a transient STS blip
+        // there surfaces as a NON-temporary `reqsign::Sign` error that
+        // RetryLayer would otherwise treat as fatal — killing a multi-hour
+        // operation the moment its cached credential expires. The layer
+        // reclassifies sign-phase failures (which occur strictly before the
+        // request is sent, so retrying is side-effect-free) as temporary;
+        // RetryLayer above supplies the backoff.
         let operator = operator
+            .layer(SignErrorRetryLayer)
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(120)))
             .layer(RetryLayer::new());
         Ok((operator, relative_path))
