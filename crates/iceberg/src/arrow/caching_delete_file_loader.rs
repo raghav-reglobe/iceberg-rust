@@ -1012,22 +1012,14 @@ mod tests {
 
         // The delete key is the full tuple — a row differing in ANY one
         // column is not in the set and is kept.
-        assert!(
-            eq_set
-                .keys
-                .contains(&EqDeleteKey(vec![
-                    Some(Datum::long(1)),
-                    Some(Datum::string("X"))
-                ]))
-        );
-        assert!(
-            !eq_set
-                .keys
-                .contains(&EqDeleteKey(vec![
-                    Some(Datum::long(1)),
-                    Some(Datum::string("Y"))
-                ]))
-        );
+        assert!(eq_set.keys.contains(&EqDeleteKey(vec![
+            Some(Datum::long(1)),
+            Some(Datum::string("X"))
+        ])));
+        assert!(!eq_set.keys.contains(&EqDeleteKey(vec![
+            Some(Datum::long(1)),
+            Some(Datum::string("Y"))
+        ])));
     }
 
     // A data row is kept only if it matches none of the delete rows, so the per-row keep

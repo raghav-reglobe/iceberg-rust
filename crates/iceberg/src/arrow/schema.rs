@@ -54,7 +54,10 @@ pub const UTC_TIME_ZONE: &str = "+00:00";
 /// alias fails whole-file reads over data that is bit-identical to accepted
 /// files ("Unsupported Arrow data type: Timestamp(µs, Etc/UTC)").
 fn is_utc_zone(zone: &str) -> bool {
-    matches!(zone, "UTC" | "+00:00" | "Etc/UTC" | "Z" | "utc" | "+0000" | "00:00")
+    matches!(
+        zone,
+        "UTC" | "+00:00" | "Etc/UTC" | "Z" | "utc" | "+0000" | "00:00"
+    )
 }
 
 /// The canonical Arrow [`arrow.parquet.variant`] extension type.
