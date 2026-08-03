@@ -50,11 +50,21 @@ pub async fn commit_rewrite(
     added: Vec<DataFile>,
 ) -> Result<Table> {
     let tx = Transaction::new(table);
-    let action = tx
+    let mut action = tx
         .rewrite_files()
         .delete_data_files(removed)
         .delete_delete_files(removed_deletes)
         .add_data_files(added);
+    // Input-protected rebase: `table` is the handle the whole compaction
+    // planned and read from, so its current snapshot is the planning base.
+    // A concurrent commit that only APPENDS (streaming sink, merge inserts
+    // on other files) rebases fine; one that touches the inputs — e.g. a
+    // merge writing a DV against a file being rewritten — aborts
+    // non-retryably instead of silently resurrecting its deleted rows (the
+    // 2026-08-01 merge×maintenance dup-current class).
+    if let Some(snap) = table.metadata().current_snapshot_id() {
+        action = action.validate_rebase_from(snap);
+    }
     let tx = action.apply(tx)?;
     let new_table = tx.commit(catalog).await?;
     Ok(new_table)

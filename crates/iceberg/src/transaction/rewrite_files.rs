@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -47,6 +47,7 @@ pub struct RewriteFilesAction {
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     starting_snapshot_id: Option<i64>,
+    rebase_base_snapshot_id: Option<i64>,
 }
 
 impl RewriteFilesAction {
@@ -58,6 +59,7 @@ impl RewriteFilesAction {
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
+            rebase_base_snapshot_id: None,
         }
     }
 
@@ -100,6 +102,152 @@ impl RewriteFilesAction {
         self.starting_snapshot_id = Some(snapshot_id);
         self
     }
+
+    /// Allow the commit to REBASE over snapshots committed after
+    /// `snapshot_id` (the rewrite's planning base), but validate that none
+    /// of them touched this rewrite's inputs:
+    ///
+    /// - a concurrent snapshot ADDED a delete file applying to one of the
+    ///   files being rewritten (a DV referencing it, or any equality delete
+    ///   — which has no referenced file and could mask rows in any input)
+    ///   → conflict. Committing anyway would resurrect the newly deleted
+    ///   rows: the rewritten output was read BEFORE that delete existed and
+    ///   the output's fresh data sequence exempts it from the delete.
+    /// - a concurrent snapshot REMOVED one of the input data files or one
+    ///   of the delete files being reabsorbed (concurrent rewrite/expiry)
+    ///   → conflict.
+    /// - pure data appends (streaming sinks, merge inserts on other files)
+    ///   and manifest reorganizations are allowed — the normal rebase case
+    ///   long-running compactions depend on.
+    ///
+    /// Conflicts are NON-retryable (`DataInvalid`): the transaction retry
+    /// must not blind-rebase across a semantic conflict. Mutually exclusive
+    /// with [`Self::validate_from_snapshot`] (the strict form wins).
+    pub fn validate_rebase_from(mut self, snapshot_id: i64) -> Self {
+        self.rebase_base_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// A conflicting concurrent commit. NON-retryable by design (see
+    /// [`Self::validate_rebase_from`]).
+    fn conflict(msg: String) -> crate::Error {
+        crate::Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!("Found conflicting concurrent commit: {msg}"),
+        )
+    }
+
+    /// Walk the snapshots committed after `base` (exclusive) and reject the
+    /// rebase if any of them touched this rewrite's inputs. See
+    /// [`Self::validate_rebase_from`] for the conflict rules.
+    async fn validate_skipped_range(&self, table: &Table, base: i64) -> Result<()> {
+        let meta = table.metadata();
+
+        // 1. Collect the skipped snapshot ids, current -> base (exclusive).
+        let mut skipped: Vec<i64> = Vec::new();
+        let mut cursor = meta.current_snapshot_id();
+        loop {
+            match cursor {
+                None => {
+                    return Err(Self::conflict(format!(
+                        "base snapshot {base} is not an ancestor of the current snapshot \
+                         (concurrent rollback, branch reset, or expired lineage)"
+                    )));
+                }
+                Some(id) if id == base => break,
+                Some(id) => {
+                    let snap = meta.snapshot_by_id(id).ok_or_else(|| {
+                        Self::conflict(format!(
+                            "ancestor snapshot {id} is missing from table metadata — \
+                             cannot validate the skipped range"
+                        ))
+                    })?;
+                    skipped.push(id);
+                    cursor = snap.parent_snapshot_id();
+                }
+            }
+        }
+        if skipped.is_empty() {
+            return Ok(());
+        }
+
+        // 2. This rewrite's conflict sets: the inputs being replaced and the
+        //    delete files being reabsorbed.
+        let our_inputs: HashSet<&str> = self
+            .removed_data_files
+            .iter()
+            .map(|f| f.file_path())
+            .collect();
+        let our_removed_deletes: HashSet<&str> = self
+            .removed_delete_files
+            .iter()
+            .map(|f| f.file_path())
+            .collect();
+
+        // 3. Walk each skipped snapshot's DELTA manifests. Removals are
+        //    visible here too: a removal rewrites the affected manifest under
+        //    the removing snapshot's id with DELETED entries.
+        for id in skipped {
+            let snap = meta
+                .snapshot_by_id(id)
+                .expect("skipped snapshot resolved above");
+            let manifest_list = table.manifest_list_reader(snap).load().await?;
+            for mf in manifest_list
+                .entries()
+                .iter()
+                .filter(|m| m.added_snapshot_id == id)
+            {
+                // Only manifests that could carry a conflicting change need
+                // an entry-level look: new delete files, or removals.
+                let added_deletes =
+                    mf.content == ManifestContentType::Deletes && mf.has_added_files();
+                if !added_deletes && !mf.has_deleted_files() {
+                    continue; // pure data appends / manifest reorganization
+                }
+                let manifest = mf.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    match entry.status() {
+                        crate::spec::ManifestStatus::Added
+                            if mf.content == ManifestContentType::Deletes =>
+                        {
+                            let refd = entry.data_file().referenced_data_file();
+                            let collides = match refd.as_deref() {
+                                Some(p) => our_inputs.contains(p),
+                                // Equality delete — no referenced file; it can
+                                // mask rows in ANY input. Fail closed.
+                                None => true,
+                            };
+                            if collides {
+                                return Err(Self::conflict(format!(
+                                    "concurrent snapshot {id} added delete file {} \
+                                     (referenced_data_file={refd:?}) applying to a data file \
+                                     this rewrite replaces — committing would resurrect the \
+                                     concurrently deleted rows",
+                                    entry.data_file().file_path(),
+                                )));
+                            }
+                        }
+                        crate::spec::ManifestStatus::Deleted => {
+                            let p = entry.data_file().file_path();
+                            let hit = match mf.content {
+                                ManifestContentType::Data => our_inputs.contains(p),
+                                ManifestContentType::Deletes => our_removed_deletes.contains(p),
+                            };
+                            if hit {
+                                return Err(Self::conflict(format!(
+                                    "concurrent snapshot {id} removed {} which this rewrite \
+                                     also replaces (concurrent rewrite or expiry)",
+                                    p,
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -116,6 +264,16 @@ impl TransactionAction for RewriteFilesAction {
                     table.metadata().current_snapshot_id()
                 ),
             ));
+        }
+
+        // Rebase validation (input protection): allow concurrent appends,
+        // conflict on anything touching this rewrite's inputs. See
+        // `validate_rebase_from`. Skipped when the strict form is in use.
+        if self.starting_snapshot_id.is_none()
+            && let Some(base) = self.rebase_base_snapshot_id
+            && table.metadata().current_snapshot_id() != Some(base)
+        {
+            self.validate_skipped_range(table, base).await?;
         }
 
         let snapshot_producer = SnapshotProducer::new(
