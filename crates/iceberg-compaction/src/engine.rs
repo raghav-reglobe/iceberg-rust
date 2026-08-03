@@ -198,6 +198,120 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     Ok(())
 }
 
+/// Outcome of a path-scoped rewrite ([`compact_files`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactFilesOutcome {
+    /// Input data files removed (rewritten).
+    pub rewritten: usize,
+    /// Output data files added.
+    pub added: usize,
+    /// Delete files (DVs) reabsorbed alongside the rewrite.
+    pub reabsorbed_deletes: usize,
+}
+
+/// Rewrite EXACTLY the given data files (no candidacy, no size bands),
+/// reabsorbing the deletion vectors bound to them — the merge path's inline
+/// DV micro-reabsorb entry.
+///
+/// Differences from [`compact_table`]:
+///
+/// * The scan is path-scoped (`with_data_file_path_filter`), and the plan is
+///   forced to `rewrite_all` + `min_input_files = 1` so every scoped file is
+///   rewritten regardless of size.
+/// * Delete-file removal is restricted to POSITIONAL deletes whose
+///   `referenced_data_file` is one of the rewritten paths. A path-scoped scan
+///   cannot see an equality delete's full applicability (files OUTSIDE the
+///   scope may still need it), so equality deletes — and positional deletes
+///   without a recorded referenced file — are always RETAINED; they keep
+///   applying to the files left behind and age out under the table-wide
+///   compaction pass.
+///
+/// The commit anchors `validate_rebase_from` at the planning snapshot (via
+/// [`commit_rewrite`]): a concurrent snapshot that added or removed delete
+/// files against the inputs aborts NON-retryably — callers treat that as
+/// "skipped, re-fires later", never retry in-place.
+pub async fn compact_files(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    paths: &HashSet<String>,
+    cfg: &Config,
+) -> Result<CompactFilesOutcome> {
+    if paths.is_empty() {
+        return Ok(CompactFilesOutcome::default());
+    }
+    let table = catalog.load_table(ident).await?;
+    let files = current_data_files(&table).await?;
+    let delete_files = current_delete_files(&table).await?;
+
+    let tasks: Vec<FileScanTask> = table
+        .scan()
+        .select_all()
+        .with_data_file_path_filter(paths.iter().cloned())
+        .build()?
+        .plan_files()
+        .await?
+        .try_collect()
+        .await?;
+    let mut cfg = cfg.clone();
+    cfg.rewrite_all = true;
+    cfg.min_input_files = 1;
+    let plan = plan_compaction(tasks, &cfg);
+
+    let mut all_removed: Vec<DataFile> = Vec::new();
+    let mut all_added: Vec<DataFile> = Vec::new();
+    let mut candidate_delete_paths: HashSet<String> = HashSet::new();
+    for group in &plan.groups {
+        let added = read_sort_write(&table, group, &cfg).await?;
+        if added.is_empty() {
+            // Same fully-superseded gate as `compact_table`: an empty read is
+            // legitimate only when every input carried at least one bound
+            // delete (a 100%-dead file); otherwise leave the group untouched.
+            if !group.tasks.iter().all(|t| !t.deletes.is_empty()) {
+                continue;
+            }
+        }
+        all_removed.extend(
+            group
+                .tasks
+                .iter()
+                .filter_map(|t| files.get(&t.data_file_path).cloned()),
+        );
+        for t in &group.tasks {
+            for d in &t.deletes {
+                candidate_delete_paths.insert(d.file_path.clone());
+            }
+        }
+        all_added.extend(added);
+    }
+
+    if all_added.is_empty() && all_removed.is_empty() {
+        return Ok(CompactFilesOutcome::default());
+    }
+
+    // Positional-and-referenced only (see doc): the scoped scan is blind to
+    // an equality delete's applicability outside `paths`.
+    let rewritten_paths: HashSet<&str> = all_removed.iter().map(|f| f.file_path()).collect();
+    let mut all_removed_deletes: Vec<DataFile> = Vec::new();
+    for path in &candidate_delete_paths {
+        if let Some(df) = delete_files.get(path)
+            && df.content_type() == DataContentType::PositionDeletes
+            && df
+                .referenced_data_file()
+                .is_some_and(|f| rewritten_paths.contains(f.as_str()))
+        {
+            all_removed_deletes.push(df.clone());
+        }
+    }
+
+    let outcome = CompactFilesOutcome {
+        rewritten: all_removed.len(),
+        added: all_added.len(),
+        reabsorbed_deletes: all_removed_deletes.len(),
+    };
+    commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
+    Ok(outcome)
+}
+
 /// Read-only diagnostic of where `removed_deletes` would come from — for pinning
 /// the real-table `rdel=NULL` failure WITHOUT writing files or committing. Does NOT
 /// call `read_sort_write` (which would write orphan parquet) and never commits; only
