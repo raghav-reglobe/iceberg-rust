@@ -32,7 +32,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use datafusion::arrow::array::UInt64Array;
+use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -421,6 +421,24 @@ fn merge_into(
                     .and_then(|v| v.parse::<usize>().ok())
                     .filter(|mb| *mb > 0)
                     .map(|mb| mb * 1024 * 1024),
+                // Inline DV micro-reabsorb — env-gated, ships OFF. When
+                // enabled, DV-target files whose dead fraction crossed the
+                // threshold are rewritten as a second, optional commit after
+                // the merge (skipped near the deadline / on conflict).
+                reabsorb_dead_frac: if std::env::var("MERGE_INLINE_REABSORB_ENABLED")
+                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or(false)
+                {
+                    Some(
+                        std::env::var("MERGE_REABSORB_DEAD_FRAC")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .filter(|f| *f > 0.0 && *f < 1.0)
+                            .unwrap_or(0.3),
+                    )
+                } else {
+                    None
+                },
             });
             let (ctx, pool) = doorway_deadline(
                 deadline,
@@ -442,14 +460,44 @@ fn merge_into(
                 .await
                 .map_err(|e| PyValueError::new_err(format!("executing MERGE: {e}")))?;
             let mut count: u64 = 0;
+            let mut reabsorbed_files: u64 = 0;
+            let mut reabsorb_ms: u64 = 0;
+            let mut reabsorb_skipped: Option<String> = None;
             for batch in &batches {
                 if let Some(col) = batch.column_by_name("count")
                     && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
                 {
                     count += arr.iter().flatten().sum::<u64>();
                 }
+                if let Some(col) = batch.column_by_name("reabsorbed_files")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    reabsorbed_files += arr.iter().flatten().sum::<u64>();
+                }
+                if let Some(col) = batch.column_by_name("reabsorb_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    reabsorb_ms += arr.iter().flatten().sum::<u64>();
+                }
+                if let Some(col) = batch.column_by_name("reabsorb_skipped")
+                    && let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+                    && arr.len() == 1
+                    && arr.is_valid(0)
+                {
+                    reabsorb_skipped = Some(arr.value(0).to_string());
+                }
             }
             let mut out = HashMap::from([("count".to_string(), count.to_string())]);
+            // Inline-reabsorb telemetry (constraint 5 of the handoff): the
+            // worker's per-slice "-> {out}" log line surfaces these with
+            // zero plumbing; absent keys = feature disabled.
+            if reabsorbed_files > 0 || reabsorb_ms > 0 || reabsorb_skipped.is_some() {
+                out.insert("reabsorbed_files".to_string(), reabsorbed_files.to_string());
+                out.insert("reabsorb_ms".to_string(), reabsorb_ms.to_string());
+            }
+            if let Some(reason) = reabsorb_skipped {
+                out.insert("reabsorb_skipped".to_string(), reason);
+            }
             // Pool-visible peak memory for this merge — the governor's
             // per-slice pressure signal. The worker's existing "-> {out}"
             // slice log prints it with zero new plumbing.

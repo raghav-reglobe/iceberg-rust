@@ -187,7 +187,26 @@ pub struct MorMergeOptions {
     /// get proportionally smaller batches. `None` = the built-in default
     /// ([`MOR_CHUNK_TARGET_BYTES_DEFAULT`]).
     pub chunk_target_bytes: Option<usize>,
+    /// Inline DV micro-reabsorb: after the RowDelta commit, rewrite THIS
+    /// merge's DV-target files whose dead fraction (consolidated DV
+    /// cardinality / file rows) exceeds this threshold, reabsorbing their
+    /// DVs — hot tables self-maintain instead of waiting for the periodic
+    /// maintenance pass. The rewrite is a second, OPTIONAL commit from the
+    /// same run: skipped when less than [`REABSORB_MIN_REMAINING`] of the
+    /// deadline remains (hygiene never spends freshness budget), capped at
+    /// [`REABSORB_MAX_FILES`] deepest files per merge, and aborted — never
+    /// retried — on a concurrent conflict (the Replace-side rebase
+    /// validation); the threshold simply re-fires on the next merge.
+    /// `None` = disabled.
+    pub reabsorb_dead_frac: Option<f64>,
 }
+
+/// Inline reabsorb runs only when at least this much of the merge deadline
+/// remains.
+const REABSORB_MIN_REMAINING: std::time::Duration = std::time::Duration::from_secs(60);
+/// Per-merge cap on inline-reabsorb rewrites (deepest dead-fraction first);
+/// the remainder re-fires on later merges — the amortization backstop.
+const REABSORB_MAX_FILES: usize = 32;
 
 impl MorMergeOptions {
     fn chunk_target_bytes(&self) -> usize {
@@ -204,6 +223,7 @@ impl Default for MorMergeOptions {
             write_workers: None,
             late_materialization: true,
             chunk_target_bytes: None,
+            reabsorb_dead_frac: None,
         }
     }
 }
@@ -1947,11 +1967,12 @@ impl IcebergMorMergeCommitExec {
         snapshot_id: Option<i64>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let count_schema: ArrowSchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
-            "count",
-            DataType::UInt64,
-            false,
-        )]));
+        let count_schema: ArrowSchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("count", DataType::UInt64, false),
+            Field::new("reabsorbed_files", DataType::UInt64, false),
+            Field::new("reabsorb_ms", DataType::UInt64, false),
+            Field::new("reabsorb_skipped", DataType::Utf8, true),
+        ]));
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&count_schema)),
             Partitioning::UnknownPartitioning(1),
@@ -2032,6 +2053,10 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
         let snapshot_id = self.snapshot_id;
         let input = self.input.clone();
         let count_schema = Arc::clone(&self.count_schema);
+        let options = context
+            .session_config()
+            .get_extension::<MorMergeOptions>()
+            .unwrap_or_default();
 
         let stream = futures::stream::once(async move {
             let spec_id = table.metadata().default_partition_spec_id();
@@ -2073,10 +2098,13 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             }
 
             if added.is_empty() && dvs.is_empty() && removed.is_empty() {
-                return Self::make_count_batch(&count_schema, 0);
+                return Self::make_count_batch(&count_schema, 0, 0, 0, None);
             }
 
             let count: u64 = added.iter().map(|f| f.record_count()).sum();
+            // The reabsorb needs this merge's DV descriptors after the
+            // RowDelta consumes `dvs` — a handful of metadata clones.
+            let merge_dvs = dvs.clone();
 
             let tx = Transaction::new(&table);
             let mut action = tx.row_delta();
@@ -2095,14 +2123,24 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 // writer must fail this commit, not be rebased over.
                 None => action.validate_from_empty_table(),
             };
-            action
+            let committed = action
                 .apply(tx)
                 .map_err(to_datafusion_error)?
                 .commit(catalog.as_ref())
                 .await
                 .map_err(to_datafusion_error)?;
 
-            Self::make_count_batch(&count_schema, count)
+            // Inline DV micro-reabsorb — optional hygiene, never fails the
+            // merge (the RowDelta above already committed).
+            let (reab_files, reab_ms, reab_skipped) = match options.reabsorb_dead_frac {
+                Some(frac) if !merge_dvs.is_empty() => {
+                    inline_reabsorb(&catalog, &committed, &merge_dvs, frac, options.deadline).await
+                }
+                Some(_) => (0, 0, Some("threshold".to_string())),
+                None => (0, 0, None),
+            };
+
+            Self::make_count_batch(&count_schema, count, reab_files, reab_ms, reab_skipped)
         })
         .boxed();
 
@@ -2114,11 +2152,93 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
 }
 
 impl IcebergMorMergeCommitExec {
-    fn make_count_batch(schema: &ArrowSchemaRef, count: u64) -> DFResult<RecordBatch> {
+    fn make_count_batch(
+        schema: &ArrowSchemaRef,
+        count: u64,
+        reabsorbed_files: u64,
+        reabsorb_ms: u64,
+        reabsorb_skipped: Option<String>,
+    ) -> DFResult<RecordBatch> {
         RecordBatch::try_new(Arc::clone(schema), vec![
             Arc::new(UInt64Array::from(vec![count])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![reabsorbed_files])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![reabsorb_ms])) as ArrayRef,
+            Arc::new(StringArray::from(vec![reabsorb_skipped])) as ArrayRef,
         ])
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+/// Threshold-select this merge's DV-target files and rewrite the crossing
+/// ones via the compaction engine's path-scoped entry
+/// ([`iceberg_compaction::engine::compact_files`]) — DVs reabsorbed, sort +
+/// shred preserved per the table contract. Returns
+/// `(reabsorbed_files, elapsed_ms, skipped_reason)`; infallible by design —
+/// every failure folds into the skip reason (`budget` | `threshold` |
+/// `conflict` | `error:…`) and the threshold re-fires on a later merge.
+async fn inline_reabsorb(
+    catalog: &Arc<dyn Catalog>,
+    committed: &Table,
+    dvs: &[DataFile],
+    dead_frac: f64,
+    deadline: Option<std::time::Instant>,
+) -> (u64, u64, Option<String>) {
+    let t0 = std::time::Instant::now();
+    if let Some(d) = deadline
+        && d.checked_duration_since(std::time::Instant::now())
+            .is_none_or(|rem| rem < REABSORB_MIN_REMAINING)
+    {
+        return (0, 0, Some("budget".to_string()));
+    }
+    let data = match iceberg_compaction::engine::current_data_files(committed).await {
+        Ok(map) => map,
+        Err(e) => return (0, 0, Some(format!("error:{e:#}"))),
+    };
+    // dv.record_count() is the CONSOLIDATED cardinality (prior DVs unioned
+    // by the merge), i.e. the file's TOTAL dead rows.
+    let mut crossing: Vec<(f64, String)> = dvs
+        .iter()
+        .filter_map(|dv| {
+            let path = dv.referenced_data_file()?;
+            let file = data.get(&path)?;
+            let frac = dv.record_count() as f64 / file.record_count().max(1) as f64;
+            (frac > dead_frac).then_some((frac, path))
+        })
+        .collect();
+    if crossing.is_empty() {
+        return (0, 0, Some("threshold".to_string()));
+    }
+    crossing.sort_by(|a, b| b.0.total_cmp(&a.0));
+    crossing.truncate(REABSORB_MAX_FILES);
+    let paths: HashSet<String> = crossing.into_iter().map(|(_, p)| p).collect();
+    let cfg = iceberg_compaction::config::Config {
+        shred_variants: committed
+            .metadata()
+            .table_properties()
+            .map(|p| p.parquet_shred_variants)
+            .unwrap_or(false),
+        ..Default::default()
+    };
+    match iceberg_compaction::engine::compact_files(
+        catalog.as_ref(),
+        committed.identifier(),
+        &paths,
+        &cfg,
+    )
+    .await
+    {
+        Ok(out) => (out.rewritten as u64, t0.elapsed().as_millis() as u64, None),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let reason = if msg.contains("conflicting concurrent commit") {
+                "conflict".to_string()
+            } else {
+                let mut m = msg;
+                m.truncate(160);
+                format!("error:{m}")
+            };
+            (0, t0.elapsed().as_millis() as u64, Some(reason))
+        }
     }
 }
 

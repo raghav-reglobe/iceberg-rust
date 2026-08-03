@@ -4125,6 +4125,7 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-cache-foyer",
+ "iceberg-compaction",
  "parquet",
  "roaring",
  "tempfile",
