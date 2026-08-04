@@ -314,6 +314,50 @@ fn expire_snapshots(
     })
 }
 
+/// The table's CURRENT schema as an Iceberg schema-JSON document. The
+/// pyiceberg-free source for schema projection (VARIANT columns come back
+/// as real `"variant"` — no UnknownType detour).
+#[pyfunction]
+fn table_schema_json(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+) -> PyResult<String> {
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            serde_json::to_string(t.metadata().current_schema().as_ref())
+                .map_err(|e| PyValueError::new_err(format!("serializing schema: {e}")))
+        })
+    })
+}
+
+/// Drop a table (metadata-only — never a purge; orphaned files are the
+/// maintenance sweep's job).
+#[pyfunction]
+fn drop_table(py: Python<'_>, catalog_props: HashMap<String, String>, fqn: String) -> PyResult<()> {
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            catalog
+                .drop_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("dropping {fqn}: {e}")))?;
+            Ok(())
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "catalog")?;
     this.add_function(wrap_pyfunction!(create_table, &this)?)?;
@@ -321,6 +365,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(table_exists, &this)?)?;
     this.add_function(wrap_pyfunction!(set_properties, &this)?)?;
     this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;
+    this.add_function(wrap_pyfunction!(table_schema_json, &this)?)?;
+    this.add_function(wrap_pyfunction!(drop_table, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
