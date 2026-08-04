@@ -90,13 +90,14 @@ fn parse_type(s: &str) -> PyResult<Type> {
 /// `catalog.namespace.table`. Blocks until the commit lands; raises
 /// `ValueError` on failure. A no-op (both lists empty) returns immediately.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new()))]
+#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new(), update_columns=Vec::new()))]
 fn update_schema(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
     add_columns: Vec<(String, String)>,
     drop_columns: Vec<String>,
+    update_columns: Vec<(String, String)>,
 ) -> PyResult<()> {
     let parts: Vec<&str> = fqn.split('.').collect();
     if parts.len() < 3 {
@@ -111,11 +112,17 @@ fn update_schema(
         .map(|s| s.to_string())
         .collect();
 
-    if add_columns.is_empty() && drop_columns.is_empty() {
+    if add_columns.is_empty() && drop_columns.is_empty() && update_columns.is_empty() {
         return Ok(());
     }
     // Parse types up-front so a bad keyword errors before we touch the catalog.
     let adds: Vec<(String, Type)> = add_columns
+        .into_iter()
+        .map(|(n, t)| parse_type(&t).map(|ty| (n, ty)))
+        .collect::<PyResult<_>>()?;
+    // SAFE promotions on existing root-level columns (int->long, float->double,
+    // decimal precision widen — validated at commit by the action).
+    let updates: Vec<(String, Type)> = update_columns
         .into_iter()
         .map(|(n, t)| parse_type(&t).map(|ty| (n, ty)))
         .collect::<PyResult<_>>()?;
@@ -146,6 +153,9 @@ fn update_schema(
             }
             for name in drop_columns {
                 action = action.delete_column(name);
+            }
+            for (name, ty) in updates {
+                action = action.update_column_type(name, ty);
             }
             let tx = action
                 .apply(tx)

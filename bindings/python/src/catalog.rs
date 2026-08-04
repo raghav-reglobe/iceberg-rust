@@ -358,6 +358,28 @@ fn drop_table(py: Python<'_>, catalog_props: HashMap<String, String>, fqn: Strin
     })
 }
 
+/// The table's CURRENT properties as a dict (metadata-only read).
+#[pyfunction]
+fn table_properties(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            Ok(t.metadata().properties().clone())
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "catalog")?;
     this.add_function(wrap_pyfunction!(create_table, &this)?)?;
@@ -367,6 +389,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;
     this.add_function(wrap_pyfunction!(table_schema_json, &this)?)?;
     this.add_function(wrap_pyfunction!(drop_table, &this)?)?;
+    this.add_function(wrap_pyfunction!(table_properties, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
