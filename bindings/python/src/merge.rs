@@ -445,6 +445,12 @@ fn merge_into(
                     None
                 },
             });
+            // Phase timing (merge_into_window W1): mount / plan / exec at the
+            // doorway, write (scan+join+write drain) + commit from the commit
+            // exec's result columns. exec_ms − write_ms − commit_ms −
+            // reabsorb_ms ≈ stream/dispatch overhead. The worker's per-slice
+            // "-> {out}" log line surfaces all of it with zero plumbing.
+            let mount_t0 = std::time::Instant::now();
             let (ctx, pool) = doorway_deadline(
                 deadline,
                 "mounting catalogs",
@@ -457,17 +463,24 @@ fn merge_into(
                 ),
             )
             .await??;
+            let mount_ms = mount_t0.elapsed().as_millis() as u64;
+            let plan_t0 = std::time::Instant::now();
             let df = doorway_deadline(deadline, "planning MERGE", ctx.sql(&sql))
                 .await?
                 .map_err(|e| PyValueError::new_err(format!("planning MERGE: {e}")))?;
+            let plan_ms = plan_t0.elapsed().as_millis() as u64;
+            let exec_t0 = std::time::Instant::now();
             let batches = df
                 .collect()
                 .await
                 .map_err(|e| PyValueError::new_err(format!("executing MERGE: {e}")))?;
+            let exec_ms = exec_t0.elapsed().as_millis() as u64;
             let mut count: u64 = 0;
             let mut reabsorbed_files: u64 = 0;
             let mut reabsorb_ms: u64 = 0;
             let mut reabsorb_skipped: Option<String> = None;
+            let mut write_ms: u64 = 0;
+            let mut commit_ms: u64 = 0;
             for batch in &batches {
                 if let Some(col) = batch.column_by_name("count")
                     && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
@@ -491,8 +504,23 @@ fn merge_into(
                 {
                     reabsorb_skipped = Some(arr.value(0).to_string());
                 }
+                if let Some(col) = batch.column_by_name("write_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    write_ms += arr.iter().flatten().sum::<u64>();
+                }
+                if let Some(col) = batch.column_by_name("commit_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    commit_ms += arr.iter().flatten().sum::<u64>();
+                }
             }
             let mut out = HashMap::from([("count".to_string(), count.to_string())]);
+            out.insert("mount_ms".to_string(), mount_ms.to_string());
+            out.insert("plan_ms".to_string(), plan_ms.to_string());
+            out.insert("exec_ms".to_string(), exec_ms.to_string());
+            out.insert("write_ms".to_string(), write_ms.to_string());
+            out.insert("commit_ms".to_string(), commit_ms.to_string());
             // Inline-reabsorb telemetry (constraint 5 of the handoff): the
             // worker's per-slice "-> {out}" log line surfaces these with
             // zero plumbing; absent keys = feature disabled.

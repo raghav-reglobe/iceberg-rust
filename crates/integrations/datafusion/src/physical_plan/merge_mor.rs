@@ -2012,6 +2012,10 @@ impl IcebergMorMergeCommitExec {
             Field::new("reabsorbed_files", DataType::UInt64, false),
             Field::new("reabsorb_ms", DataType::UInt64, false),
             Field::new("reabsorb_skipped", DataType::Utf8, true),
+            // Phase timing (merge_into_window W1): wall of the upstream
+            // drain (scan + join + write) and of the RowDelta commit.
+            Field::new("write_ms", DataType::UInt64, false),
+            Field::new("commit_ms", DataType::UInt64, false),
         ]));
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&count_schema)),
@@ -2107,6 +2111,9 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             let mut dvs: Vec<DataFile> = Vec::new();
             let mut removed: Vec<DataFile> = Vec::new();
 
+            // Phase timing: draining the input IS the scan+join+write phase
+            // (the write node materializes inside this loop).
+            let write_t0 = std::time::Instant::now();
             let mut batches = input.execute(0, context)?;
             while let Some(batch) = batches.try_next().await? {
                 let lane = |name: &str| -> DFResult<Vec<DataFile>> {
@@ -2137,8 +2144,10 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 removed.extend(lane(REMOVED_DELETE_FILES_LANE)?);
             }
 
+            let write_ms = write_t0.elapsed().as_millis() as u64;
+
             if added.is_empty() && dvs.is_empty() && removed.is_empty() {
-                return Self::make_count_batch(&count_schema, 0, 0, 0, None);
+                return Self::make_count_batch(&count_schema, 0, 0, 0, None, write_ms, 0);
             }
 
             let count: u64 = added.iter().map(|f| f.record_count()).sum();
@@ -2146,6 +2155,7 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             // RowDelta consumes `dvs` — a handful of metadata clones.
             let merge_dvs = dvs.clone();
 
+            let commit_t0 = std::time::Instant::now();
             let tx = Transaction::new(&table);
             let mut action = tx.row_delta();
             if !added.is_empty() {
@@ -2169,6 +2179,7 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 .commit(catalog.as_ref())
                 .await
                 .map_err(to_datafusion_error)?;
+            let commit_ms = commit_t0.elapsed().as_millis() as u64;
 
             // Inline DV micro-reabsorb — optional hygiene, never fails the
             // merge (the RowDelta above already committed).
@@ -2180,7 +2191,15 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 None => (0, 0, None),
             };
 
-            Self::make_count_batch(&count_schema, count, reab_files, reab_ms, reab_skipped)
+            Self::make_count_batch(
+                &count_schema,
+                count,
+                reab_files,
+                reab_ms,
+                reab_skipped,
+                write_ms,
+                commit_ms,
+            )
         })
         .boxed();
 
@@ -2192,18 +2211,23 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
 }
 
 impl IcebergMorMergeCommitExec {
+    #[allow(clippy::too_many_arguments)]
     fn make_count_batch(
         schema: &ArrowSchemaRef,
         count: u64,
         reabsorbed_files: u64,
         reabsorb_ms: u64,
         reabsorb_skipped: Option<String>,
+        write_ms: u64,
+        commit_ms: u64,
     ) -> DFResult<RecordBatch> {
         RecordBatch::try_new(Arc::clone(schema), vec![
             Arc::new(UInt64Array::from(vec![count])) as ArrayRef,
             Arc::new(UInt64Array::from(vec![reabsorbed_files])) as ArrayRef,
             Arc::new(UInt64Array::from(vec![reabsorb_ms])) as ArrayRef,
             Arc::new(StringArray::from(vec![reabsorb_skipped])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![write_ms])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![commit_ms])) as ArrayRef,
         ])
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
