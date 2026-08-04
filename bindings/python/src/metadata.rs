@@ -26,6 +26,8 @@
 //!   semantics; this returns raw facts.
 //! - `manifest_stats`  — manifest-LIST-level counts (no entry fetch): live
 //!   data/delete file + row counts, manifest + snapshot counts.
+//! - `location`        — the table's base location + current metadata-file
+//!   location (the pointer an EXTERNAL metadata walker starts from).
 //!
 //! `append_window` intentionally reproduces the reference reader's exact
 //! semantics (its consumer runs a byte-exact parity gate against a pure-Python
@@ -122,6 +124,33 @@ fn head(
             Ok(Some(d.into_any().unbind()))
         }
     }
+}
+
+/// Table pointers for an external metadata walker: `{"location",
+/// "metadata_location"}`. `metadata_location` is `None` when the catalog
+/// response carries no metadata file pointer (never the case for a REST
+/// catalog table). One loadTable — no manifest IO.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn))]
+fn location(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+) -> PyResult<Py<PyAny>> {
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    let out: (String, Option<String>) = py.detach(|| {
+        runtime().block_on(async move {
+            let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+            Ok::<_, PyErr>((
+                table.metadata().location().to_string(),
+                table.metadata_location().map(|s| s.to_string()),
+            ))
+        })
+    })?;
+    let d = PyDict::new(py);
+    d.set_item("location", out.0)?;
+    d.set_item("metadata_location", out.1)?;
+    Ok(d.into_any().unbind())
 }
 
 struct FileRow {
@@ -376,6 +405,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(head, &this)?)?;
     this.add_function(wrap_pyfunction!(append_window, &this)?)?;
     this.add_function(wrap_pyfunction!(manifest_stats, &this)?)?;
+    this.add_function(wrap_pyfunction!(location, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
