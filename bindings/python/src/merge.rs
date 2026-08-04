@@ -426,7 +426,12 @@ fn merge_into(
                 // threshold are rewritten as a second, optional commit after
                 // the merge (skipped near the deadline / on conflict).
                 reabsorb_dead_frac: if std::env::var("MERGE_INLINE_REABSORB_ENABLED")
-                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                    .map(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    })
                     .unwrap_or(false)
                 {
                     Some(
