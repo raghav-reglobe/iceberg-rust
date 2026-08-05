@@ -67,7 +67,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -78,11 +78,16 @@ fn compact(
     shred_variants: Option<bool>,
     sort_column: Option<String>,
     rewrite_all: Option<bool>,
+    timeout_s: Option<u64>,
 ) -> PyResult<()> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
 
     let mut cfg = Config::default();
+    // Cooperative deadline (the merge doorway's `timeout_s` twin): read/
+    // sort/write phases abort once it elapses; the commit, once entered,
+    // always runs to completion. A timed-out pass commits NOTHING.
+    cfg.deadline = timeout_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     if let Some(v) = target_file_size_bytes {
         cfg.target_file_size_bytes = v;
     }

@@ -114,7 +114,19 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
 /// each prior snapshot, which duplicated data files. All reads are against the
 /// loaded snapshot, so the once-built `files`/`delete_files` maps stay valid.
 pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Config) -> Result<()> {
+    // Phase progress to stderr (Loki-visible): a hang self-reports by its
+    // last phase line instead of an 8h stall-watchdog cycle, and the phase
+    // it dies in scopes the diagnosis.
+    let t0 = std::time::Instant::now();
+    let phase = |name: &str| {
+        eprintln!(
+            "compact-phase table={ident} phase={name} elapsed_s={:.0}",
+            t0.elapsed().as_secs_f64()
+        );
+    };
+    phase("load");
     let table = catalog.load_table(ident).await?;
+    phase("plan");
     let files = current_data_files(&table).await?;
     let delete_files = current_delete_files(&table).await?;
     let plan = plan_table(&table, cfg).await?;
@@ -122,7 +134,15 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     let mut all_removed: Vec<DataFile> = Vec::new();
     let mut all_added: Vec<DataFile> = Vec::new();
     let mut candidate_delete_paths: HashSet<String> = HashSet::new();
-    for group in &plan.groups {
+    let n_groups = plan.groups.len();
+    for (gi, group) in plan.groups.iter().enumerate() {
+        crate::rewrite::check_deadline(cfg, "between groups")?;
+        eprintln!(
+            "compact-phase table={ident} phase=rewrite group={}/{n_groups} files={} elapsed_s={:.0}",
+            gi + 1,
+            group.tasks.len(),
+            t0.elapsed().as_secs_f64()
+        );
         let added = read_sort_write(&table, group, cfg).await?;
         if added.is_empty() {
             // The group produced no live rows. That is LEGITIMATE when every
@@ -194,7 +214,9 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
         }
     }
 
+    phase("commit");
     commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
+    phase("done");
     Ok(())
 }
 

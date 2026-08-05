@@ -143,7 +143,13 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
                 "fifo" => EvictionPolicy::Fifo,
                 _ => EvictionPolicy::S3Fifo,
             };
-            let builder = FoyerObjectBytesCacheBuilder::new(64 * 1024 * 1024)
+            // Memory-tier budget: ICEBERG_DATA_CACHE_MEM_MB (default 64).
+            // Fat dedicated pods (whole-file VARIANT slices) size it up so
+            // the working set stops thrashing the disk tier (~61k misses +
+            // 1.4TB disk churn per slice measured on the queries catch-up at
+            // the 64MB default); the fleet default stays 64.
+            let mem_bytes = env_mb("ICEBERG_DATA_CACHE_MEM_MB", 64) * 1024 * 1024;
+            let builder = FoyerObjectBytesCacheBuilder::new(mem_bytes as usize)
                 .with_disk(dir.join("data"), (disk_mb * 1024 * 1024) as usize)
                 .with_disk_block_bytes((max_file_bytes + 16 * 1024 * 1024) as usize)
                 .with_eviction_policy(policy);

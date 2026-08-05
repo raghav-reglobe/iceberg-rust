@@ -90,6 +90,18 @@ pub async fn commit_rewrite(
 /// budget (the common case) still produce ONE fully-sorted run; oversized
 /// groups degrade gracefully to several sorted runs (slightly looser
 /// per-file `_valid_from` bounds, full correctness).
+/// Cooperative deadline check — the compaction twin of the merge doorway's
+/// `timeout_s`. Returns a plain error naming the phase; never called on the
+/// commit path (a commit, once entered, runs to completion).
+pub(crate) fn check_deadline(cfg: &Config, what: &str) -> Result<()> {
+    if let Some(d) = cfg.deadline
+        && std::time::Instant::now() >= d
+    {
+        anyhow::bail!("compaction deadline exceeded while {what} (no commit was performed)");
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_sort_write(
     table: &Table,
     group: &Group,
@@ -110,12 +122,14 @@ pub(crate) async fn read_sort_write(
     let mut chunk: Vec<RecordBatch> = Vec::new();
     let mut chunk_bytes = 0usize;
     while let Some(batch) = stream.try_next().await? {
+        check_deadline(cfg, "reading input")?;
         if batch.num_rows() == 0 {
             continue;
         }
         chunk_bytes += batch.get_array_memory_size();
         chunk.push(batch);
         if chunk_bytes >= cfg.sort_chunk_bytes {
+            check_deadline(cfg, "sorting/writing a chunk")?;
             flush_chunk(
                 table,
                 cfg,
@@ -325,4 +339,29 @@ pub(crate) async fn read_group(
     let reader = table.reader_builder().build();
     let task_stream: FileScanTaskStream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
     Ok(reader.read(task_stream)?.stream())
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn expired_deadline_aborts_with_phase_name() {
+        let mut cfg = Config::default();
+        cfg.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let err = check_deadline(&cfg, "reading input").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("deadline exceeded"), "{msg}");
+        assert!(msg.contains("reading input"), "{msg}");
+        assert!(msg.contains("no commit was performed"), "{msg}");
+    }
+
+    #[test]
+    fn unset_and_future_deadlines_pass() {
+        let cfg = Config::default();
+        check_deadline(&cfg, "x").unwrap();
+        let mut cfg2 = Config::default();
+        cfg2.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        check_deadline(&cfg2, "x").unwrap();
+    }
 }

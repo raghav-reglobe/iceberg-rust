@@ -49,6 +49,13 @@ pub struct Config {
     /// size/delete candidacy policy (Spark `rewrite-all` parity). Grouping
     /// and bin-packing still apply.
     pub rewrite_all: bool,
+    /// Cooperative deadline. Checked between groups, between read batches
+    /// and between sort-chunk flushes; when exceeded the pass aborts with a
+    /// "compaction deadline exceeded" error BEFORE the commit — the commit
+    /// itself, once entered, always runs to completion (cancelling a REST
+    /// commit in flight leaves the outcome unknown; the merge doorway's
+    /// `timeout_s` doctrine). `None` (default) = unbounded.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for Config {
@@ -65,6 +72,7 @@ impl Default for Config {
             shred_variants: false,
             sort_column: None,
             rewrite_all: false,
+            deadline: None,
         }
     }
 }
