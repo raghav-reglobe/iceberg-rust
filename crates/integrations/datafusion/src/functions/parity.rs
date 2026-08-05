@@ -26,6 +26,12 @@
 //! case-insensitively; an empty/invalid input yields 0; NULL stays NULL.
 //! Sum the result with exact integer semantics on BOTH sides
 //! (`SUM(CAST(CONV(...) AS UNSIGNED))` on MySQL) — never as a double.
+//!
+//! `crc32(s)` is the cheaper checksum scheme's scalar: MySQL `CRC32(s)`
+//! semantics — CRC-32/IEEE (the zlib polynomial) over the string's bytes,
+//! unsigned 32-bit result widened to UInt64; NULL stays NULL. CRC-32 is
+//! far cheaper per row than MD5 on the SQL side, which matters when the
+//! source side runs under tight per-query budgets.
 
 use std::sync::Arc;
 
@@ -95,14 +101,65 @@ impl ScalarUDFImpl for Conv16Udf {
     }
 }
 
+/// `crc32(string)` → UInt64 (MySQL `CRC32(s)` — CRC-32/IEEE over the
+/// string bytes; NULL in → NULL out).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Crc32Udf {
+    signature: Signature,
+}
+
+impl Crc32Udf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+fn crc32_str(s: &str) -> u64 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(s.as_bytes());
+    u64::from(h.finalize())
+}
+
+impl ScalarUDFImpl for Crc32Udf {
+    fn name(&self) -> &str {
+        "crc32"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::UInt64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let input = match &args.args[0] {
+            ColumnarValue::Array(a) => Arc::clone(a),
+            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
+        };
+        let strings = cast(input.as_ref(), &DataType::Utf8)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let strings = strings
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cast to Utf8");
+        let out: UInt64Array = strings.iter().map(|v| v.map(crc32_str)).collect();
+        Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
+    }
+}
+
 /// Register the parity UDFs on the given [`SessionContext`].
 pub fn register_parity_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(Conv16Udf::new()));
+    ctx.register_udf(ScalarUDF::from(Crc32Udf::new()));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::conv16_str;
+    use super::{conv16_str, crc32_str};
 
     #[test]
     fn mysql_conv_semantics() {
@@ -114,5 +171,14 @@ mod tests {
         assert_eq!(conv16_str(""), 0);
         assert_eq!(conv16_str("zzz"), 0);
         assert_eq!(conv16_str("ffffffffffffffff"), u64::MAX); // 16 digits fit
+    }
+
+    #[test]
+    fn mysql_crc32_semantics() {
+        // Goldens = MySQL CRC32() (CRC-32/IEEE, zlib polynomial).
+        assert_eq!(crc32_str("hello"), 907060870);
+        assert_eq!(crc32_str("123456789"), 0xCBF43926); // classic check value
+        assert_eq!(crc32_str(""), 0);
+        assert_eq!(crc32_str("MySQL"), 3259397556);
     }
 }
