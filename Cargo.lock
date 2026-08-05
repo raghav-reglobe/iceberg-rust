@@ -4119,6 +4119,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "crc32fast",
  "dashmap",
  "datafusion",
  "expect-test",
