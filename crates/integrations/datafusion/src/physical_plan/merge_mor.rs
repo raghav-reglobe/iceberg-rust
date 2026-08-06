@@ -45,7 +45,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
@@ -61,6 +61,9 @@ use datafusion::logical_expr::dml::MergeIntoClauseKind;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
@@ -579,6 +582,29 @@ pub(crate) enum MorActionPlan {
     Delete,
 }
 
+/// Accumulates the time spent INSIDE each `poll_next` of the wrapped stream
+/// into an `elapsed_compute`-style [`Time`] — BUSY time (decode/compute done
+/// during the poll), not wall (a Pending poll returns immediately, so waits
+/// between polls never count). The metrics-walk sub-split of `write_ms`
+/// reads these post-drain (merge_into_window W1).
+struct PollTimedStream<S> {
+    inner: S,
+    busy: Time,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for PollTimedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let _t = this.busy.timer();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IcebergMorTargetScanExec — narrow target scan with plain-typed _file/_pos
 // ---------------------------------------------------------------------------
@@ -602,6 +628,8 @@ pub(crate) struct IcebergMorTargetScanExec {
     /// The same residuals bound row-exactly against the scan output schema;
     /// the semantics guarantee (applied to every batch).
     residual: Option<Arc<dyn PhysicalExpr>>,
+    /// Busy-time accounting for the metrics-walk sub-split (scan_ms).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergMorTargetScanExec {
@@ -631,6 +659,7 @@ impl IcebergMorTargetScanExec {
             plan_properties,
             predicate,
             residual,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -670,6 +699,10 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -729,7 +762,13 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
             });
             Ok::<_, DataFusionError>(Box::pin(out))
         };
-        let stream = futures::stream::once(fut).try_flatten();
+        // Busy-time accounting (scan_ms): the iceberg reader's plan + decode
+        // work all happens inside this composed stream's polls.
+        let busy = MetricBuilder::new(&self.metrics).elapsed_compute(0);
+        let stream = PollTimedStream {
+            inner: Box::pin(futures::stream::once(fut).try_flatten()),
+            busy,
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
     }
 }
@@ -770,6 +809,12 @@ pub(crate) struct IcebergMorMergeExec {
     file_idx: usize,
     schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
+    /// Busy-time accounting for the metrics-walk sub-split (join_ms): the
+    /// clause-routing time lands here directly; the execute-time
+    /// [`HashJoinExec`] is retained below so its build+probe
+    /// `elapsed_compute` (folded on stream drop) stays readable post-drain.
+    metrics: ExecutionPlanMetricsSet,
+    retained_join: Mutex<Option<Arc<dyn ExecutionPlan>>>,
 }
 
 impl IcebergMorMergeExec {
@@ -810,6 +855,8 @@ impl IcebergMorMergeExec {
             file_idx,
             schema,
             plan_properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+            retained_join: Mutex::new(None),
         }
     }
 }
@@ -894,6 +941,12 @@ impl ExecutionPlan for IcebergMorMergeExec {
             NullEquality::NullEqualsNothing,
             false,
         )?) as Arc<dyn ExecutionPlan>;
+        // Retain the execute-time join so `metrics()` can read its
+        // build+probe times after the drain (the stream itself is dropped).
+        *self
+            .retained_join
+            .lock()
+            .expect("retained_join lock poisoned") = Some(Arc::clone(&join));
 
         if partition != 0 {
             return Err(DataFusionError::Internal(
@@ -912,14 +965,39 @@ impl ExecutionPlan for IcebergMorMergeExec {
         let file_idx = self.file_idx;
         let out_schema = Arc::clone(&self.schema);
         let stream_schema = Arc::clone(&out_schema);
+        let route_busy = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
 
         let stream = join_stream.and_then(move |batch| {
             let clauses = Arc::clone(&clauses);
             let out_schema = Arc::clone(&stream_schema);
-            async move { route_clauses(&batch, &clauses, file_idx, &out_schema) }
+            let busy = route_busy.clone();
+            async move {
+                let _t = busy.timer();
+                route_clauses(&batch, &clauses, file_idx, &out_schema)
+            }
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        // Clause-routing time plus the retained join's metrics — its
+        // elapsed_compute (build+probe, folded on stream drop) is what the
+        // post-drain walk buckets as join_ms. NB DataFusion's build_time
+        // includes collecting the build (source) side.
+        let mut set = self.metrics.clone_inner();
+        if let Some(join) = self
+            .retained_join
+            .lock()
+            .expect("retained_join lock poisoned")
+            .as_ref()
+            && let Some(join_metrics) = join.metrics()
+        {
+            for m in join_metrics.iter() {
+                set.push(Arc::clone(m));
+            }
+        }
+        Some(set)
     }
 }
 
@@ -1011,6 +1089,11 @@ pub(crate) struct IcebergMorMergeWriteExec {
     clauses: Arc<Vec<MorClausePlan>>,
     result_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
+    /// Busy-time accounting for the metrics-walk sub-split (write_node_ms):
+    /// wall inside `run_mor_write` MINUS the time spent awaiting upstream
+    /// input — i.e. chunking + SET evaluation + late fetch + DV build +
+    /// writer-pool feed/join (late-fetch I/O counts as this node's work).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergMorMergeWriteExec {
@@ -1034,6 +1117,7 @@ impl IcebergMorMergeWriteExec {
             clauses,
             result_schema,
             plan_properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -1117,8 +1201,11 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
         let input_schema = self.input.schema();
 
         let run_schema = Arc::clone(&result_schema);
+        let busy = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
         let stream = futures::stream::once(async move {
-            run_mor_write(
+            let t0 = std::time::Instant::now();
+            let mut input_wait_nanos = 0u64;
+            let result = run_mor_write(
                 table,
                 snapshot_id,
                 input,
@@ -1127,8 +1214,13 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
                 options,
                 memory_pool,
                 &run_schema,
+                &mut input_wait_nanos,
             )
-            .await
+            .await;
+            busy.add_duration(std::time::Duration::from_nanos(
+                (t0.elapsed().as_nanos() as u64).saturating_sub(input_wait_nanos),
+            ));
+            result
         })
         .boxed();
 
@@ -1136,6 +1228,10 @@ impl ExecutionPlan for IcebergMorMergeWriteExec {
             result_schema,
             stream,
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -1211,6 +1307,7 @@ async fn merge_shred_types(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mor_write(
     table: Table,
     snapshot_id: Option<i64>,
@@ -1220,6 +1317,7 @@ async fn run_mor_write(
     options: Arc<MorMergeOptions>,
     memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     result_schema: &ArrowSchemaRef,
+    input_wait_nanos: &mut u64,
 ) -> DFResult<RecordBatch> {
     // #18 read-RSS accounting: the late-materialization fetch registers
     // decode working sets, and the merge's own residents (evaluated-SET
@@ -1343,9 +1441,14 @@ async fn run_mor_write(
     let mut matched: HashMap<(String, u64), MatchedRow> = HashMap::new();
     let chunk_target_bytes = options.chunk_target_bytes();
 
-    while let Some(batch) =
-        with_deadline(deadline, "reading the merge input", input.try_next()).await??
-    {
+    loop {
+        // Upstream-wait accounting: time awaiting the join's output is the
+        // UPSTREAM's production time, not this node's work — excluded from
+        // the write_node_ms busy figure.
+        let wait_t0 = std::time::Instant::now();
+        let next = with_deadline(deadline, "reading the merge input", input.try_next()).await??;
+        *input_wait_nanos += wait_t0.elapsed().as_nanos() as u64;
+        let Some(batch) = next else { break };
         // Byte-budgeted chunking: MOR_WRITE_CHUNK_ROWS is only the row
         // CEILING — wide rows shrink the chunk so the materialized copies
         // downstream (filter, SET evaluation, full-width build) stay near
@@ -2016,6 +2119,12 @@ impl IcebergMorMergeCommitExec {
             // drain (scan + join + write) and of the RowDelta commit.
             Field::new("write_ms", DataType::UInt64, false),
             Field::new("commit_ms", DataType::UInt64, false),
+            // write_ms sub-split (post-drain metrics walk): per-operator
+            // elapsed_compute — BUSY time, not wall. Pipelined operators
+            // overlap, so these do NOT sum to write_ms.
+            Field::new("scan_ms", DataType::UInt64, false),
+            Field::new("join_ms", DataType::UInt64, false),
+            Field::new("write_node_ms", DataType::UInt64, false),
         ]));
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&count_schema)),
@@ -2145,9 +2254,26 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             }
 
             let write_ms = write_t0.elapsed().as_millis() as u64;
+            // The metrics walk must run AFTER the drained stream drops: the
+            // hash join folds build+probe time into elapsed_compute on
+            // stream drop, and the write node's busy figure lands when its
+            // once-future completes.
+            drop(batches);
+            let (scan_ms, join_ms, write_node_ms) = phase_metrics(&input);
 
             if added.is_empty() && dvs.is_empty() && removed.is_empty() {
-                return Self::make_count_batch(&count_schema, 0, 0, 0, None, write_ms, 0);
+                return Self::make_count_batch(
+                    &count_schema,
+                    0,
+                    0,
+                    0,
+                    None,
+                    write_ms,
+                    0,
+                    scan_ms,
+                    join_ms,
+                    write_node_ms,
+                );
             }
 
             let count: u64 = added.iter().map(|f| f.record_count()).sum();
@@ -2199,6 +2325,9 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 reab_skipped,
                 write_ms,
                 commit_ms,
+                scan_ms,
+                join_ms,
+                write_node_ms,
             )
         })
         .boxed();
@@ -2220,6 +2349,9 @@ impl IcebergMorMergeCommitExec {
         reabsorb_skipped: Option<String>,
         write_ms: u64,
         commit_ms: u64,
+        scan_ms: u64,
+        join_ms: u64,
+        write_node_ms: u64,
     ) -> DFResult<RecordBatch> {
         RecordBatch::try_new(Arc::clone(schema), vec![
             Arc::new(UInt64Array::from(vec![count])) as ArrayRef,
@@ -2228,9 +2360,44 @@ impl IcebergMorMergeCommitExec {
             Arc::new(StringArray::from(vec![reabsorb_skipped])) as ArrayRef,
             Arc::new(UInt64Array::from(vec![write_ms])) as ArrayRef,
             Arc::new(UInt64Array::from(vec![commit_ms])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![scan_ms])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![join_ms])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![write_node_ms])) as ArrayRef,
         ])
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+}
+
+/// Post-drain metrics walk (the write_ms sub-split, merge_into_window W1):
+/// aggregate each MoR node's `elapsed_compute` into
+/// `(scan_ms, join_ms, write_node_ms)`.
+///
+/// Semantics — BUSY time, not wall: scan_ms is the target scan's poll time
+/// (iceberg plan + parquet decode), join_ms is the retained HashJoin's
+/// build+probe plus clause routing (DataFusion's build_time includes
+/// collecting the build/source side), write_node_ms is the write node's wall
+/// minus its upstream-input wait (late-fetch I/O and writer-pool joins count
+/// as write work). Pipelined operators overlap, so the three do not sum to
+/// `write_ms`.
+fn phase_metrics(plan: &Arc<dyn ExecutionPlan>) -> (u64, u64, u64) {
+    fn rec(plan: &dyn ExecutionPlan, acc: &mut [u64; 3]) {
+        let nanos = plan
+            .metrics()
+            .and_then(|m| m.elapsed_compute())
+            .unwrap_or(0) as u64;
+        match plan.name() {
+            "IcebergMorTargetScanExec" => acc[0] += nanos,
+            "IcebergMorMergeExec" => acc[1] += nanos,
+            "IcebergMorMergeWriteExec" => acc[2] += nanos,
+            _ => {}
+        }
+        for child in plan.children() {
+            rec(child.as_ref(), acc);
+        }
+    }
+    let mut acc = [0u64; 3];
+    rec(plan.as_ref(), &mut acc);
+    (acc[0] / 1_000_000, acc[1] / 1_000_000, acc[2] / 1_000_000)
 }
 
 /// Threshold-select this merge's DV-target files and rewrite the crossing

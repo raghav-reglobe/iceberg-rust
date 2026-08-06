@@ -481,6 +481,9 @@ fn merge_into(
             let mut reabsorb_skipped: Option<String> = None;
             let mut write_ms: u64 = 0;
             let mut commit_ms: u64 = 0;
+            let mut scan_ms: u64 = 0;
+            let mut join_ms: u64 = 0;
+            let mut write_node_ms: u64 = 0;
             for batch in &batches {
                 if let Some(col) = batch.column_by_name("count")
                     && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
@@ -514,6 +517,21 @@ fn merge_into(
                 {
                     commit_ms += arr.iter().flatten().sum::<u64>();
                 }
+                if let Some(col) = batch.column_by_name("scan_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    scan_ms += arr.iter().flatten().sum::<u64>();
+                }
+                if let Some(col) = batch.column_by_name("join_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    join_ms += arr.iter().flatten().sum::<u64>();
+                }
+                if let Some(col) = batch.column_by_name("write_node_ms")
+                    && let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    write_node_ms += arr.iter().flatten().sum::<u64>();
+                }
             }
             let mut out = HashMap::from([("count".to_string(), count.to_string())]);
             out.insert("mount_ms".to_string(), mount_ms.to_string());
@@ -521,6 +539,15 @@ fn merge_into(
             out.insert("exec_ms".to_string(), exec_ms.to_string());
             out.insert("write_ms".to_string(), write_ms.to_string());
             out.insert("commit_ms".to_string(), commit_ms.to_string());
+            // write_ms sub-split (post-drain metrics walk over the plan) —
+            // BUSY time per operator (elapsed_compute), NOT wall: pipelined
+            // operators overlap so scan+join+write_node ≠ write_ms; join_ms
+            // includes the build-side (source) collect per DataFusion's
+            // accounting; write_node_ms excludes upstream-input wait but
+            // includes late-fetch I/O + writer-pool joins.
+            out.insert("scan_ms".to_string(), scan_ms.to_string());
+            out.insert("join_ms".to_string(), join_ms.to_string());
+            out.insert("write_node_ms".to_string(), write_node_ms.to_string());
             // Inline-reabsorb telemetry (constraint 5 of the handoff): the
             // worker's per-slice "-> {out}" log line surfaces these with
             // zero plumbing; absent keys = feature disabled.

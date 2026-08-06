@@ -414,12 +414,31 @@ async fn scd2_merge_demotes_via_dv_and_inserts_in_one_snapshot() {
     let before = load_table(&catalog).await;
     let snaps_before = before.metadata().snapshots().count();
 
-    ctx.sql(&scd2_merge_sql())
+    let merge_batches = ctx
+        .sql(&scd2_merge_sql())
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
+    // The commit exec's result batch carries the phase-timing columns —
+    // write_ms/commit_ms wall plus the metrics-walk sub-split (busy time).
+    // Values on a tiny fixture may round to 0 ms; presence + type are the
+    // regression pin.
+    for col in [
+        "write_ms",
+        "commit_ms",
+        "scan_ms",
+        "join_ms",
+        "write_node_ms",
+    ] {
+        let arr = merge_batches[0]
+            .column_by_name(col)
+            .unwrap_or_else(|| panic!("merge result missing '{col}'"));
+        arr.as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap_or_else(|| panic!("'{col}' must be UInt64"));
+    }
 
     let table = load_table(&catalog).await;
     // Exactly ONE new snapshot carries the demote + both appends.
