@@ -56,12 +56,48 @@ impl Debug for HttpClient {
     }
 }
 
+/// Default reqwest client for catalog HTTP with request DEADLINES — the
+/// stock `Client::default()` has NO timeout of any kind, so a stalled
+/// catalog connection (server drops mid-request, half-open TCP) hangs the
+/// caller forever (the 25-minute idle-Polaris hang class). Bounds applied:
+///
+/// - connect timeout (`ICEBERG_REST_CONNECT_TIMEOUT_S`, default 30s)
+/// - read timeout — max gap BETWEEN response bytes, never a total-duration
+///   cap, so large-but-flowing metadata responses are unaffected
+///   (`ICEBERG_REST_READ_TIMEOUT_S`, default 120s — the platform's storage
+///   I/O-timeout precedent).
+///
+/// `0` disables either bound. A timed-out COMMIT is safe by construction:
+/// nothing deletes the just-written files on a commit error (they orphan;
+/// the sweep reclaims) and the caller's replay is idempotent — the same
+/// commit-state-unknown posture as a server-side gateway timeout.
+fn default_client_with_deadlines() -> Client {
+    fn env_secs(name: &str, default: u64) -> Option<std::time::Duration> {
+        deadline_secs(std::env::var(name).ok().as_deref(), default)
+    }
+    let mut builder = Client::builder();
+    if let Some(t) = env_secs("ICEBERG_REST_CONNECT_TIMEOUT_S", 30) {
+        builder = builder.connect_timeout(t);
+    }
+    if let Some(t) = env_secs("ICEBERG_REST_READ_TIMEOUT_S", 120) {
+        builder = builder.read_timeout(t);
+    }
+    builder.build().unwrap_or_default()
+}
+
+/// `0` (or unparseable-as-zero) disables the bound; unset/garbage falls back
+/// to the default.
+fn deadline_secs(value: Option<&str>, default: u64) -> Option<std::time::Duration> {
+    let secs = value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(default);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
         let extra_headers = cfg.extra_headers()?;
         Ok(HttpClient {
-            client: cfg.client().unwrap_or_default(),
+            client: cfg.client().unwrap_or_else(default_client_with_deadlines),
             token: Mutex::new(cfg.token()),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
@@ -496,5 +532,28 @@ mod tests {
         assert!(result.contains("application/json"));
         // [REDACTED] should NOT be present when redaction is disabled
         assert!(!result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_deadline_secs_default_zero_disable_and_garbage() {
+        // Unset -> the default bound.
+        assert_eq!(
+            deadline_secs(None, 120),
+            Some(std::time::Duration::from_secs(120))
+        );
+        // Explicit value wins.
+        assert_eq!(
+            deadline_secs(Some("7"), 120),
+            Some(std::time::Duration::from_secs(7))
+        );
+        // 0 disables the bound entirely.
+        assert_eq!(deadline_secs(Some("0"), 120), None);
+        // Garbage falls back to the default, never to unbounded.
+        assert_eq!(
+            deadline_secs(Some("ten"), 30),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // A zero DEFAULT means no bound by default.
+        assert_eq!(deadline_secs(None, 0), None);
     }
 }

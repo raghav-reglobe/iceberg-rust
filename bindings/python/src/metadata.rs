@@ -40,6 +40,7 @@
 //! sequence, load-bearing for the caller's file-level checkpoint.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use futures::stream::{StreamExt, TryStreamExt};
 use iceberg::spec::ManifestContentType;
@@ -66,6 +67,29 @@ fn split_fqn(fqn: &str) -> PyResult<(String, Vec<String>, String)> {
             .collect(),
         parts[parts.len() - 1].to_string(),
     ))
+}
+
+/// Bound a read-only metadata doorway by a hard deadline — the compact
+/// `timeout_s` twin. These calls are catalog/manifest READS (no commit to
+/// protect), so a blanket cancel is safe; the REST client's own
+/// connect/read timeouts bound individual requests, and this bounds the
+/// whole call (many-manifest walks included) so a stalled catalog can never
+/// hang the caller for minutes.
+async fn metadata_deadline<T>(
+    timeout_s: Option<u64>,
+    what: &str,
+    fut: impl Future<Output = PyResult<T>>,
+) -> PyResult<T> {
+    match timeout_s {
+        None => fut.await,
+        Some(s) => tokio::time::timeout(std::time::Duration::from_secs(s), fut)
+            .await
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "metadata timeout exceeded while {what} (read-only — nothing was written)"
+                ))
+            })?,
+    }
 }
 
 async fn load_table_only(
@@ -97,22 +121,27 @@ struct HeadOut {
 /// "timestamp_ms"}`, or `None` when the table has no current snapshot. One
 /// metadata.json read — no manifest IO.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn))]
+#[pyo3(signature = (catalog_props, fqn, timeout_s=None))]
 fn head(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
+    timeout_s: Option<u64>,
 ) -> PyResult<Option<Py<PyAny>>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
     let out: Option<HeadOut> = py.detach(|| {
-        runtime().block_on(async move {
-            let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
-            Ok::<_, PyErr>(table.metadata().current_snapshot().map(|s| HeadOut {
-                snapshot_id: s.snapshot_id(),
-                sequence_number: s.sequence_number(),
-                timestamp_ms: s.timestamp_ms(),
-            }))
-        })
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "reading the table head",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                Ok::<_, PyErr>(table.metadata().current_snapshot().map(|s| HeadOut {
+                    snapshot_id: s.snapshot_id(),
+                    sequence_number: s.sequence_number(),
+                    timestamp_ms: s.timestamp_ms(),
+                }))
+            },
+        ))
     })?;
     match out {
         None => Ok(None),
@@ -131,21 +160,26 @@ fn head(
 /// response carries no metadata file pointer (never the case for a REST
 /// catalog table). One loadTable — no manifest IO.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn))]
+#[pyo3(signature = (catalog_props, fqn, timeout_s=None))]
 fn location(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
+    timeout_s: Option<u64>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
     let out: (String, Option<String>) = py.detach(|| {
-        runtime().block_on(async move {
-            let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
-            Ok::<_, PyErr>((
-                table.metadata().location().to_string(),
-                table.metadata_location().map(|s| s.to_string()),
-            ))
-        })
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "reading table pointers",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                Ok::<_, PyErr>((
+                    table.metadata().location().to_string(),
+                    table.metadata_location().map(|s| s.to_string()),
+                ))
+            },
+        ))
     })?;
     let d = PyDict::new(py);
     d.set_item("location", out.0)?;
@@ -186,120 +220,125 @@ struct WindowOut {
 /// (`walked=False`, `files=[]`) — that walk is provably empty, not a
 /// different semantic. Cursor/plan-kind decisions stay with the caller.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, cursor_snap=None, cursor_seq=None))]
+#[pyo3(signature = (catalog_props, fqn, cursor_snap=None, cursor_seq=None, timeout_s=None))]
 fn append_window(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
     cursor_snap: Option<i64>,
     cursor_seq: Option<i64>,
+    timeout_s: Option<u64>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
     let out: WindowOut = py.detach(|| {
-        runtime().block_on(async move {
-            let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
-            let meta = table.metadata_ref();
-            let Some(current) = meta.current_snapshot() else {
-                return Ok::<_, PyErr>(WindowOut {
-                    head_snapshot_id: None,
-                    head_seq: None,
-                    resolved_cursor_seq: None,
-                    from_seq: 0,
-                    walked: false,
-                    files: vec![],
-                });
-            };
-            let head_id = current.snapshot_id();
-            let head_seq = current.sequence_number();
-            let resolved = match cursor_seq {
-                Some(s) => Some(s),
-                None => cursor_snap
-                    .and_then(|cs| meta.snapshot_by_id(cs))
-                    .map(|s| s.sequence_number()),
-            };
-            if let Some(r) = resolved {
-                if r >= head_seq {
-                    return Ok(WindowOut {
-                        head_snapshot_id: Some(head_id),
-                        head_seq: Some(head_seq),
-                        resolved_cursor_seq: resolved,
-                        from_seq: r,
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "walking the append window",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                let meta = table.metadata_ref();
+                let Some(current) = meta.current_snapshot() else {
+                    return Ok::<_, PyErr>(WindowOut {
+                        head_snapshot_id: None,
+                        head_seq: None,
+                        resolved_cursor_seq: None,
+                        from_seq: 0,
                         walked: false,
                         files: vec![],
                     });
-                }
-            }
-            let after_seq = resolved.unwrap_or(0);
-            let mlist = table
-                .manifest_list_reader(current)
-                .load()
-                .await
-                .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
-            // Manifest-level prune: every entry's data seq <= its manifest's
-            // seq (spec invariant), so an at-or-below-cursor manifest holds
-            // only consumed files.
-            let candidates: Vec<_> = mlist
-                .entries()
-                .iter()
-                .filter(|mf| {
-                    mf.content == ManifestContentType::Data && mf.sequence_number > after_seq
-                })
-                .collect();
-            // Concurrent manifest loads through the table's PARSED-manifest
-            // cache (shared with the scan path; manifest files are immutable
-            // so path-keyed reuse is always valid — re-walks after a new
-            // commit re-fetch only the NEW manifests). The walk is I/O-bound:
-            // sequential GETs were the dominant cost on trickle-manifest
-            // tables. Completion order is irrelevant — the final (seq, path)
-            // sort normalizes it.
-            let concurrency = std::env::var("ICEBERG_METADATA_MANIFEST_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(16);
-            let loaded: Vec<_> = futures::stream::iter(candidates.into_iter().map(|mf| {
-                let table = &table;
-                async move {
-                    table
-                        .load_manifest_cached(mf)
-                        .await
-                        .map(|m| (mf, m))
-                        .map_err(|e| {
-                            PyValueError::new_err(format!("manifest {}: {e}", mf.manifest_path))
-                        })
-                }
-            }))
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await?;
-            let mut files: Vec<FileRow> = Vec::new();
-            for (mf, manifest) in &loaded {
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
-                        continue;
-                    }
-                    let seq = entry.sequence_number().unwrap_or(mf.sequence_number);
-                    if seq > after_seq {
-                        let df = entry.data_file();
-                        files.push(FileRow {
-                            path: df.file_path().to_string(),
-                            rows: df.record_count(),
-                            seq,
-                            bytes: df.file_size_in_bytes(),
+                };
+                let head_id = current.snapshot_id();
+                let head_seq = current.sequence_number();
+                let resolved = match cursor_seq {
+                    Some(s) => Some(s),
+                    None => cursor_snap
+                        .and_then(|cs| meta.snapshot_by_id(cs))
+                        .map(|s| s.sequence_number()),
+                };
+                if let Some(r) = resolved {
+                    if r >= head_seq {
+                        return Ok(WindowOut {
+                            head_snapshot_id: Some(head_id),
+                            head_seq: Some(head_seq),
+                            resolved_cursor_seq: resolved,
+                            from_seq: r,
+                            walked: false,
+                            files: vec![],
                         });
                     }
                 }
-            }
-            files.sort_by(|a, b| (a.seq, a.path.as_str()).cmp(&(b.seq, b.path.as_str())));
-            Ok(WindowOut {
-                head_snapshot_id: Some(head_id),
-                head_seq: Some(head_seq),
-                resolved_cursor_seq: resolved,
-                from_seq: after_seq,
-                walked: true,
-                files,
-            })
-        })
+                let after_seq = resolved.unwrap_or(0);
+                let mlist = table
+                    .manifest_list_reader(current)
+                    .load()
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
+                // Manifest-level prune: every entry's data seq <= its manifest's
+                // seq (spec invariant), so an at-or-below-cursor manifest holds
+                // only consumed files.
+                let candidates: Vec<_> = mlist
+                    .entries()
+                    .iter()
+                    .filter(|mf| {
+                        mf.content == ManifestContentType::Data && mf.sequence_number > after_seq
+                    })
+                    .collect();
+                // Concurrent manifest loads through the table's PARSED-manifest
+                // cache (shared with the scan path; manifest files are immutable
+                // so path-keyed reuse is always valid — re-walks after a new
+                // commit re-fetch only the NEW manifests). The walk is I/O-bound:
+                // sequential GETs were the dominant cost on trickle-manifest
+                // tables. Completion order is irrelevant — the final (seq, path)
+                // sort normalizes it.
+                let concurrency = std::env::var("ICEBERG_METADATA_MANIFEST_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(16);
+                let loaded: Vec<_> = futures::stream::iter(candidates.into_iter().map(|mf| {
+                    let table = &table;
+                    async move {
+                        table
+                            .load_manifest_cached(mf)
+                            .await
+                            .map(|m| (mf, m))
+                            .map_err(|e| {
+                                PyValueError::new_err(format!("manifest {}: {e}", mf.manifest_path))
+                            })
+                    }
+                }))
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await?;
+                let mut files: Vec<FileRow> = Vec::new();
+                for (mf, manifest) in &loaded {
+                    for entry in manifest.entries() {
+                        if !entry.is_alive() {
+                            continue;
+                        }
+                        let seq = entry.sequence_number().unwrap_or(mf.sequence_number);
+                        if seq > after_seq {
+                            let df = entry.data_file();
+                            files.push(FileRow {
+                                path: df.file_path().to_string(),
+                                rows: df.record_count(),
+                                seq,
+                                bytes: df.file_size_in_bytes(),
+                            });
+                        }
+                    }
+                }
+                files.sort_by(|a, b| (a.seq, a.path.as_str()).cmp(&(b.seq, b.path.as_str())));
+                Ok(WindowOut {
+                    head_snapshot_id: Some(head_id),
+                    head_seq: Some(head_seq),
+                    resolved_cursor_seq: resolved,
+                    from_seq: after_seq,
+                    walked: true,
+                    files,
+                })
+            },
+        ))
     })?;
     let d = PyDict::new(py);
     d.set_item("head_snapshot_id", out.head_snapshot_id)?;
@@ -336,59 +375,64 @@ struct StatsOut {
 /// counts come from the manifest list, never the snapshot summary (summary
 /// totals are cosmetic carry-forwards on REPLACE).
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn))]
+#[pyo3(signature = (catalog_props, fqn, timeout_s=None))]
 fn manifest_stats(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
+    timeout_s: Option<u64>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
     let out: StatsOut = py.detach(|| {
-        runtime().block_on(async move {
-            let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
-            let meta = table.metadata_ref();
-            let snapshots = meta.snapshots().len();
-            let Some(current) = meta.current_snapshot() else {
-                return Ok::<_, PyErr>(StatsOut {
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "reading manifest stats",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                let meta = table.metadata_ref();
+                let snapshots = meta.snapshots().len();
+                let Some(current) = meta.current_snapshot() else {
+                    return Ok::<_, PyErr>(StatsOut {
+                        data_files: 0,
+                        data_records: 0,
+                        delete_files: 0,
+                        delete_records: 0,
+                        manifests: 0,
+                        snapshots,
+                    });
+                };
+                let mlist = table
+                    .manifest_list_reader(current)
+                    .load()
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
+                let mut s = StatsOut {
                     data_files: 0,
                     data_records: 0,
                     delete_files: 0,
                     delete_records: 0,
-                    manifests: 0,
+                    manifests: mlist.entries().len(),
                     snapshots,
-                });
-            };
-            let mlist = table
-                .manifest_list_reader(current)
-                .load()
-                .await
-                .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
-            let mut s = StatsOut {
-                data_files: 0,
-                data_records: 0,
-                delete_files: 0,
-                delete_records: 0,
-                manifests: mlist.entries().len(),
-                snapshots,
-            };
-            for mf in mlist.entries() {
-                let live_files = u64::from(mf.added_files_count.unwrap_or(0))
-                    + u64::from(mf.existing_files_count.unwrap_or(0));
-                let live_rows =
-                    mf.added_rows_count.unwrap_or(0) + mf.existing_rows_count.unwrap_or(0);
-                match mf.content {
-                    ManifestContentType::Data => {
-                        s.data_files += live_files;
-                        s.data_records += live_rows;
-                    }
-                    ManifestContentType::Deletes => {
-                        s.delete_files += live_files;
-                        s.delete_records += live_rows;
+                };
+                for mf in mlist.entries() {
+                    let live_files = u64::from(mf.added_files_count.unwrap_or(0))
+                        + u64::from(mf.existing_files_count.unwrap_or(0));
+                    let live_rows =
+                        mf.added_rows_count.unwrap_or(0) + mf.existing_rows_count.unwrap_or(0);
+                    match mf.content {
+                        ManifestContentType::Data => {
+                            s.data_files += live_files;
+                            s.data_records += live_rows;
+                        }
+                        ManifestContentType::Deletes => {
+                            s.delete_files += live_files;
+                            s.delete_records += live_rows;
+                        }
                     }
                 }
-            }
-            Ok(s)
-        })
+                Ok(s)
+            },
+        ))
     })?;
     let d = PyDict::new(py);
     d.set_item("data_files", out.data_files)?;
