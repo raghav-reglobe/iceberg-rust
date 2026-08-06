@@ -117,6 +117,27 @@ pub(crate) async fn build_mor_merge_plan(
         }
     }
 
+    // Windowed merge: widen the narrow projection with the caller-named
+    // extra columns so the HELD current-set can also serve the USING-side
+    // self-read (the demote-union t2), whose projection exceeds the merge
+    // expressions' own target references.
+    if let Some(options) = state
+        .config()
+        .get_extension::<crate::physical_plan::MorMergeOptions>()
+        && let Some(w) = options.window.as_ref()
+        && w.hold_requested()
+    {
+        for col in w.held_extra_columns() {
+            if target_names.contains(col) {
+                referenced.insert(col.clone());
+            } else {
+                return Err(DataFusionError::Plan(format!(
+                    "held_extra_columns: `{col}` is not a column of the merge target"
+                )));
+            }
+        }
+    }
+
     // Narrow projection in table-schema order.
     let mut narrow_names: Vec<String> = Vec::new();
     let mut narrow_fields: Vec<Field> = Vec::new();

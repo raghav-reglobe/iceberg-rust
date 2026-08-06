@@ -4129,6 +4129,7 @@ dependencies = [
  "iceberg-compaction",
  "parquet",
  "roaring",
+ "serde",
  "tempfile",
  "tokio",
  "uuid",

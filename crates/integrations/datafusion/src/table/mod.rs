@@ -37,12 +37,14 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchemaRef, DataFusionError, TableReference};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::scalar::ScalarValue;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
@@ -57,6 +59,28 @@ use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::sort::sort_by_partition;
 use crate::physical_plan::write::IcebergWriteExec;
+
+/// True when one of the pushed-down conjuncts pins the scan to CURRENT rows
+/// — a bare `_is_current` column reference or `_is_current = true` (either
+/// operand order). The held current-set is exactly the rows passing that
+/// predicate, so serving it is a superset of any further-filtered result
+/// (all pushdown is Inexact: DataFusion re-applies every filter above).
+fn filters_imply_current_only(filters: &[Expr]) -> bool {
+    fn is_current_col(e: &Expr) -> bool {
+        matches!(e, Expr::Column(c) if c.name == "_is_current")
+    }
+    fn is_true_lit(e: &Expr) -> bool {
+        matches!(e, Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+    }
+    filters.iter().any(|f| match f {
+        Expr::Column(c) => c.name == "_is_current",
+        Expr::BinaryExpr(b) if b.op == Operator::Eq => {
+            (is_current_col(&b.left) && is_true_lit(&b.right))
+                || (is_current_col(&b.right) && is_true_lit(&b.left))
+        }
+        _ => false,
+    })
+}
 
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
@@ -133,7 +157,7 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -144,6 +168,45 @@ impl TableProvider for IcebergTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
+
+        // Windowed merge (merge_into_window): when this provider IS the
+        // window's merge target and the query provably wants CURRENT rows
+        // only (a pushed-down `_is_current` truthy conjunct — all pushdown
+        // here is Inexact, so DataFusion re-applies every filter above us),
+        // serve the held current-set instead of re-scanning the table.
+        // This is the demote-union's USING-side self-read (t2). Guards
+        // (identity, head-snapshot equality, projection coverage) all fall
+        // back to the direct scan.
+        if let Some(options) = state
+            .config()
+            .get_extension::<crate::physical_plan::MorMergeOptions>()
+            && let Some(w) = options.window.as_ref()
+            && w.hold_requested()
+            && filters_imply_current_only(filters)
+        {
+            let projected_names: Vec<String> = match projection {
+                Some(indices) => indices
+                    .iter()
+                    .map(|i| self.schema.field(*i).name().clone())
+                    .collect(),
+                None => self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect(),
+            };
+            if let Some((schema, batches)) = w.held_batches_for_provider(
+                &self.table_ident.to_string(),
+                table.metadata().current_snapshot_id(),
+                &projected_names,
+            ) {
+                w.provider_serves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                    .map(|e| e as Arc<dyn ExecutionPlan>);
+            }
+        }
 
         // Create scan with fresh metadata (always use current snapshot)
         Ok(Arc::new(IcebergTableScan::new(

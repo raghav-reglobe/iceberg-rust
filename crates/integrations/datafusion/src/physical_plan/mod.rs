@@ -19,6 +19,10 @@ pub(crate) mod commit;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod merge_mor;
 pub use merge_mor::MorMergeOptions;
+pub mod merge_window;
+pub use merge_window::{
+    HELD_MAX_BYTES_DEFAULT, MorWindowState, WindowRunResult, WindowSliceSpec, run_window,
+};
 pub(crate) mod metadata_scan;
 pub(crate) mod project;
 pub(crate) mod repartition;

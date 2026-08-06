@@ -202,6 +202,12 @@ pub struct MorMergeOptions {
     /// validation); the threshold simply re-fires on the next merge.
     /// `None` = disabled.
     pub reabsorb_dead_frac: Option<f64>,
+    /// Windowed-merge state (merge_into_window): the held target
+    /// current-set, per-slice deadline, defer-mode lanes and telemetry
+    /// shared between the exec nodes, the table provider and the window
+    /// driver loop. `None` = the one-shot merge_into path (no window
+    /// machinery anywhere on the hot path).
+    pub window: Option<Arc<super::merge_window::MorWindowState>>,
 }
 
 /// Inline reabsorb runs only when at least this much of the merge deadline
@@ -217,6 +223,19 @@ impl MorMergeOptions {
             .unwrap_or(MOR_CHUNK_TARGET_BYTES_DEFAULT)
             .max(1)
     }
+
+    /// The deadline the exec nodes enforce: the window's per-slice deadline
+    /// when a window is active (options are a shared session extension, so
+    /// the per-slice value lives interior-mutably on the window state),
+    /// else the one-shot call's static deadline.
+    pub(crate) fn effective_deadline(&self) -> Option<std::time::Instant> {
+        if let Some(w) = &self.window
+            && let Some(d) = w.slice_deadline()
+        {
+            return Some(d);
+        }
+        self.deadline
+    }
 }
 
 impl Default for MorMergeOptions {
@@ -227,6 +246,7 @@ impl Default for MorMergeOptions {
             late_materialization: true,
             chunk_target_bytes: None,
             reabsorb_dead_frac: None,
+            window: None,
         }
     }
 }
@@ -712,6 +732,36 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let table = self.table.clone();
         let snapshot_id = self.snapshot_id;
+        // Windowed merge (merge_into_window): serve the held current-set
+        // when it matches this scan's table, pinned snapshot and schema —
+        // the ONE-target-scan-per-window invariant. A miss (first slice,
+        // out-of-band commit, overflow) falls through to the direct scan,
+        // TEEING its output so the window installs/reinstalls the hold.
+        let window = context
+            .session_config()
+            .get_extension::<MorMergeOptions>()
+            .and_then(|o| o.window.clone())
+            .filter(|w| w.hold_requested());
+        if let Some(w) = &window {
+            let ident = self.table.identifier().to_string();
+            if let Some(batches) =
+                w.held_batches_for_target_scan(&ident, self.snapshot_id, &self.schema)
+            {
+                w.target_scans_served
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let busy = MetricBuilder::new(&self.metrics).elapsed_compute(0);
+                let stream = PollTimedStream {
+                    inner: Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
+                    busy,
+                };
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    stream,
+                )));
+            }
+            w.target_scans_direct
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Decode-memory accounting (crate::memory_gate): the target scan's
         // reads register against the session pool like any provider scan.
         let scan_gate = crate::memory_gate::pool_scan_gate(&context.runtime_env().memory_pool);
@@ -765,17 +815,120 @@ impl ExecutionPlan for IcebergMorTargetScanExec {
         // Busy-time accounting (scan_ms): the iceberg reader's plan + decode
         // work all happens inside this composed stream's polls.
         let busy = MetricBuilder::new(&self.metrics).elapsed_compute(0);
+        let composed: std::pin::Pin<Box<dyn futures::Stream<Item = DFResult<RecordBatch>> + Send>> =
+            match window {
+                Some(w) => Box::pin(HeldTeeStream {
+                    inner: Box::pin(futures::stream::once(fut).try_flatten()),
+                    window: w,
+                    install: Some(HeldTeeInstall {
+                        target_ident: self.table.identifier().to_string(),
+                        schema: Arc::clone(&out_schema),
+                        valid_for_snapshot: self.snapshot_id,
+                        predicate: self.predicate.clone(),
+                        residual: self.residual.clone(),
+                        pool: Arc::clone(&context.runtime_env().memory_pool),
+                    }),
+                    acc: Vec::new(),
+                    bytes: 0,
+                    overflowed: false,
+                }),
+                None => Box::pin(futures::stream::once(fut).try_flatten()),
+            };
         let stream = PollTimedStream {
-            inner: Box::pin(futures::stream::once(fut).try_flatten()),
+            inner: composed,
             busy,
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
     }
 }
 
+/// Install facts the tee needs when the direct target scan completes.
+struct HeldTeeInstall {
+    target_ident: String,
+    schema: ArrowSchemaRef,
+    valid_for_snapshot: Option<i64>,
+    predicate: Option<IcebergPredicate>,
+    residual: Option<Arc<dyn PhysicalExpr>>,
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+}
+
+/// Tees the direct target scan's output into the window's held set: batches
+/// accumulate (zero-copy clones) up to the byte cap; on clean stream
+/// completion the capture installs as the held current-set. Errors or
+/// overflow abandon the capture (overflow permanently — the window falls
+/// back to per-slice direct scans).
+struct HeldTeeStream<S> {
+    inner: S,
+    window: Arc<super::merge_window::MorWindowState>,
+    install: Option<HeldTeeInstall>,
+    acc: Vec<RecordBatch>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl<S: futures::Stream<Item = DFResult<RecordBatch>> + Unpin> futures::Stream
+    for HeldTeeStream<S>
+{
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_next(cx);
+        match &poll {
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                if !this.overflowed && this.install.is_some() {
+                    this.bytes += batch.get_array_memory_size();
+                    if this.bytes > this.window.held_max_bytes() {
+                        this.overflowed = true;
+                        this.acc.clear();
+                        this.window.mark_hold_overflow();
+                    } else {
+                        this.acc.push(batch.clone());
+                    }
+                }
+            }
+            std::task::Poll::Ready(Some(Err(_))) => {
+                // A failed scan never installs — drop the partial capture.
+                this.acc.clear();
+                this.install = None;
+            }
+            std::task::Poll::Ready(None) => {
+                if !this.overflowed
+                    && let Some(install) = this.install.take()
+                {
+                    let reservation =
+                        super::merge_window::held_reservation(&install.pool, this.bytes);
+                    if reservation.is_none() && this.bytes > 0 {
+                        this.window.mark_hold_overflow();
+                    } else {
+                        this.window.install_held(
+                            install.target_ident,
+                            install.schema,
+                            std::mem::take(&mut this.acc),
+                            this.bytes,
+                            install.valid_for_snapshot,
+                            install.predicate,
+                            install.residual,
+                            reservation,
+                        );
+                    }
+                }
+            }
+            std::task::Poll::Pending => {}
+        }
+        poll
+    }
+}
+
 /// Rebuild `batch` against `schema`, casting any column whose type differs
 /// (notably run-end-encoded metadata columns to their plain value type).
-fn plain_cast_batch(batch: &RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
+pub(crate) fn plain_cast_batch(
+    batch: &RecordBatch,
+    schema: &ArrowSchemaRef,
+) -> DFResult<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(idx);
@@ -1345,7 +1498,7 @@ async fn run_mor_write(
             format!("File format {file_format} is not supported for MERGE"),
         )));
     }
-    let deadline = options.deadline;
+    let deadline = options.effective_deadline();
 
     // Shred-preserving output under `write.parquet.shred-variants`: derive
     // each variant column's layout from the table's existing files, and give
@@ -1596,6 +1749,14 @@ async fn run_mor_write(
         }
         for positions in positions_by_file.values_mut() {
             positions.sort_unstable();
+        }
+        // Windowed merge: hand the newly-matched victim set (demotes +
+        // deletes, by (file, sorted positions)) to the window driver's
+        // held-set maintenance — `held' = held − victims + appends`.
+        if let Some(w) = options.window.as_ref()
+            && w.hold_requested()
+        {
+            w.record_victims(positions_by_file.clone());
         }
         let late = options.late_materialization;
 
@@ -2277,9 +2438,46 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
             }
 
             let count: u64 = added.iter().map(|f| f.record_count()).sum();
+
+            // Windowed merge, defer mode (commit_every > 1): hand the lanes
+            // to the window's pending fold instead of committing — the
+            // driver flushes one RowDelta per fold (or earlier on a
+            // DV-conflict). No reabsorb either: hygiene rides real commits.
+            if let Some(w) = options.window.as_ref()
+                && w.defer_commits()
+            {
+                w.record_lanes(super::merge_window::SliceLanes {
+                    table: table.clone(),
+                    catalog: Arc::clone(&catalog),
+                    base_snapshot: snapshot_id,
+                    added,
+                    dvs,
+                    removed,
+                });
+                return Self::make_count_batch(
+                    &count_schema,
+                    count,
+                    0,
+                    0,
+                    None,
+                    write_ms,
+                    0,
+                    scan_ms,
+                    join_ms,
+                    write_node_ms,
+                );
+            }
+
             // The reabsorb needs this merge's DV descriptors after the
             // RowDelta consumes `dvs` — a handful of metadata clones.
             let merge_dvs = dvs.clone();
+            // Windowed merge, commit mode: the held-set maintenance needs
+            // the appended file paths + the post-commit snapshot.
+            let window_added_paths: Option<Vec<String>> = options
+                .window
+                .as_ref()
+                .filter(|w| w.hold_requested())
+                .map(|_| added.iter().map(|f| f.file_path().to_string()).collect());
 
             let commit_t0 = std::time::Instant::now();
             let tx = Transaction::new(&table);
@@ -2307,11 +2505,30 @@ impl ExecutionPlan for IcebergMorMergeCommitExec {
                 .map_err(to_datafusion_error)?;
             let commit_ms = commit_t0.elapsed().as_millis() as u64;
 
+            // Windowed merge: report the committed slice for held-set
+            // maintenance (appends scanned back at the new snapshot).
+            if let Some(w) = options.window.as_ref()
+                && let Some(added_paths) = window_added_paths
+            {
+                w.record_commit(super::merge_window::CommittedSlice {
+                    table: committed.clone(),
+                    snapshot_id: committed.metadata().current_snapshot_id(),
+                    added_paths,
+                });
+            }
+
             // Inline DV micro-reabsorb — optional hygiene, never fails the
             // merge (the RowDelta above already committed).
             let (reab_files, reab_ms, reab_skipped) = match options.reabsorb_dead_frac {
                 Some(frac) if !merge_dvs.is_empty() => {
-                    inline_reabsorb(&catalog, &committed, &merge_dvs, frac, options.deadline).await
+                    inline_reabsorb(
+                        &catalog,
+                        &committed,
+                        &merge_dvs,
+                        frac,
+                        options.effective_deadline(),
+                    )
+                    .await
                 }
                 Some(_) => (0, 0, Some("threshold".to_string())),
                 None => (0, 0, None),

@@ -39,6 +39,7 @@ futures = { workspace = true }
 iceberg = { workspace = true }
 iceberg-compaction = { workspace = true }
 roaring = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 parquet = { workspace = true, features = ["variant_experimental"] }
 tokio = { workspace = true }
 uuid = { workspace = true }

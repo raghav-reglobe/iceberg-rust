@@ -61,7 +61,10 @@ use iceberg::{
     TableCreation, TableIdent,
 };
 use iceberg_datafusion::functions::register_variant_functions;
-use iceberg_datafusion::{IcebergCatalogProvider, MorMergeOptions};
+use iceberg_datafusion::{
+    HELD_MAX_BYTES_DEFAULT, IcebergCatalogProvider, MorMergeOptions, MorWindowState,
+    WindowSliceSpec, run_window,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, LogicalType};
@@ -2740,4 +2743,369 @@ async fn value_remap_matched_only_update_no_insert_arm() {
     let table = load_table(&catalog).await;
     assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
     assert_eq!(read_state(&ctx).await, state);
+}
+
+// ---------------------------------------------------------------------------
+// merge_into_window — the held target scan + engine-side slicing
+// ---------------------------------------------------------------------------
+
+/// The SCD2 statement over a named batch table (the window's per-slice SQL
+/// parameterization — the worker renders one statement per slice from a
+/// single template).
+fn scd2_merge_sql_from(batch: &str) -> String {
+    scd2_merge_sql()
+        .replace("FROM batch", &format!("FROM {batch}"))
+        .replace(
+            "FROM (SELECT id, MIN(_valid_from) AS new_vf FROM batch GROUP BY id)",
+            &format!("FROM (SELECT id, MIN(_valid_from) AS new_vf FROM {batch} GROUP BY id)"),
+        )
+}
+
+fn register_named_batch(ctx: &SessionContext, name: &str, rows: &[(i32, &str, i64, i64)]) {
+    let b = cdc_batch(rows);
+    let mem = MemTable::try_new(b.schema(), vec![vec![b]]).unwrap();
+    ctx.register_table(name, Arc::new(mem)).unwrap();
+}
+
+fn window_options(
+    hold: bool,
+    extras: &[&str],
+    commit_every: usize,
+) -> (Arc<MorWindowState>, Arc<MorMergeOptions>) {
+    let window = Arc::new(MorWindowState::new(
+        hold,
+        extras.iter().map(|s| s.to_string()).collect(),
+        HELD_MAX_BYTES_DEFAULT,
+        commit_every,
+    ));
+    let options = Arc::new(MorMergeOptions {
+        window: Some(Arc::clone(&window)),
+        ..Default::default()
+    });
+    (window, options)
+}
+
+/// Two slices, same PK updated in both + a second PK demoted by slice 2
+/// only: the held set must be MAINTAINED between slices (victims out,
+/// appended currents in) for the chain to land, the direct target scan must
+/// run exactly ONCE (the window invariant), and the seed-file DV must
+/// consolidate across the two commits (V3: one live DV per file).
+#[tokio::test]
+async fn window_two_slices_hold_one_target_scan_and_chain_correctly() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(true, &["val", "_is_current"], 1);
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100), (2, "b", 10, None, true, 101)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(1, "a2", 20, 200), (3, "c", 20, 201)]);
+    register_named_batch(&ctx, "batch2", &[(1, "a3", 30, 300), (2, "b2", 30, 301)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch1")),
+            scan_files: None,
+        },
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch2")),
+            scan_files: None,
+        },
+    ];
+    let run = run_window(&ctx, &window, "", &specs, None, None).await;
+    assert_eq!(run.failed_slice, None, "{:?}", run.failed_error);
+    assert_eq!(run.held_dropped, None);
+    assert_eq!(run.outcomes.len(), 2);
+    assert!(run.outcomes.iter().all(|o| o.committed));
+
+    // One RowDelta per slice (the checkpoint contract).
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 2);
+
+    assert_eq!(read_state(&ctx).await, vec![
+        (1, "a".to_string(), 10, Some(20), false),
+        (1, "a2".to_string(), 20, Some(30), false),
+        (1, "a3".to_string(), 30, None, true),
+        (2, "b".to_string(), 10, Some(30), false),
+        (2, "b2".to_string(), 30, None, true),
+        (3, "c".to_string(), 20, None, true),
+    ]);
+
+    // THE window invariant: the target current-set was direct-scanned once
+    // (slice 1's tee); slice 2 served from the held set.
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(window.target_scans_direct.load(Relaxed), 1);
+    assert_eq!(window.target_scans_served.load(Relaxed), 1);
+    // The USING-side self-read (t2) of slice 2 served from the held set too.
+    assert!(
+        window.provider_serves.load(Relaxed) >= 1,
+        "demote-union self-read must serve from the held set"
+    );
+
+    // V3 invariant across the window: the seed file's DV consolidated
+    // (slice 1 demoted id=1 pos 0; slice 2 demoted id=2 pos 1 — ONE live DV
+    // with both positions), and slice 1's output file carries one DV for
+    // the id=1 v20 demote — proving the held set learned the appended
+    // file's (_file, _pos) via maintenance.
+    let dvs = live_dvs(&table).await;
+    assert_eq!(dvs.len(), 2, "one live DV per touched file: {dvs:?}");
+    let seed_dv = dvs.iter().find(|(f, _)| f.contains("seed")).unwrap();
+    assert_eq!(seed_dv.1, 2, "seed DV holds both slices' demotes");
+    let out_dv = dvs.iter().find(|(f, _)| !f.contains("seed")).unwrap();
+    assert_eq!(
+        out_dv.1, 1,
+        "slice-1 output file demoted via held (_file,_pos)"
+    );
+}
+
+/// Poison contract: a failing slice stops the loop; completed slices'
+/// commits stand; the failure is reported in-band with its 0-based index.
+#[tokio::test]
+async fn window_poison_stops_at_failed_slice_and_keeps_commits() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(true, &["val", "_is_current"], 1);
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(1, "a2", 20, 200)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch1")),
+            scan_files: None,
+        },
+        WindowSliceSpec {
+            sql: Some("MERGE INTO definitely.not.a_table USING x ON 1=1".to_string()),
+            scan_files: None,
+        },
+    ];
+    let run = run_window(&ctx, &window, "", &specs, None, None).await;
+    assert_eq!(run.failed_slice, Some(1));
+    assert!(run.failed_error.as_deref().unwrap().contains("MERGE"));
+    assert_eq!(run.outcomes.len(), 1);
+    assert!(run.outcomes[0].committed);
+
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_before + 1,
+        "slice 1's commit must stand"
+    );
+    assert_eq!(read_state(&ctx).await, vec![
+        (1, "a".to_string(), 10, Some(20), false),
+        (1, "a2".to_string(), 20, None, true),
+    ]);
+}
+
+/// The 1-slice hot path: no hold machinery engages (the driver requests the
+/// hold only for >1 slices), and the result equals a plain merge_into.
+#[tokio::test]
+async fn window_single_slice_routes_through_same_path_without_hold() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(false, &[], 1);
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(1, "a2", 20, 200), (4, "d", 20, 203)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![WindowSliceSpec {
+        sql: Some(scd2_merge_sql_from("batch1")),
+        scan_files: None,
+    }];
+    let run = run_window(&ctx, &window, "", &specs, None, None).await;
+    assert_eq!(run.failed_slice, None, "{:?}", run.failed_error);
+    assert_eq!(run.outcomes.len(), 1);
+    assert!(run.outcomes[0].committed);
+    assert_eq!(
+        run.outcomes[0].count, 3,
+        "insert + demote-append + new-current"
+    );
+
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(window.target_scans_direct.load(Relaxed), 0);
+    assert_eq!(window.target_scans_served.load(Relaxed), 0);
+    assert_eq!(window.provider_serves.load(Relaxed), 0);
+    let (installed, _, _) = window.held_stats();
+    assert!(!installed, "1-slice window must not hold");
+
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+    assert_eq!(read_state(&ctx).await, vec![
+        (1, "a".to_string(), 10, Some(20), false),
+        (1, "a2".to_string(), 20, None, true),
+        (4, "d".to_string(), 20, None, true),
+    ]);
+}
+
+/// Fold mode, disjoint work: two insert-only slices fold into ONE RowDelta.
+#[tokio::test]
+async fn window_fold_disjoint_slices_commit_one_snapshot() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(true, &[], 2);
+    assert!(!window.hold_requested(), "fold mode disables the hold");
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(3, "c", 20, 201)]);
+    register_named_batch(&ctx, "batch2", &[(4, "d", 20, 202)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch1")),
+            scan_files: None,
+        },
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch2")),
+            scan_files: None,
+        },
+    ];
+    let run = run_window(&ctx, &window, "", &specs, None, None).await;
+    assert_eq!(run.failed_slice, None, "{:?}", run.failed_error);
+    assert_eq!(run.outcomes.len(), 2);
+    assert!(run.outcomes.iter().all(|o| o.committed));
+    assert!(run.outcomes.iter().all(|o| !o.reexecuted));
+
+    let table = load_table(&catalog).await;
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps_before + 1,
+        "two folded slices = ONE RowDelta"
+    );
+    assert_eq!(read_state(&ctx).await, vec![
+        (1, "a".to_string(), 10, None, true),
+        (3, "c".to_string(), 20, None, true),
+        (4, "d".to_string(), 20, None, true),
+    ]);
+}
+
+/// Fold mode, same-PK conflict: slice 2 (planned blind to the pending fold)
+/// re-victimizes the file slice 1's DV already covers — the fold flushes,
+/// slice 2 RE-EXECUTES against the flushed head, and the chain lands
+/// correctly.
+#[tokio::test]
+async fn window_fold_conflict_flushes_and_reexecutes() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(false, &[], 2);
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(1, "a2", 20, 200)]);
+    register_named_batch(&ctx, "batch2", &[(1, "a3", 30, 300)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch1")),
+            scan_files: None,
+        },
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch2")),
+            scan_files: None,
+        },
+    ];
+    let run = run_window(&ctx, &window, "", &specs, None, None).await;
+    assert_eq!(run.failed_slice, None, "{:?}", run.failed_error);
+    assert_eq!(run.outcomes.len(), 2);
+    assert!(run.outcomes.iter().all(|o| o.committed));
+    assert!(
+        run.outcomes[1].reexecuted,
+        "conflict must re-execute slice 2"
+    );
+
+    // Flush of slice 1 + the re-executed slice 2's own fold flush.
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 2);
+    assert_eq!(read_state(&ctx).await, vec![
+        (1, "a".to_string(), 10, Some(20), false),
+        (1, "a2".to_string(), 20, Some(30), false),
+        (1, "a3".to_string(), 30, None, true),
+    ]);
+    // Consolidation held across the fold: one live DV per file.
+    let dvs = live_dvs(&table).await;
+    let mut by_file: HashMap<&str, usize> = HashMap::new();
+    for (f, _) in &dvs {
+        *by_file.entry(f.as_str()).or_default() += 1;
+    }
+    assert!(
+        by_file.values().all(|c| *c == 1),
+        "one live DV per file: {dvs:?}"
+    );
+}
+
+/// Budget stop: the loop stops cleanly BETWEEN slices once the window
+/// budget elapses; executed slices' commits stand.
+#[tokio::test]
+async fn window_budget_stops_between_slices() {
+    let warehouse = TempDir::new().unwrap();
+    let (window, options) = window_options(true, &["val", "_is_current"], 1);
+    let (catalog, ctx) = setup_full(
+        &warehouse,
+        &[(1, "a", 10, None, true, 100)],
+        &[],
+        HashMap::new(),
+        Some(options),
+    )
+    .await;
+    register_named_batch(&ctx, "batch1", &[(1, "a2", 20, 200)]);
+    register_named_batch(&ctx, "batch2", &[(1, "a3", 30, 300)]);
+    let before = load_table(&catalog).await;
+    let snaps_before = before.metadata().snapshots().count();
+
+    let specs = vec![
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch1")),
+            scan_files: None,
+        },
+        WindowSliceSpec {
+            sql: Some(scd2_merge_sql_from("batch2")),
+            scan_files: None,
+        },
+    ];
+    let run = run_window(
+        &ctx,
+        &window,
+        "",
+        &specs,
+        None,
+        Some(std::time::Instant::now()),
+    )
+    .await;
+    assert!(run.budget_stopped);
+    assert_eq!(run.failed_slice, None);
+    assert_eq!(run.outcomes.len(), 1);
+    assert!(run.outcomes[0].committed);
+    let table = load_table(&catalog).await;
+    assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
 }
