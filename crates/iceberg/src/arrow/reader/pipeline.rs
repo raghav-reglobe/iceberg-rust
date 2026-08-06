@@ -208,8 +208,12 @@ struct FileScanTaskReader {
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index =
-            (self.row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
+        // An explicit keep set wants the page index too: the selection is
+        // built from row counts alone, but the OFFSET index is what lets the
+        // reader skip whole pages the selection never touches.
+        let should_load_page_index = (self.row_selection_enabled && task.predicate.is_some())
+            || !task.deletes.is_empty()
+            || task.row_selection_positions.is_some();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
@@ -375,6 +379,13 @@ impl FileScanTaskReader {
         // Build the stream reader, reusing the already-opened file reader
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
+        // Bound (or disable) parquet's per-row-group predicate cache — its
+        // 100 MB/row-group default is unaccounted memory on decode-bounded
+        // pods; only effective when a row filter is present.
+        if let Some(cap) = self.parquet_read_options.max_predicate_cache_bytes {
+            record_batch_stream_builder =
+                record_batch_stream_builder.with_max_predicate_cache_size(cap);
+        }
 
         // Filter out metadata fields for Parquet projection (they don't exist in files)
         let project_field_ids_without_metadata: Vec<i32> = task
@@ -619,6 +630,23 @@ impl FileScanTaskReader {
                 Some(filter_row_selection) => {
                     Some(filter_row_selection.intersection(&delete_row_selection))
                 }
+            };
+        }
+
+        // Explicit keep set (merge late-fetch victim positions): a
+        // RowSelection selecting ONLY those rows, intersected with whatever
+        // the deletes/predicate derived. Built from row-group row counts in
+        // the surviving-row-group coordinate space (the same contract as the
+        // deletes selection above).
+        if let Some(keep_positions) = task.row_selection_positions.as_ref() {
+            let keep_selection = ArrowReader::build_keep_row_selection(
+                record_batch_stream_builder.metadata().row_groups(),
+                &selected_row_group_indices,
+                keep_positions,
+            )?;
+            row_selection = match row_selection {
+                None => Some(keep_selection),
+                Some(existing) => Some(existing.intersection(&keep_selection)),
             };
         }
 

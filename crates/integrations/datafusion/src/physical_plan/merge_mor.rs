@@ -1800,6 +1800,17 @@ async fn run_mor_write(
         if let Some(gate) = scan_gate.clone() {
             reader_builder = reader_builder.with_scan_memory_gate(gate);
         }
+        // Bound parquet's async-decoder predicate cache explicitly (#7850 —
+        // RowGroupCache): parquet defaults to 100 MB PER ROW GROUP, which is
+        // unaccounted memory on lane pods. Inert while the fetch carries no
+        // row filter, but the bound must not depend on that staying true.
+        // MB; 0 disables the cache; unset keeps parquet's default.
+        if let Some(mb) = std::env::var("ICEBERG_PARQUET_PREDICATE_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            reader_builder = reader_builder.with_max_predicate_cache_size(mb * 1024 * 1024);
+        }
         if passthrough_ok {
             reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
         }
@@ -2095,20 +2106,69 @@ async fn plan_one_ranged_fetch(
     let row_bytes = (total_rows > 0).then(|| ((total_bytes / total_rows).max(1)) as usize);
     let ranges = IcebergArrowReader::byte_ranges_for_row_positions(meta.metadata(), &positions)
         .map_err(to_datafusion_error)?;
+    // File-absolute row span per row group, for splitting the victim
+    // positions across the clipped tasks (each task's keep-RowSelection may
+    // only name rows of ITS OWN row groups — a position in a pruned group
+    // errors loudly by design).
+    let rg_spans: Vec<(u64, u64)> = {
+        let mut spans = Vec::with_capacity(meta.metadata().num_row_groups());
+        let mut base = 0u64;
+        for rg in meta.metadata().row_groups() {
+            let rows = rg.num_rows() as u64;
+            spans.push((base, base + rows));
+            base += rows;
+        }
+        spans
+    };
     let tasks = match ranges {
-        Some(ranges) => ranges
-            .into_iter()
-            .map(|(start, length)| {
+        Some(ranges) => {
+            let mut covered = 0usize;
+            let mut out = Vec::with_capacity(ranges.len());
+            for (start, length) in ranges {
                 let mut clipped = task.clone();
                 clipped.start = start;
                 clipped.length = length;
                 // Sub-file read: the manifest record count no longer
                 // describes what this task reads.
                 clipped.record_count = None;
-                clipped
-            })
-            .collect(),
-        None => vec![task],
+                // The victim positions this range's row groups own — the
+                // reader decodes only the PAGES containing them (#10:
+                // page-index skip + row mask on the late fetch).
+                let selected = IcebergArrowReader::filter_row_groups_by_byte_range(
+                    meta.metadata(),
+                    start,
+                    length,
+                )
+                .map_err(to_datafusion_error)?;
+                let mut in_task: Vec<u64> = Vec::new();
+                for rg in &selected {
+                    let (lo, hi) = rg_spans[*rg];
+                    let a = positions.partition_point(|p| *p < lo);
+                    let b = positions.partition_point(|p| *p < hi);
+                    in_task.extend_from_slice(&positions[a..b]);
+                }
+                covered += in_task.len();
+                if !in_task.is_empty() {
+                    clipped.row_selection_positions = Some(Arc::new(in_task));
+                }
+                out.push(clipped);
+            }
+            if covered != positions.len() {
+                // A position escaped every clipped range (midpoint-rule
+                // drift would lose a victim) — fall back to ONE whole-file
+                // task carrying the full keep set.
+                let mut whole = task;
+                whole.row_selection_positions = Some(Arc::new(positions));
+                vec![whole]
+            } else {
+                out
+            }
+        }
+        None => {
+            let mut whole = task;
+            whole.row_selection_positions = Some(Arc::new(positions));
+            vec![whole]
+        }
     };
     Ok((tasks, row_bytes))
 }

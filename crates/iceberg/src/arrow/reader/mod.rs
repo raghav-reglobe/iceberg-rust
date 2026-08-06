@@ -162,6 +162,17 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Caps parquet's per-row-group predicate cache (bytes) — the async
+    /// decoder's cache of filter-decoded pages reused for output
+    /// materialization (only effective when a row filter is present AND the
+    /// filter columns are also projected). Parquet's own default is 100 MB
+    /// PER ROW GROUP, which is real memory on decode-bounded pods; `0`
+    /// disables the cache. Unset = parquet's default.
+    pub fn with_max_predicate_cache_size(mut self, max_predicate_cache_bytes: usize) -> Self {
+        self.parquet_read_options.max_predicate_cache_bytes = Some(max_predicate_cache_bytes);
+        self
+    }
+
     /// Sets the maximum number of merged byte ranges to fetch concurrently.
     ///
     /// Defaults to 10, matching object_store's OBJECT_STORE_COALESCE_PARALLEL.

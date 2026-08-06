@@ -145,6 +145,116 @@ impl ArrowReader {
 
         Ok(results.into())
     }
+
+    /// Computes a `RowSelection` that KEEPS only the given file-absolute row
+    /// positions — the inverse of [`Self::build_deletes_row_selection`], for
+    /// an externally-known keep set (e.g. the merge late-fetch's victim
+    /// rows: only the pages containing victims decode, instead of every row
+    /// of the byte-clipped row groups).
+    ///
+    /// Same coordinate-space contract as the deletes builder: selectors are
+    /// emitted in the concatenated row space of the SELECTED row groups
+    /// (skipped groups contribute nothing). `keep_positions` must be sorted
+    /// strictly ascending; a position landing in a skipped row group or past
+    /// the file's last row is an ERROR — a keep set is a row inventory, and
+    /// silently dropping an entry would lose rows.
+    pub(super) fn build_keep_row_selection(
+        row_group_metadata_list: &[RowGroupMetaData],
+        selected_row_groups: &Option<Vec<usize>>,
+        keep_positions: &[u64],
+    ) -> Result<RowSelection> {
+        let mut results: Vec<RowSelector> = Vec::new();
+        let mut selected_row_groups_idx = 0;
+        let mut current_row_group_base_idx: u64 = 0;
+        let mut pos_iter = keep_positions.iter().copied().peekable();
+
+        for (idx, row_group_metadata) in row_group_metadata_list.iter().enumerate() {
+            let row_group_num_rows = row_group_metadata.num_rows() as u64;
+            let next_row_group_base_idx = current_row_group_base_idx + row_group_num_rows;
+
+            let selected = match selected_row_groups {
+                Some(selected_row_groups) => {
+                    if selected_row_groups_idx < selected_row_groups.len()
+                        && idx == selected_row_groups[selected_row_groups_idx]
+                    {
+                        selected_row_groups_idx += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            };
+
+            if !selected {
+                if let Some(&p) = pos_iter.peek()
+                    && p < next_row_group_base_idx
+                {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Unexpected,
+                        format!(
+                            "keep position {p} falls in row group {idx}, which the \
+                             row-group selection skipped — the keep set would lose rows"
+                        ),
+                    ));
+                }
+                current_row_group_base_idx = next_row_group_base_idx;
+                continue;
+            }
+
+            let mut current_idx = current_row_group_base_idx;
+            loop {
+                let Some(&p) = pos_iter.peek() else { break };
+                if p >= next_row_group_base_idx {
+                    break;
+                }
+                pos_iter.next();
+                if p < current_idx {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Unexpected,
+                        format!(
+                            "keep positions must be sorted strictly ascending \
+                             (position {p} after {current_idx})"
+                        ),
+                    ));
+                }
+                if p > current_idx {
+                    results.push(RowSelector::skip((p - current_idx) as usize));
+                }
+                // Coalesce a consecutive run within this row group.
+                let mut run: usize = 1;
+                current_idx = p + 1;
+                loop {
+                    let Some(&q) = pos_iter.peek() else { break };
+                    if q != current_idx || q >= next_row_group_base_idx {
+                        break;
+                    }
+                    pos_iter.next();
+                    run += 1;
+                    current_idx += 1;
+                }
+                results.push(RowSelector::select(run));
+            }
+            if current_idx < next_row_group_base_idx {
+                results.push(RowSelector::skip(
+                    (next_row_group_base_idx - current_idx) as usize,
+                ));
+            }
+            current_row_group_base_idx = next_row_group_base_idx;
+        }
+
+        if let Some(&p) = pos_iter.peek() {
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::Unexpected,
+                format!(
+                    "keep position {p} is past the file's last row \
+                     ({current_row_group_base_idx} rows)"
+                ),
+            ));
+        }
+
+        Ok(results.into())
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +1032,89 @@ mod tests {
             all_ids, expected_ids,
             "Should have ids 101-200 (all of row group 1)"
         );
+    }
+
+    #[test]
+    fn test_build_keep_row_selection_with_selected_row_groups() {
+        let schema_descr = get_test_schema_descr();
+        let mut columns = vec![];
+        for ptr in schema_descr.columns() {
+            let column = ColumnChunkMetaData::builder(ptr.clone()).build().unwrap();
+            columns.push(column);
+        }
+        let row_groups_metadata = vec![
+            build_test_row_group_meta(schema_descr.clone(), columns.clone(), 1000, 0),
+            build_test_row_group_meta(schema_descr.clone(), columns.clone(), 500, 1),
+            build_test_row_group_meta(schema_descr.clone(), columns.clone(), 500, 2),
+        ];
+
+        // Selected rgs 0 and 2 — the selection space is their concatenation
+        // (1500 rows). Keep: a run at the head of rg0, a solitary row later
+        // in rg0, and one row inside rg2.
+        let result =
+            ArrowReader::build_keep_row_selection(&row_groups_metadata, &Some(vec![0, 2]), &[
+                3, 4, 5, 42, 1520,
+            ])
+            .unwrap();
+        let expected = RowSelection::from(vec![
+            RowSelector::skip(3),
+            RowSelector::select(3),
+            RowSelector::skip(36),
+            RowSelector::select(1),
+            RowSelector::skip(957),
+            RowSelector::skip(20),
+            RowSelector::select(1),
+            RowSelector::skip(479),
+        ]);
+        assert_eq!(result, expected);
+
+        // All row groups (None): a run crossing the rg0/rg1 boundary stays
+        // correct (positions 998..=1001).
+        let result = ArrowReader::build_keep_row_selection(&row_groups_metadata, &None, &[
+            998, 999, 1000, 1001,
+        ])
+        .unwrap();
+        let expected = RowSelection::from(vec![
+            RowSelector::skip(998),
+            RowSelector::select(2),
+            RowSelector::select(2),
+            RowSelector::skip(498),
+            RowSelector::skip(500),
+        ]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_build_keep_row_selection_refuses_lost_positions() {
+        let schema_descr = get_test_schema_descr();
+        let mut columns = vec![];
+        for ptr in schema_descr.columns() {
+            let column = ColumnChunkMetaData::builder(ptr.clone()).build().unwrap();
+            columns.push(column);
+        }
+        let row_groups_metadata = vec![
+            build_test_row_group_meta(schema_descr.clone(), columns.clone(), 100, 0),
+            build_test_row_group_meta(schema_descr.clone(), columns.clone(), 100, 1),
+        ];
+
+        // A keep position inside a PRUNED row group must error (silently
+        // dropping it would lose a victim row).
+        let err =
+            ArrowReader::build_keep_row_selection(&row_groups_metadata, &Some(vec![1]), &[50, 150])
+                .unwrap_err();
+        assert!(err.to_string().contains("skipped"), "{err}");
+
+        // A position past EOF must error.
+        let err = ArrowReader::build_keep_row_selection(&row_groups_metadata, &None, &[199, 200])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("past the file's last row"),
+            "{err}"
+        );
+
+        // Unsorted input must error, never mis-select.
+        let err = ArrowReader::build_keep_row_selection(&row_groups_metadata, &None, &[5, 3])
+            .unwrap_err();
+        assert!(err.to_string().contains("sorted"), "{err}");
     }
 }

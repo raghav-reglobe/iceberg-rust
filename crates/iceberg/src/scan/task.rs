@@ -131,6 +131,20 @@ pub struct FileScanTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub key_metadata: Option<Box<[u8]>>,
+
+    /// Explicit file-absolute row positions to KEEP (sorted strictly
+    /// ascending) — an externally-known keep set applied to the parquet
+    /// reader as a `RowSelection` (page-index skip + row mask), intersected
+    /// with any delete- or predicate-derived selection. The merge
+    /// late-fetch sets it to the victim positions so only the pages
+    /// containing victims decode. Positions keep the reader-emitted `_pos`
+    /// coordinate space (file-absolute — unaffected by row-group pruning or
+    /// row selection). A position in a pruned row group or past EOF errors
+    /// loudly rather than silently dropping a row.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub row_selection_positions: Option<Arc<Vec<u64>>>,
 }
 
 impl FileScanTask {

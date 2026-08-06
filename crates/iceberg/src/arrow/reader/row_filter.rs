@@ -180,7 +180,7 @@ impl ArrowReader {
     /// each midpoint falls in exactly one task. This matches parquet-mr's `BlockMetaData`
     /// midpoint semantics. For a whole-file task (`start=0, length=fileSize`, as iceberg-rust's
     /// own planner emits) every midpoint lies in range, so all row groups are selected.
-    pub(super) fn filter_row_groups_by_byte_range(
+    pub fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
         length: u64,
@@ -1261,6 +1261,7 @@ mod tests {
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let task = FileScanTask {
+            row_selection_positions: None,
             file_size_in_bytes: file_size,
             start: 0,
             length: 0,
@@ -1353,6 +1354,7 @@ mod tests {
             .build();
 
         let task_sub2 = FileScanTask {
+            row_selection_positions: None,
             file_size_in_bytes: file_size,
             start: 0,
             length: 0,

@@ -55,6 +55,11 @@ pub(crate) struct ParquetReadOptions {
     /// Whether to preload the page index when reading Parquet metadata.
     #[builder(default = false)]
     pub(crate) preload_page_index: bool,
+    /// Per-row-group cap (bytes) on parquet's async-decoder predicate cache
+    /// (`ArrowReaderBuilder::with_max_predicate_cache_size`); `None` keeps
+    /// parquet's default (100 MB per row group), `Some(0)` disables.
+    #[builder(default = None)]
+    pub(crate) max_predicate_cache_bytes: Option<usize>,
 }
 
 impl ParquetReadOptions {
