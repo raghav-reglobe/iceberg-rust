@@ -127,9 +127,13 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     phase("load");
     let table = catalog.load_table(ident).await?;
     phase("plan");
-    let files = current_data_files(&table).await?;
+    let mut files = current_data_files(&table).await?;
     let delete_files = current_delete_files(&table).await?;
     let plan = plan_table(&table, cfg).await?;
+
+    // ONE reader for the whole run — its delete-file cache is shared across
+    // groups, so a delete pile bound to many groups decodes once per run.
+    let run_reader = crate::rewrite::build_run_reader(&table);
 
     let mut all_removed: Vec<DataFile> = Vec::new();
     let mut all_added: Vec<DataFile> = Vec::new();
@@ -143,7 +147,7 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
             group.tasks.len(),
             t0.elapsed().as_secs_f64()
         );
-        let added = read_sort_write(&table, group, cfg).await?;
+        let added = read_sort_write(&table, &run_reader, group, cfg).await?;
         if added.is_empty() {
             // The group produced no live rows. That is LEGITIMATE when every
             // row of every input file is masked by the deletes the scan bound
@@ -168,7 +172,7 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
             group
                 .tasks
                 .iter()
-                .filter_map(|t| files.get(&t.data_file_path).cloned()),
+                .filter_map(|t| files.remove(&t.data_file_path)),
         );
         // Delete files the SCAN bound to these rewritten data files become
         // removal CANDIDATES. Sourced from `task.deletes` (the scan's
@@ -262,7 +266,7 @@ pub async fn compact_files(
         return Ok(CompactFilesOutcome::default());
     }
     let table = catalog.load_table(ident).await?;
-    let files = current_data_files(&table).await?;
+    let mut files = current_data_files(&table).await?;
     let delete_files = current_delete_files(&table).await?;
 
     let tasks: Vec<FileScanTask> = table
@@ -279,11 +283,12 @@ pub async fn compact_files(
     cfg.min_input_files = 1;
     let plan = plan_compaction(tasks, &cfg);
 
+    let run_reader = crate::rewrite::build_run_reader(&table);
     let mut all_removed: Vec<DataFile> = Vec::new();
     let mut all_added: Vec<DataFile> = Vec::new();
     let mut candidate_delete_paths: HashSet<String> = HashSet::new();
     for group in &plan.groups {
-        let added = read_sort_write(&table, group, &cfg).await?;
+        let added = read_sort_write(&table, &run_reader, group, &cfg).await?;
         if added.is_empty() {
             // Same fully-superseded gate as `compact_table`: an empty read is
             // legitimate only when every input carried at least one bound
@@ -296,7 +301,7 @@ pub async fn compact_files(
             group
                 .tasks
                 .iter()
-                .filter_map(|t| files.get(&t.data_file_path).cloned()),
+                .filter_map(|t| files.remove(&t.data_file_path)),
         );
         for t in &group.tasks {
             for d in &t.deletes {
@@ -416,11 +421,12 @@ pub async fn dry_run_inspect(
     }
 
     // Per-group READ (DVs applied) — does a DV-bearing group read empty (→ skipped)?
+    let run_reader = crate::rewrite::build_run_reader(&table);
     let mut group_reads: Vec<String> = Vec::new();
     for (i, group) in plan.groups.iter().enumerate() {
         let tasks = group.tasks.len();
         let dv_tasks = group.tasks.iter().filter(|t| !t.deletes.is_empty()).count();
-        let rows = match crate::rewrite::read_group(&table, group.tasks.clone()).await {
+        let rows = match crate::rewrite::read_group(&run_reader, group.tasks.clone()).await {
             Ok(stream) => match stream.try_collect::<Vec<_>>().await {
                 Ok(batches) => batches
                     .iter()

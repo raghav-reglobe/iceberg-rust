@@ -10,7 +10,7 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
-use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::arrow::{ArrowReader, RecordBatchPartitionSplitter};
 use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
@@ -104,6 +104,7 @@ pub(crate) fn check_deadline(cfg: &Config, what: &str) -> Result<()> {
 
 pub(crate) async fn read_sort_write(
     table: &Table,
+    reader: &ArrowReader,
     group: &Group,
     cfg: &Config,
 ) -> Result<Vec<DataFile>> {
@@ -117,7 +118,7 @@ pub(crate) async fn read_sort_write(
         std::collections::HashMap::new()
     };
 
-    let mut stream = read_group(table, group.tasks.clone()).await?;
+    let mut stream = read_group(reader, group.tasks.clone()).await?;
     let mut sink: Option<CompactSink> = None;
     let mut chunk: Vec<RecordBatch> = Vec::new();
     let mut chunk_bytes = 0usize;
@@ -330,15 +331,26 @@ fn bloom_writer_properties(table: &Table) -> WriterProperties {
 
 /// Scan a group's data files into Arrow record batches (deletes/DVs applied,
 /// #2681) via iceberg-rust's `ArrowReader`.
+///
+/// The reader is built ONCE per compaction run and shared across groups
+/// (`ArrowReader` is `Clone` over `Arc`-shared state): its delete-file
+/// cache persists, so a delete pile bound to many groups is downloaded and
+/// decoded ONCE per run instead of once per group — with N groups over an
+/// op=R replace pile the per-group loader re-decoded overlapping subsets of
+/// the same pile up to N times (the ~26 min/group grind).
 pub(crate) async fn read_group(
-    table: &Table,
+    reader: &ArrowReader,
     tasks: Vec<FileScanTask>,
 ) -> Result<ArrowRecordBatchStream> {
-    // `reader_builder()` inherits the table's whole-file data cache (when
-    // configured), so compaction reads share the node-local copy.
-    let reader = table.reader_builder().build();
     let task_stream: FileScanTaskStream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    Ok(reader.read(task_stream)?.stream())
+    Ok(reader.clone().read(task_stream)?.stream())
+}
+
+/// Build the shared per-run reader. `reader_builder()` inherits the table's
+/// whole-file data cache (when configured), so compaction reads share the
+/// node-local copy.
+pub(crate) fn build_run_reader(table: &Table) -> ArrowReader {
+    table.reader_builder().build()
 }
 
 #[cfg(test)]

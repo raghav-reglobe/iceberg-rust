@@ -37,7 +37,8 @@ use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
 };
-use crate::arrow::caching_delete_file_loader::{CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet};
+use crate::arrow::caching_delete_file_loader::{CachingDeleteFileLoader, EqDeleteKey};
+use crate::arrow::delete_filter::EqDeleteGroup;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::large_offsets::widen_variable_length_types;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
@@ -529,7 +530,7 @@ impl FileScanTaskReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let eq_delete_sets = delete_filter.build_equality_delete_sets(&task).await?;
+        let eq_delete_groups = delete_filter.build_equality_delete_groups(&task).await?;
 
         // The scan predicate (if any) is applied via the Parquet RowFilter.
         // Equality deletes are applied as a separate post-read filter step using
@@ -731,10 +732,10 @@ impl FileScanTaskReader {
                     // Process the record batch (type promotion, column reordering, virtual fields, etc.)
                     let mut batch = record_batch_transformer.process_record_batch(batch)?;
                     // Apply equality deletes via hash-set lookup. Multiple
-                    // sets occur only when delete files use different
+                    // groups occur only when delete files use different
                     // equality_ids column sets.
-                    for eq_delete_set in &eq_delete_sets {
-                        batch = ArrowReader::apply_eq_delete_filter(&batch, eq_delete_set)?;
+                    for eq_delete_group in &eq_delete_groups {
+                        batch = ArrowReader::apply_eq_delete_filter(&batch, eq_delete_group)?;
                     }
                     if let Some(keep) = user_cols_to_keep {
                         batch = ArrowReader::strip_extra_columns(batch, keep)?;
@@ -751,15 +752,20 @@ impl FileScanTaskReader {
 
 impl ArrowReader {
     /// Filters a record batch by removing rows whose equality-delete key columns
-    /// match an entry in the delete set. Uses O(1) hash lookups per row.
+    /// match an entry in ANY of the group's delete sets. Uses hash lookups per
+    /// row, probing the shared per-delete-file sets sequentially with early
+    /// exit — semantically identical to probing the union of the sets, which
+    /// is deliberately never materialized (see `build_equality_delete_groups`).
     fn apply_eq_delete_filter(
         batch: &RecordBatch,
-        delete_set: &EqDeleteSet,
+        delete_group: &EqDeleteGroup,
     ) -> Result<RecordBatch> {
         // For each delete key field, locate the corresponding column in the
         // batch (by field_id from the Arrow field metadata, falling back to
-        // name) and convert it to a Vec<Option<Datum>> for hash lookups.
-        let datum_columns: Vec<Vec<Option<Datum>>> = delete_set
+        // name) and convert it to a Vec<Option<Datum>> for hash lookups. The
+        // conversion happens once per group — every set in the group shares
+        // the same field layout.
+        let datum_columns: Vec<Vec<Option<Datum>>> = delete_group
             .fields
             .iter()
             .map(|(field_name, field_id)| {
@@ -823,7 +829,11 @@ impl ArrowReader {
             for (col_idx, col) in datum_columns.iter().enumerate() {
                 probe_key.0[col_idx].clone_from(&col[row_idx]);
             }
-            if delete_set.keys.contains(&probe_key) {
+            if delete_group
+                .sets
+                .iter()
+                .any(|set| set.keys.contains_tuple(&probe_key))
+            {
                 *keep_row = false;
             }
         }

@@ -43,12 +43,104 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub(crate) struct EqDeleteKey(pub(crate) Vec<Option<Datum>>);
 
+/// Key storage for an equality delete set.
+///
+/// Single INTEGER-typed key columns (the replace/upsert class: an int or
+/// long PK) store raw widened i64s — one heap allocation total instead of
+/// one `Vec<Option<Datum>>` per key. A 4-byte key costs ~100 B as a boxed
+/// datum tuple; at the recorded pile shapes (10^7-10^8 keys per delete
+/// file) the generic representation is multi-GB and an allocator
+/// fragmentation source, the i64 set well under 1 GB. Everything else
+/// keeps the generic tuple set.
+#[derive(Debug, Clone)]
+pub(crate) enum EqDeleteKeys {
+    /// Composite or non-integer keys as datum tuples.
+    Generic(HashSet<EqDeleteKey>),
+    /// A single int/long/date key column, widened to i64.
+    SingleInt {
+        keys: HashSet<i64>,
+        /// Spec null semantics: a null delete value matches only null data.
+        contains_null: bool,
+    },
+}
+
+impl EqDeleteKeys {
+    /// Number of stored delete keys (a null key counts as one).
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Generic(keys) => keys.len(),
+            Self::SingleInt {
+                keys,
+                contains_null,
+            } => keys.len() + usize::from(*contains_null),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Insert one key tuple (column order matches `EqDeleteSet::fields`).
+    pub(crate) fn insert_tuple(&mut self, key_values: Vec<Option<Datum>>) -> Result<()> {
+        match self {
+            Self::Generic(keys) => {
+                keys.insert(EqDeleteKey(key_values));
+                Ok(())
+            }
+            Self::SingleInt {
+                keys,
+                contains_null,
+            } => match key_values.into_iter().next().flatten() {
+                None => {
+                    *contains_null = true;
+                    Ok(())
+                }
+                Some(datum) => {
+                    keys.insert(datum_as_i64(&datum)?);
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// Probe one key tuple. Union semantics across sets are the caller's
+    /// job (`EqDeleteGroup`); this answers membership in ONE set.
+    pub(crate) fn contains_tuple(&self, key: &EqDeleteKey) -> bool {
+        match self {
+            Self::Generic(keys) => keys.contains(key),
+            Self::SingleInt {
+                keys,
+                contains_null,
+            } => match key.0.first() {
+                Some(Some(datum)) => datum_as_i64(datum).is_ok_and(|v| keys.contains(&v)),
+                Some(None) | None => *contains_null,
+            },
+        }
+    }
+}
+
+/// Widen an integer-typed datum to i64. Widening also erases int→long type
+/// promotion drift between a delete file's stored type and an evolved
+/// batch column type (the generic datum tuple treats Int(5) and Long(5) as
+/// distinct keys).
+fn datum_as_i64(datum: &Datum) -> Result<i64> {
+    use crate::spec::PrimitiveLiteral;
+    match datum.literal() {
+        PrimitiveLiteral::Int(v) => Ok(*v as i64),
+        PrimitiveLiteral::Long(v) => Ok(*v),
+        other => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("non-integer datum in single-int equality delete set: {other:?}"),
+        )),
+    }
+}
+
 /// Bundles the hash set of delete keys with the field metadata needed to extract
 /// matching keys from data record batches.
 #[derive(Debug, Clone)]
 pub(crate) struct EqDeleteSet {
-    /// Delete key tuples to filter out of data batches.
-    pub(crate) keys: HashSet<EqDeleteKey>,
+    /// Delete keys to filter out of data batches.
+    pub(crate) keys: EqDeleteKeys,
     /// Ordered list of (field_name, field_id) used to locate the key columns in
     /// data record batches. The order matches the element order in `EqDeleteKey`.
     pub(crate) fields: Vec<(String, i32)>,
@@ -57,7 +149,18 @@ pub(crate) struct EqDeleteSet {
 impl EqDeleteSet {
     fn new(fields: Vec<(String, i32)>) -> Self {
         Self {
-            keys: HashSet::new(),
+            keys: EqDeleteKeys::Generic(HashSet::new()),
+            fields,
+        }
+    }
+
+    /// A set specialized for a single integer-typed key column.
+    fn new_single_int(fields: Vec<(String, i32)>) -> Self {
+        Self {
+            keys: EqDeleteKeys::SingleInt {
+                keys: HashSet::new(),
+                contains_null: false,
+            },
             fields,
         }
     }
@@ -67,10 +170,11 @@ impl EqDeleteSet {
         self.keys.is_empty()
     }
 
-    /// Merge another set (with the same field layout) into this one.
-    pub(crate) fn union(&mut self, other: &EqDeleteSet) {
-        self.keys.extend(other.keys.iter().cloned());
-    }
+    // NB: there is deliberately NO union/merge on this type. Unioning the
+    // per-delete-file sets into a per-data-file set deep-cloned the whole
+    // applicable key space once per data file (up to ~10^8 heap-allocated
+    // key tuples, concurrent across the decode pool) — the compact-path
+    // memory balloon. Reads probe the shared Arcs through EqDeleteGroup.
 }
 
 #[derive(Clone, Debug)]
@@ -633,21 +737,32 @@ impl CachingDeleteFileLoader {
             let delete_set = eq_delete_set.get_or_insert_with(|| {
                 let fields = datum_columns_with_names
                     .iter()
-                    .map(|(_, name, field_id)| (name.clone(), *field_id))
+                    .map(|(_, name, field_id, _)| (name.clone(), *field_id))
                     .collect();
-                EqDeleteSet::new(fields)
+                // A single integer-typed key column (int/long PK, date) gets
+                // the specialized i64 representation — see EqDeleteKeys.
+                let single_int = datum_columns_with_names.len() == 1
+                    && matches!(
+                        datum_columns_with_names[0].3,
+                        PrimitiveType::Int | PrimitiveType::Long | PrimitiveType::Date
+                    );
+                if single_int {
+                    EqDeleteSet::new_single_int(fields)
+                } else {
+                    EqDeleteSet::new(fields)
+                }
             });
 
             // Collect delete key tuples by iterating all columns in lockstep.
             #[allow(clippy::len_zero)]
             while datum_columns_with_names[0].0.len() > 0 {
                 let mut key_values = Vec::with_capacity(datum_columns_with_names.len());
-                for (column, _, _) in &mut datum_columns_with_names {
+                for (column, _, _, _) in &mut datum_columns_with_names {
                     if let Some(item) = column.next() {
                         key_values.push(item?);
                     }
                 }
-                delete_set.keys.insert(EqDeleteKey(key_values));
+                delete_set.keys.insert_tuple(key_values)?;
             }
         }
 
@@ -668,7 +783,8 @@ impl<'a> EqDelColumnProcessor<'a> {
         }
     }
 
-    /// Produces per-column Datum iterators alongside (field_name, field_id) metadata.
+    /// Produces per-column Datum iterators alongside (field_name, field_id,
+    /// primitive_type) metadata.
     #[allow(clippy::type_complexity)]
     fn finish(
         self,
@@ -677,6 +793,7 @@ impl<'a> EqDelColumnProcessor<'a> {
             Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>>,
             String,
             i32,
+            PrimitiveType,
         )>,
     > {
         self.collected_columns
@@ -690,13 +807,14 @@ impl<'a> EqDelColumnProcessor<'a> {
                     .clone();
 
                 let lit_vec = arrow_primitive_to_literal(&array, &field_type)?;
+                let iter_type = primitive_type.clone();
                 let datum_iterator: Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>> =
                     Box::new(lit_vec.into_iter().map(move |c| {
                         c.map(|literal| {
                             literal
                                 .as_primitive_literal()
                                 .map(|primitive_literal| {
-                                    Datum::new(primitive_type.clone(), primitive_literal)
+                                    Datum::new(iter_type.clone(), primitive_literal)
                                 })
                                 .ok_or(Error::new(
                                     ErrorKind::Unexpected,
@@ -706,7 +824,7 @@ impl<'a> EqDelColumnProcessor<'a> {
                         .transpose()
                     }));
 
-                Ok((datum_iterator, field_name, field_id))
+                Ok((datum_iterator, field_name, field_id, primitive_type))
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -820,17 +938,20 @@ impl PartnerAccessor<ArrayRef> for EqDelRecordBatchPartnerAccessor {
 #[cfg(test)]
 mod tests {
 
-    /// BALLOON REPRO (specimen #2/#3 diagnosis, 2026-08-07): the per-data-file
-    /// eq-delete UNION at the recorded production shape — order_document
-    /// group 11: ~91 bound eq-delete files x ~1.09M int32 keys each. The
-    /// engine clones set[0] and extends with every other set's cloned keys
-    /// (delete_filter.rs build_equality_delete_sets), so ONE data file's
-    /// private union materializes ~99M EqDeleteKey(Vec<Option<Datum>>)
-    /// entries — measure it. Run explicitly:
+    /// BALLOON REPRO → REGRESSION PIN (specimen diagnosis, 2026-08-07): the
+    /// recorded production shape — one rewrite group binding ~91 eq-delete
+    /// files x ~1.09M int32 keys each. The retired per-data-file UNION
+    /// deep-cloned all ~99M EqDeleteKey(Vec<Option<Datum>>) entries into a
+    /// PRIVATE set per data file (~4 GB process peak on macOS at this shape;
+    /// ~8-11 GB per union on glibc, concurrent across the decode pool). The
+    /// grouped shape (EqDeleteGroup) must cost ~nothing beyond the shared
+    /// Arcs while probing identically. Run explicitly:
     ///   cargo test -p iceberg --lib eq_delete_union_memory_repro --release -- --ignored --nocapture
     #[test]
     #[ignore]
     fn eq_delete_union_memory_repro() {
+        use crate::arrow::delete_filter::EqDeleteGroup;
+
         fn maxrss_mb() -> f64 {
             let out = std::process::Command::new("ps")
                 .args(["-o", "rss=", "-p", &std::process::id().to_string()])
@@ -846,39 +967,57 @@ mod tests {
         const KEYS_PER_FILE: u64 = 1_090_000;
         let fields = vec![("id".to_string(), 1i32)];
         let base = maxrss_mb();
-        // The per-delete-file sets (shared Arcs in production).
+        // The per-delete-file sets (shared Arcs in production) in the
+        // representation the parse path now builds for a single int key
+        // column: a raw i64 set (EqDeleteKeys::SingleInt). The retired
+        // generic representation measured +5.5 GB for these same keys.
         let sets: Vec<Arc<EqDeleteSet>> = (0..FILES as u64)
             .map(|f| {
-                let keys: HashSet<EqDeleteKey> = (0..KEYS_PER_FILE)
-                    .map(|k| {
-                        EqDeleteKey(vec![Some(Datum::int(
+                let mut set = EqDeleteSet::new_single_int(fields.clone());
+                for k in 0..KEYS_PER_FILE {
+                    set.keys
+                        .insert_tuple(vec![Some(Datum::int(
                             ((f * KEYS_PER_FILE + k) % i32::MAX as u64) as i32,
                         ))])
-                    })
-                    .collect();
-                Arc::new(EqDeleteSet {
-                    keys,
-                    fields: fields.clone(),
-                })
+                        .unwrap();
+                }
+                Arc::new(set)
             })
             .collect();
         let after_sets = maxrss_mb();
-        // The engine's per-data-file union (delete_filter.rs:259-263 shape).
-        let mut combined = (*sets[0]).clone();
-        for set in &sets[1..] {
-            combined.union(set);
-        }
-        let after_union = maxrss_mb();
+
+        // The read path's shape: shared Arcs grouped, never unioned.
+        let group = EqDeleteGroup {
+            fields: fields.clone(),
+            sets: sets.clone(),
+        };
+        let after_group = maxrss_mb();
+
+        // Union-equivalent probe semantics: a key is deleted when ANY set
+        // holds it.
+        let hit = EqDeleteKey(vec![Some(Datum::int(42))]);
+        let miss = EqDeleteKey(vec![Some(Datum::int(-7))]);
+        assert!(group.sets.iter().any(|s| s.keys.contains_tuple(&hit)));
+        assert!(!group.sets.iter().any(|s| s.keys.contains_tuple(&miss)));
+
+        let total_keys: u64 = group.sets.iter().map(|s| s.keys.len() as u64).sum();
+        assert_eq!(total_keys, FILES as u64 * KEYS_PER_FILE);
+
+        let group_cost = after_group - after_sets;
         println!(
-            "shared sets ({} x {}): +{:.1} MB | ONE per-file union ({} keys): +{:.1} MB | peak {:.1} MB",
+            "shared sets ({} x {}): +{:.1} MB | group build: +{:.1} MB | peak {:.1} MB",
             FILES,
             KEYS_PER_FILE,
             after_sets - base,
-            combined.keys.len(),
-            after_union - after_sets,
-            after_union
+            group_cost,
+            after_group
         );
-        assert_eq!(combined.keys.len() as u64, FILES as u64 * KEYS_PER_FILE);
+        // The group is Arc clones only — a fraction of one set's footprint.
+        // (The retired union added ~700+ MB incremental / ~4 GB peak here.)
+        assert!(
+            group_cost < 100.0,
+            "grouping the shared sets must not copy keys (cost {group_cost:.1} MB)"
+        );
     }
     use std::collections::HashMap;
     use std::fs::File;
@@ -898,6 +1037,84 @@ mod tests {
     use crate::arrow::delete_filter::tests::setup;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, Schema};
+
+    /// A single int/long key column gets the specialized i64 representation
+    /// (the replace/upsert PK class); probe semantics are identical to the
+    /// generic tuple set, including spec null matching and int→long
+    /// promotion widening.
+    #[tokio::test]
+    async fn single_int_key_column_specializes_and_probes() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "id",
+            DataType::Int64,
+            true,
+            "1",
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![
+            Some(10),
+            Some(20),
+            None,
+        ])) as ArrayRef])
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let eq_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![1]),
+        )
+        .await
+        .expect("error parsing equality delete stream");
+
+        assert!(
+            matches!(eq_set.keys, EqDeleteKeys::SingleInt { .. }),
+            "single integer key column must take the specialized representation"
+        );
+        // 2 int keys + the null key.
+        assert_eq!(eq_set.keys.len(), 3);
+
+        // Probes: same-type, widened (int vs long — promotion drift), null.
+        assert!(
+            eq_set
+                .keys
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::long(10))]))
+        );
+        assert!(
+            eq_set
+                .keys
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::int(20))])),
+            "int-typed probe must hit a long-typed stored key (widening)"
+        );
+        assert!(eq_set.keys.contains_tuple(&EqDeleteKey(vec![None])));
+        assert!(
+            !eq_set
+                .keys
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::long(30))]))
+        );
+    }
+
+    /// Composite keys keep the generic tuple representation.
+    #[tokio::test]
+    async fn composite_key_columns_stay_generic() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            simple_field("id", DataType::Int64, true, "1"),
+            simple_field("status", DataType::Utf8, true, "3"),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
+        ])
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let eq_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![1, 3]),
+        )
+        .await
+        .expect("error parsing equality delete stream");
+
+        assert!(matches!(eq_set.keys, EqDeleteKeys::Generic(_)));
+    }
 
     #[tokio::test]
     async fn test_delete_file_loader_parse_equality_deletes() {
@@ -952,7 +1169,7 @@ mod tests {
             Some(Datum::binary(b"binary_data".to_vec())),
         ]);
         assert!(
-            parsed_eq_delete.keys.contains(&row1),
+            parsed_eq_delete.keys.contains_tuple(&row1),
             "Row 1 should be in delete set"
         );
 
@@ -965,7 +1182,7 @@ mod tests {
             None,
         ]);
         assert!(
-            parsed_eq_delete.keys.contains(&row2),
+            parsed_eq_delete.keys.contains_tuple(&row2),
             "Row 2 should be in delete set"
         );
 
@@ -977,7 +1194,7 @@ mod tests {
             Some(Datum::int(0)),
             Some(Datum::binary(b"nope".to_vec())),
         ]);
-        assert!(!parsed_eq_delete.keys.contains(&non_existent));
+        assert!(!parsed_eq_delete.keys.contains_tuple(&non_existent));
     }
 
     // An equality delete keyed on a nullable column must not delete rows whose value in that
@@ -1011,9 +1228,9 @@ mod tests {
         assert!(
             eq_set
                 .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::string("INACTIVE"))]))
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::string("INACTIVE"))]))
         );
-        assert!(!eq_set.keys.contains(&EqDeleteKey(vec![None])));
+        assert!(!eq_set.keys.contains_tuple(&EqDeleteKey(vec![None])));
     }
 
     // A delete row with a null value in the column matches only rows whose value is null (Iceberg
@@ -1041,11 +1258,11 @@ mod tests {
 
         // A null delete value is the key (None,) — it matches only null data
         // values; non-null data values are not in the set and are kept.
-        assert!(eq_set.keys.contains(&EqDeleteKey(vec![None])));
+        assert!(eq_set.keys.contains_tuple(&EqDeleteKey(vec![None])));
         assert!(
             !eq_set
                 .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::string("ACTIVE"))]))
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::string("ACTIVE"))]))
         );
     }
 
@@ -1073,11 +1290,11 @@ mod tests {
 
         // The delete key is the full tuple — a row differing in ANY one
         // column is not in the set and is kept.
-        assert!(eq_set.keys.contains(&EqDeleteKey(vec![
+        assert!(eq_set.keys.contains_tuple(&EqDeleteKey(vec![
             Some(Datum::long(1)),
             Some(Datum::string("X"))
         ])));
-        assert!(!eq_set.keys.contains(&EqDeleteKey(vec![
+        assert!(!eq_set.keys.contains_tuple(&EqDeleteKey(vec![
             Some(Datum::long(1)),
             Some(Datum::string("Y"))
         ])));
@@ -1113,17 +1330,17 @@ mod tests {
         assert!(
             eq_set
                 .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::string("A"))]))
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::string("A"))]))
         );
         assert!(
             eq_set
                 .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::string("B"))]))
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::string("B"))]))
         );
         assert!(
             !eq_set
                 .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::string("C"))]))
+                .contains_tuple(&EqDeleteKey(vec![Some(Datum::string("C"))]))
         );
     }
 
@@ -1446,18 +1663,18 @@ mod tests {
 
         // Verify both delete types can be processed together
         let result = delete_filter
-            .build_equality_delete_sets(&file_scan_task)
+            .build_equality_delete_groups(&file_scan_task)
             .await;
         assert!(
             result.is_ok(),
-            "Failed to build equality delete sets: {:?}",
+            "Failed to build equality delete groups: {:?}",
             result.err()
         );
-        // The equality delete sets should contain delete keys
-        let eq_sets = result.unwrap();
+        // The equality delete groups should contain delete keys
+        let eq_groups = result.unwrap();
         assert!(
-            !eq_sets.is_empty(),
-            "Expected at least one equality delete set"
+            !eq_groups.is_empty(),
+            "Expected at least one equality delete group"
         );
     }
 

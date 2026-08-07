@@ -35,6 +35,18 @@ enum EqDelState {
     Loaded(Arc<EqDeleteSet>),
 }
 
+/// A group of equality delete sets sharing one field layout, probed
+/// sequentially at read time. Rows are removed when their key is in ANY of
+/// the sets — identical semantics to the union of the sets, without ever
+/// materializing that union (see `build_equality_delete_groups`).
+#[derive(Debug, Clone)]
+pub(crate) struct EqDeleteGroup {
+    /// Ordered `(field_name, field_id)` — identical across `sets`.
+    pub(crate) fields: Vec<(String, i32)>,
+    /// The per-delete-file sets (shared cache `Arc`s).
+    pub(crate) sets: Vec<Arc<EqDeleteSet>>,
+}
+
 /// State tracking for positional delete files.
 /// Unlike equality deletes, positional deletes must be fully loaded before
 /// the ArrowReader proceeds because retrieval is synchronous and non-blocking.
@@ -204,21 +216,29 @@ impl DeleteFilter {
         }
     }
 
-    /// Builds equality delete sets for the provided task.
+    /// Builds equality delete groups for the provided task.
     ///
-    /// Returns a list of delete sets, one per distinct `equality_ids` group.
+    /// Returns one group per distinct `equality_ids` field layout, each
+    /// holding the cached `Arc`s of every applicable delete file's set.
     /// Most tables use a single `equality_ids` set, so this typically returns
-    /// zero or one element. Multiple elements occur only when different delete
+    /// zero or one group. Multiple groups occur only when different delete
     /// files on the same partition use different equality column sets.
     ///
-    /// When only one delete file applies for a group, returns the cached `Arc`
-    /// directly — no deep clone of the hash set.
-    pub(crate) async fn build_equality_delete_sets(
+    /// The per-group UNION of the sets is deliberately NOT materialized:
+    /// with N delete files bound to one data file, unioning deep-cloned the
+    /// whole applicable key space into a PRIVATE `HashSet` per data file
+    /// (~100 B per key tuple, up to 10^8 keys, held concurrently across the
+    /// decode pool) — the compact-path memory balloon. Probing the shared
+    /// `Arc`s sequentially (`apply_eq_delete_filter`) is semantically
+    /// identical — a row is deleted when its key is in ANY set — at zero
+    /// copies.
+    pub(crate) async fn build_equality_delete_groups(
         &self,
         file_scan_task: &FileScanTask,
-    ) -> Result<Vec<Arc<EqDeleteSet>>> {
+    ) -> Result<Vec<EqDeleteGroup>> {
         // Collect all applicable equality delete sets, reusing cached Arcs.
-        // Group by field layout so we only union sets with matching columns.
+        // Group by field layout so batch key columns are converted once per
+        // layout at probe time.
         let mut groups: HashMap<Vec<(String, i32)>, Vec<Arc<EqDeleteSet>>> = HashMap::new();
 
         for delete in &file_scan_task.deletes {
@@ -247,25 +267,10 @@ impl DeleteFilter {
             }
         }
 
-        // For each group, union all sets into one.
-        let mut result = Vec::with_capacity(groups.len());
-        for (_fields, sets) in groups {
-            match sets.len() {
-                0 => {}
-                // Single file in group: return the cached Arc directly.
-                1 => result.push(sets.into_iter().next().unwrap()),
-                // Multiple files with same fields: union into a new set.
-                _ => {
-                    let mut combined = (*sets[0]).clone();
-                    for set in &sets[1..] {
-                        combined.union(set);
-                    }
-                    result.push(Arc::new(combined));
-                }
-            }
-        }
-
-        Ok(result)
+        Ok(groups
+            .into_iter()
+            .map(|(fields, sets)| EqDeleteGroup { fields, sets })
+            .collect())
     }
 
     pub(crate) fn upsert_delete_vector(
@@ -333,7 +338,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::arrow::caching_delete_file_loader::{
-        CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet,
+        CachingDeleteFileLoader, EqDeleteKey, EqDeleteKeys, EqDeleteSet,
     };
     use crate::io::FileIO;
     use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
@@ -610,17 +615,17 @@ pub(crate) mod tests {
 
         // Insert two equality delete sets with different keys
         let mut set1 = EqDeleteSet {
-            keys: std::collections::HashSet::new(),
+            keys: EqDeleteKeys::Generic(std::collections::HashSet::new()),
             fields: vec![("id".to_string(), 1)],
         };
-        set1.keys.insert(EqDeleteKey(vec![Some(Datum::long(10))]));
-        set1.keys.insert(EqDeleteKey(vec![Some(Datum::long(20))]));
+        set1.keys.insert_tuple(vec![Some(Datum::long(10))]).unwrap();
+        set1.keys.insert_tuple(vec![Some(Datum::long(20))]).unwrap();
 
         let mut set2 = EqDeleteSet {
-            keys: std::collections::HashSet::new(),
+            keys: EqDeleteKeys::Generic(std::collections::HashSet::new()),
             fields: vec![("id".to_string(), 1)],
         };
-        set2.keys.insert(EqDeleteKey(vec![Some(Datum::long(30))]));
+        set2.keys.insert_tuple(vec![Some(Datum::long(30))]).unwrap();
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete("eq-del-1.parquet", rx1);
@@ -633,30 +638,28 @@ pub(crate) mod tests {
         // Small delay to allow the spawned tasks to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let result = filter.build_equality_delete_sets(&task).await;
+        let result = filter.build_equality_delete_groups(&task).await;
         assert!(result.is_ok());
 
-        let eq_sets = result.unwrap();
-        // Same equality_ids → unioned into one set
-        assert_eq!(eq_sets.len(), 1);
-        let eq_set = &eq_sets[0];
-        // Union of {10, 20} and {30} should contain all three
-        assert_eq!(eq_set.keys.len(), 3);
-        assert!(
-            eq_set
-                .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::long(10))]))
+        let eq_groups = result.unwrap();
+        // Same equality_ids → ONE group holding both sets (never unioned).
+        assert_eq!(eq_groups.len(), 1);
+        let group = &eq_groups[0];
+        assert_eq!(group.sets.len(), 2);
+        assert_eq!(
+            group.sets.iter().map(|s| s.keys.len()).sum::<usize>(),
+            3,
+            "no key is copied or lost across the group"
         );
-        assert!(
-            eq_set
-                .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::long(20))]))
-        );
-        assert!(
-            eq_set
-                .keys
-                .contains(&EqDeleteKey(vec![Some(Datum::long(30))]))
-        );
+        // Every key is reachable through the group (the union semantics).
+        for key in [10, 20, 30] {
+            assert!(
+                group.sets.iter().any(|s| s
+                    .keys
+                    .contains_tuple(&EqDeleteKey(vec![Some(Datum::long(key))]))),
+                "key {key} must be probeable through the group"
+            );
+        }
     }
 
     /// Delete files with different equality_ids must NOT be unioned — they
@@ -705,21 +708,23 @@ pub(crate) mod tests {
 
         // Delete file 1: delete by id
         let mut set_by_id = EqDeleteSet {
-            keys: std::collections::HashSet::new(),
+            keys: EqDeleteKeys::Generic(std::collections::HashSet::new()),
             fields: vec![("id".to_string(), 1)],
         };
         set_by_id
             .keys
-            .insert(EqDeleteKey(vec![Some(Datum::long(10))]));
+            .insert_tuple(vec![Some(Datum::long(10))])
+            .unwrap();
 
         // Delete file 2: delete by name
         let mut set_by_name = EqDeleteSet {
-            keys: std::collections::HashSet::new(),
+            keys: EqDeleteKeys::Generic(std::collections::HashSet::new()),
             fields: vec![("name".to_string(), 2)],
         };
         set_by_name
             .keys
-            .insert(EqDeleteKey(vec![Some(Datum::string("alice"))]));
+            .insert_tuple(vec![Some(Datum::string("alice"))])
+            .unwrap();
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete("eq-del-by-id.parquet", rx1);
@@ -731,20 +736,22 @@ pub(crate) mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let eq_sets = filter
-            .build_equality_delete_sets(&task)
+        let eq_groups = filter
+            .build_equality_delete_groups(&task)
             .await
             .expect("should succeed");
 
-        // Different equality_ids → two separate sets, NOT unioned
+        // Different equality_ids → two separate groups
         assert_eq!(
-            eq_sets.len(),
+            eq_groups.len(),
             2,
-            "Delete files with different equality_ids must produce separate sets"
+            "Delete files with different equality_ids must produce separate groups"
         );
 
-        // Each set should have exactly one key
-        let key_counts: Vec<usize> = eq_sets.iter().map(|s| s.keys.len()).collect();
-        assert!(key_counts.contains(&1));
+        // Each group holds exactly one set with exactly one key
+        for group in &eq_groups {
+            assert_eq!(group.sets.len(), 1);
+            assert_eq!(group.sets[0].keys.len(), 1);
+        }
     }
 }
