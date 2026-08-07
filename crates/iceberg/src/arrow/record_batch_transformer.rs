@@ -19,11 +19,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, LargeListArray, ListArray, MapArray, RecordBatch,
+    RecordBatchOptions, RunArray, StructArray, new_null_array,
 };
 use arrow_cast::cast;
 use arrow_schema::{
-    DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
+    DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    SchemaRef,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -107,6 +109,147 @@ fn constants_map(
     }
 
     Ok(constants)
+}
+
+/// Parquet field id recorded in an Arrow field's metadata, if any.
+fn arrow_field_id(field: &Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| id.parse::<i32>().ok())
+}
+
+/// Adapt a source column to `target_type`, handling Iceberg schema evolution
+/// INSIDE nested types.
+///
+/// `arrow_cast::cast` cannot adapt a struct that gained or lost fields — it
+/// requires equal field counts, and its fallback zips source children against
+/// target fields positionally, tripping `StructArray::try_new` with
+/// "Incorrect number of arrays for StructArray fields" (the post-schema-
+/// evolution read failure on files written before a nested field was added).
+///
+/// Struct-bearing types are therefore adapted field-by-field here: target
+/// children matched to source children by Parquet field id (name as the
+/// fallback when either side lacks an id), matched children adapted
+/// recursively, missing optional children null-padded, missing required
+/// children an error (spec "Column Projection" rule #4 applies to nested
+/// fields the same as top-level ones — null is only a valid default for an
+/// optional field). Everything non-nested falls through to `cast`.
+fn adapt_column(source: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
+    if source.data_type() == target_type {
+        return Ok(Arc::clone(source));
+    }
+
+    match (source.data_type(), target_type) {
+        (DataType::Struct(_), DataType::Struct(target_fields)) => {
+            let source_struct = source
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "expected StructArray for struct type",
+                    )
+                })?;
+            let children = adapt_struct_children(source_struct, target_fields)?;
+            Ok(Arc::new(StructArray::try_new(
+                target_fields.clone(),
+                children,
+                source_struct.nulls().cloned(),
+            )?))
+        }
+        (DataType::List(_), DataType::List(target_elem)) => {
+            let list = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                Error::new(ErrorKind::Unexpected, "expected ListArray for list type")
+            })?;
+            let values = adapt_column(list.values(), target_elem.data_type())?;
+            Ok(Arc::new(ListArray::try_new(
+                Arc::clone(target_elem),
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?))
+        }
+        (DataType::LargeList(_), DataType::LargeList(target_elem)) => {
+            let list = source
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "expected LargeListArray for large list type",
+                    )
+                })?;
+            let values = adapt_column(list.values(), target_elem.data_type())?;
+            Ok(Arc::new(LargeListArray::try_new(
+                Arc::clone(target_elem),
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?))
+        }
+        (DataType::Map(_, _), DataType::Map(target_entries, target_sorted)) => {
+            let map = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                Error::new(ErrorKind::Unexpected, "expected MapArray for map type")
+            })?;
+            let entries: ArrayRef = Arc::new(map.entries().clone());
+            let adapted = adapt_column(&entries, target_entries.data_type())?;
+            let adapted_entries = adapted
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "adapted map entries must be a struct",
+                    )
+                })?
+                .clone();
+            Ok(Arc::new(MapArray::try_new(
+                Arc::clone(target_entries),
+                map.offsets().clone(),
+                adapted_entries,
+                map.nulls().cloned(),
+                *target_sorted,
+            )?))
+        }
+        _ => Ok(cast(source, target_type)?),
+    }
+}
+
+/// Build the child arrays of an evolved struct: match target children to
+/// source children by field id (name fallback), adapt matches recursively,
+/// null-pad missing optional children, error on missing required children.
+fn adapt_struct_children(source: &StructArray, target_fields: &Fields) -> Result<Vec<ArrayRef>> {
+    let DataType::Struct(source_fields) = source.data_type() else {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "expected struct data type on StructArray",
+        ));
+    };
+
+    target_fields
+        .iter()
+        .map(|target_field| {
+            let target_id = arrow_field_id(target_field);
+            let matched = source_fields.iter().enumerate().find(|(_, source_field)| {
+                match (target_id, arrow_field_id(source_field)) {
+                    (Some(t), Some(s)) => t == s,
+                    _ => source_field.name() == target_field.name(),
+                }
+            });
+
+            match matched {
+                Some((idx, _)) => adapt_column(source.column(idx), target_field.data_type()),
+                None if target_field.is_nullable() => {
+                    Ok(new_null_array(target_field.data_type(), source.len()))
+                }
+                None => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Missing required field: {}", target_field.name()),
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Indicates how a particular column in a processed RecordBatch should
@@ -709,7 +852,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => adapt_column(&columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -764,9 +907,9 @@ mod test {
 
     use arrow_array::{
         Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray,
+        RecordBatch, StringArray, StructArray,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::record_batch_transformer::{
@@ -1062,11 +1205,362 @@ mod test {
         let struct_column = result
             .column(2)
             .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
         assert!(struct_column.is_null(0));
         assert!(struct_column.is_null(1));
         assert!(struct_column.is_null(2));
+    }
+
+    /// The production shape behind this test: a source-side ALTER added a
+    /// new PK column, evolving the nested `_cdc.key` struct from 2 fields to
+    /// 3. Files written before the evolution carry the 2-field struct;
+    /// reading them under the evolved schema must null-pad the missing
+    /// nested field. arrow cast cannot do this (it requires equal struct
+    /// field counts; its positional fallback trips StructArray::try_new with
+    /// "Incorrect number of arrays for StructArray fields").
+    #[test]
+    fn nested_struct_evolution_pads_added_field_and_drops_removed_field() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(4)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "_cdc",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(3, "op", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::optional(
+                                4,
+                                "key",
+                                Type::Struct(crate::spec::StructType::new(vec![
+                                    NestedField::optional(
+                                        5,
+                                        "post_id",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        6,
+                                        "day",
+                                        Type::Primitive(PrimitiveType::String),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        7,
+                                        "new_id",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .into(),
+                                ])),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        // File written BEFORE the evolution: key = {post_id, day, legacy} —
+        // no new_id (added later); legacy was dropped from the schema.
+        let file_key_fields = Fields::from(vec![
+            simple_field("post_id", DataType::Int64, true, "5"),
+            simple_field("day", DataType::Utf8, true, "6"),
+            simple_field("legacy", DataType::Int32, true, "99"),
+        ]);
+        let file_cdc_fields = Fields::from(vec![
+            simple_field("op", DataType::Utf8, true, "3"),
+            simple_field("key", DataType::Struct(file_key_fields.clone()), true, "4"),
+        ]);
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, true, "1"),
+            simple_field("_cdc", DataType::Struct(file_cdc_fields.clone()), true, "2"),
+        ]));
+
+        let key_array = StructArray::new(
+            file_key_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec![
+                    "2026-08-01",
+                    "2026-08-02",
+                    "2026-08-03",
+                ])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
+            ],
+            None,
+        );
+        let cdc_array = StructArray::new(
+            file_cdc_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u", "d"])),
+                Arc::new(key_array),
+            ],
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(cdc_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        let cdc = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let key = cdc
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let DataType::Struct(key_fields) = key.data_type() else {
+            panic!("key must stay a struct");
+        };
+        assert_eq!(
+            key_fields
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["post_id", "day", "new_id"],
+        );
+
+        let post_id = key
+            .column_by_name("post_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(post_id.values(), &[100, 200, 300]);
+
+        // Nested string promoted to the target LargeUtf8 mapping.
+        let day = key
+            .column_by_name("day")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(day.value(0), "2026-08-01");
+
+        // The added nested field is null-padded.
+        let new_id = key.column_by_name("new_id").unwrap();
+        assert_eq!(new_id.null_count(), 3);
+
+        // Sibling fields inside the evolved parent survive untouched.
+        let op = cdc
+            .column_by_name("op")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(op.value(1), "u");
+    }
+
+    /// The pure add-only shape (unequal field counts — the exact production
+    /// failure: "Incorrect number of arrays for StructArray fields,
+    /// expected 2 got 1" under arrow cast's positional fallback).
+    #[test]
+    fn nested_struct_evolution_pads_added_field_unequal_counts() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(4)
+                .with_fields(vec![
+                    NestedField::optional(
+                        2,
+                        "meta",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                            NestedField::optional(4, "b", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[2]).build();
+
+        let file_meta_fields = Fields::from(vec![simple_field("a", DataType::Int64, true, "3")]);
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "meta",
+            DataType::Struct(file_meta_fields.clone()),
+            true,
+            "2",
+        )]));
+        let meta_array = StructArray::new(
+            file_meta_fields,
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(meta_array)]).unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let meta = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let a = meta
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(a.values(), &[1, 2]);
+        assert_eq!(meta.column_by_name("b").unwrap().null_count(), 2);
+    }
+
+    #[test]
+    fn nested_struct_evolution_missing_required_field_errors() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(4)
+                .with_fields(vec![
+                    NestedField::optional(
+                        2,
+                        "meta",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                            NestedField::required(4, "b", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[2]).build();
+
+        let file_meta_fields = Fields::from(vec![simple_field("a", DataType::Int64, true, "3")]);
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "meta",
+            DataType::Struct(file_meta_fields.clone()),
+            true,
+            "2",
+        )]));
+        let meta_array = StructArray::new(
+            file_meta_fields,
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(meta_array)]).unwrap();
+
+        let err = transformer.process_record_batch(file_batch).unwrap_err();
+        assert!(
+            err.to_string().contains("Missing required field: b"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Recursion through list wrappers: a list of structs whose element
+    /// struct gained a field must null-pad inside the list values.
+    #[test]
+    fn nested_struct_evolution_inside_list_pads_added_field() {
+        use arrow_array::ListArray;
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(4)
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "events",
+                        Type::List(crate::spec::ListType {
+                            element_field: NestedField::list_element(
+                                2,
+                                Type::Struct(crate::spec::StructType::new(vec![
+                                    NestedField::optional(
+                                        3,
+                                        "x",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        4,
+                                        "y",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .into(),
+                                ])),
+                                false,
+                            )
+                            .into(),
+                        }),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1]).build();
+
+        let file_elem_fields = Fields::from(vec![simple_field("x", DataType::Int64, true, "3")]);
+        let elem_field = Arc::new(
+            Field::new("element", DataType::Struct(file_elem_fields.clone()), false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        );
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "events",
+            DataType::List(elem_field.clone()),
+            true,
+            "1",
+        )]));
+
+        let values = StructArray::new(
+            file_elem_fields,
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+            None,
+        );
+        let list = ListArray::new(
+            elem_field,
+            OffsetBuffer::new(vec![0, 2, 3].into()),
+            Arc::new(values),
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(list)]).unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let events = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let elem = events
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let x = elem
+            .column_by_name("x")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(x.values(), &[10, 20, 30]);
+        assert_eq!(elem.column_by_name("y").unwrap().null_count(), 3);
     }
 
     pub fn source_record_batch() -> RecordBatch {

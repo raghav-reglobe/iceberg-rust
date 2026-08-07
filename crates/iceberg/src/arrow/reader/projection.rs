@@ -1099,6 +1099,89 @@ message schema {
         assert!(col_b.is_null(2));
     }
 
+    /// Real-file repro for the nested-struct-evolution read failure
+    /// ("Arrow Schema Error: ... Incorrect number of arrays for StructArray
+    /// fields"): read a production parquet written BEFORE a nested struct
+    /// gained a field, under the evolved table schema. The nested struct
+    /// must come back null-padded to the evolved width.
+    ///
+    /// Ignored: needs local artifacts. Run with
+    ///   EVO_PARQUET=/path/to/pre_evolution.parquet \
+    ///   EVO_SCHEMA_JSON=/path/to/current_schema.json \
+    ///   EVO_STRUCT_COL=_cdc EVO_NESTED=key EVO_ADDED=id \
+    ///   cargo test -p iceberg --lib nested_struct_evolution_real_file -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn nested_struct_evolution_real_file_repro() {
+        use arrow_array::StructArray;
+
+        let parquet_path = std::env::var("EVO_PARQUET").expect("EVO_PARQUET not set");
+        let schema_json = std::env::var("EVO_SCHEMA_JSON").expect("EVO_SCHEMA_JSON not set");
+        let struct_col = std::env::var("EVO_STRUCT_COL").unwrap_or_else(|_| "_cdc".to_string());
+        let nested = std::env::var("EVO_NESTED").unwrap_or_else(|_| "key".to_string());
+        let added = std::env::var("EVO_ADDED").unwrap_or_else(|_| "id".to_string());
+
+        let schema: Schema =
+            serde_json::from_str(&std::fs::read_to_string(&schema_json).unwrap()).unwrap();
+        let schema = Arc::new(schema);
+        let project_field_ids: Vec<i32> =
+            schema.as_struct().fields().iter().map(|f| f.id).collect();
+
+        let file_io = FileIO::new_with_fs();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&parquet_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(parquet_path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(project_field_ids)
+                .with_case_sensitive(false)
+                .build())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected rows from the real file");
+
+        for batch in &batches {
+            let parent = batch
+                .column_by_name(&struct_col)
+                .expect("struct column present")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct column is a StructArray");
+            let inner = parent
+                .column_by_name(&nested)
+                .expect("nested struct present")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("nested column is a StructArray");
+            let added_col = inner
+                .column_by_name(&added)
+                .expect("evolved field present in nested struct");
+            assert_eq!(
+                added_col.null_count(),
+                added_col.len(),
+                "pre-evolution file must read the added nested field as all-null"
+            );
+        }
+        println!(
+            "read {total} rows; {struct_col}.{nested}.{added} null-padded across {} batches",
+            batches.len()
+        );
+    }
+
     /// Test reading Parquet files without field ID metadata (e.g., migrated tables).
     /// This exercises the position-based fallback path.
     ///
