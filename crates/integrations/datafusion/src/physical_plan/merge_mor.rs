@@ -72,8 +72,9 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::variant_shred::{
-    conform_batch_variants, shred_record_batch, shred_shape_compatible,
-    shred_types_with_arrow_from_file_schema, shredded_output_type, variant_column_count,
+    conform_batch_variants, is_shredded_variant_type, shred_record_batch, shred_shape_compatible,
+    shred_types_with_arrow_from_file_schema, shredded_output_type, unshred_batch_columns,
+    variant_column_count,
 };
 use iceberg::arrow::{
     ArrowFileReader, ArrowReader as IcebergArrowReader, PROJECTED_PARTITION_VALUE_COLUMN,
@@ -86,7 +87,7 @@ use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestList, Struct,
-    deserialize_data_file_from_json, serialize_data_file_to_json,
+    Type as IcebergType, deserialize_data_file_from_json, serialize_data_file_to_json,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -152,6 +153,16 @@ const MERGE_SHRED_PROBE_FILES: usize = 16;
 /// Bounded low: each writer buffers its own parquet row groups, so memory
 /// scales with pool size on wide rows.
 const MOR_DEFAULT_WRITE_WORKERS: usize = 4;
+
+/// Cap on lazily-spawned PER-LAYOUT writers for shredded-passthrough fetches
+/// (one writer task per distinct on-disk variant shredding layout seen among
+/// the late-fetched files, beyond the primary pool). A duck-shredded estate
+/// varies its `typed_value` child set per file; each distinct layout gets its
+/// own writer so those batches are written VERBATIM — zero per-row variant
+/// work. Batches whose layout arrives after the cap fall back to the primary
+/// pool, which folds them to canonical and kernel-re-shreds (today's bounded
+/// cost) — degradation, never an error.
+const MOR_MAX_LAYOUT_WRITERS: usize = 8;
 
 /// Concurrent deletion-vector (Puffin) uploads during DV construction.
 const MOR_DV_WRITE_CONCURRENCY: usize = 8;
@@ -282,8 +293,14 @@ struct WriterCtx {
     clauses: Arc<Vec<MorClausePlan>>,
     /// Plain shredding types per variant column (empty = canonical output).
     shred_plain: HashMap<String, DataType>,
-    /// Writer schema overrides matching the shredded batches.
+    /// PRIMARY writer schema overrides (the footer-derived layout kernel
+    /// output conforms to). Per-layout writers carry their own override maps
+    /// layered over this one.
     shred_overrides: HashMap<String, DataType>,
+    /// Names of every VARIANT column in the table schema — the routing +
+    /// adopt checks work off names, independent of what the layout probe
+    /// happened to derive.
+    variant_columns: HashSet<String>,
     /// One id per merge — combined with the worker index for file names.
     run_id: Uuid,
     deadline: Option<std::time::Instant>,
@@ -312,38 +329,111 @@ enum WriteItem {
 /// under backpressure. Parallelizing here (not via input partitioning)
 /// keeps the matched-row bookkeeping — the double-match guard and the
 /// per-file DV consolidation — on the single consuming thread.
+///
+/// Shredded passthrough adds LAYOUT ROUTING on top: a late-fetched batch
+/// whose shredded variant columns differ from the primary writer layout is
+/// routed to a lazily-spawned writer dedicated to exactly that layout, so
+/// the batch is written VERBATIM (a parquet file carries ONE schema — mixing
+/// layouts in one writer would force a per-row fold + re-shred round-trip,
+/// the exact cost passthrough removes). Layouts beyond
+/// [`MOR_MAX_LAYOUT_WRITERS`] fall back to the primary pool, which folds
+/// them to canonical and kernel-re-shreds — bounded degradation, never an
+/// error.
 struct WriterPool {
+    ctx: Arc<WriterCtx>,
     txs: Vec<tokio::sync::mpsc::Sender<WriteItem>>,
     handles: Vec<tokio::task::JoinHandle<DFResult<Vec<DataFile>>>>,
     next: usize,
+    /// Layout signature (sorted `(column, shredded type)` pairs of the
+    /// columns that differ from the primary overrides) -> that layout's
+    /// dedicated writer.
+    layout_txs: HashMap<Vec<(String, DataType)>, tokio::sync::mpsc::Sender<WriteItem>>,
     deadline: Option<std::time::Instant>,
 }
 
 impl WriterPool {
     fn spawn(ctx: Arc<WriterCtx>, workers: usize) -> Self {
         let deadline = ctx.deadline;
+        let primary = Arc::new(ctx.shred_overrides.clone());
         let mut txs = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
         for idx in 0..workers {
             let (tx, rx) = tokio::sync::mpsc::channel::<WriteItem>(2);
-            handles.push(tokio::spawn(writer_task(Arc::clone(&ctx), idx, rx)));
+            handles.push(tokio::spawn(writer_task(
+                Arc::clone(&ctx),
+                format!("w{idx}"),
+                rx,
+                Arc::clone(&primary),
+            )));
             txs.push(tx);
         }
         Self {
+            ctx,
             txs,
             handles,
             next: 0,
+            layout_txs: HashMap::new(),
             deadline,
         }
     }
 
+    /// The batch's variant-layout signature: the shredded variant columns
+    /// whose arrow type differs from the primary writer layout, sorted by
+    /// name. Empty = the batch writes through the primary pool as-is
+    /// (canonical columns, or shredded columns already AT the primary
+    /// layout).
+    fn layout_signature(&self, batch: &RecordBatch) -> Vec<(String, DataType)> {
+        let mut sig: Vec<(String, DataType)> = batch
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| {
+                self.ctx.variant_columns.contains(f.name())
+                    && is_shredded_variant_type(f.data_type())
+                    && self.ctx.shred_overrides.get(f.name().as_str()) != Some(f.data_type())
+            })
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect();
+        sig.sort_by(|a, b| a.0.cmp(&b.0));
+        sig
+    }
+
     async fn dispatch(&mut self, item: WriteItem) -> DFResult<()> {
-        let i = self.next % self.txs.len();
-        self.next += 1;
+        let sig = match &item {
+            WriteItem::Fetched { batch, .. } => self.layout_signature(batch),
+            WriteItem::Insert { .. } => Vec::new(),
+        };
+        let tx = if sig.is_empty() {
+            let i = self.next % self.txs.len();
+            self.next += 1;
+            self.txs[i].clone()
+        } else if let Some(tx) = self.layout_txs.get(&sig) {
+            tx.clone()
+        } else if self.layout_txs.len() < MOR_MAX_LAYOUT_WRITERS {
+            // First batch of a new layout: spawn its dedicated writer with
+            // the primary overrides overlaid by this layout's columns.
+            let mut overrides = self.ctx.shred_overrides.clone();
+            overrides.extend(sig.iter().cloned());
+            let (tx, rx) = tokio::sync::mpsc::channel::<WriteItem>(2);
+            self.handles.push(tokio::spawn(writer_task(
+                Arc::clone(&self.ctx),
+                format!("l{}", self.layout_txs.len()),
+                rx,
+                Arc::new(overrides),
+            )));
+            self.layout_txs.insert(sig, tx.clone());
+            tx
+        } else {
+            // Layout-writer cap reached: the primary pool folds + re-shreds
+            // this batch (bounded fallback).
+            let i = self.next % self.txs.len();
+            self.next += 1;
+            self.txs[i].clone()
+        };
         with_deadline(
             self.deadline,
             "dispatching merge output to a writer",
-            self.txs[i].send(item),
+            tx.send(item),
         )
         .await?
         .map_err(|_| DataFusionError::Internal("merge writer task terminated early".to_string()))
@@ -352,6 +442,7 @@ impl WriterPool {
     /// Close every writer and collect the data files they produced.
     async fn finish(self) -> DFResult<Vec<DataFile>> {
         drop(self.txs);
+        drop(self.layout_txs);
         let mut files = Vec::new();
         for h in self.handles {
             let joined = with_deadline(self.deadline, "closing merge writers", h)
@@ -367,11 +458,14 @@ impl WriterPool {
 
 /// One writer task: builds full-width rows for its items, shreds/partitions
 /// them, and writes through its own rolling writer chain. The writer is
-/// created lazily so an idle worker leaves no file behind.
+/// created lazily so an idle worker leaves no file behind. `overrides` is
+/// THIS task's variant writer layout (primary pool: the footer-derived
+/// layout; per-layout writers: that layout overlaid on the primary).
 async fn writer_task(
     ctx: Arc<WriterCtx>,
-    idx: usize,
+    tag: String,
     mut rx: tokio::sync::mpsc::Receiver<WriteItem>,
+    overrides: Arc<HashMap<String, DataType>>,
 ) -> DFResult<Vec<DataFile>> {
     let table_props = ctx
         .table
@@ -380,11 +474,11 @@ async fn writer_task(
         .map_err(to_datafusion_error)?;
     let parquet_writer_builder =
         ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())
-            .with_variant_shred_types(ctx.shred_overrides.clone());
+            .with_variant_shred_types((*overrides).clone());
     let location_generator =
         DefaultLocationGenerator::new(ctx.table.metadata()).map_err(to_datafusion_error)?;
     let file_name_generator = DefaultFileNameGenerator::new(
-        format!("merge-{}-w{idx}", ctx.run_id),
+        format!("merge-{}-{tag}", ctx.run_id),
         None,
         DataFileFormat::Parquet,
     );
@@ -442,21 +536,37 @@ async fn writer_task(
                 &ctx.clauses,
                 &update_values,
                 &ctx.table_arrow,
-                &ctx.shred_overrides,
             )?,
         };
         for out in outs {
-            // Shredded passthrough: columns already carrying the writer's
-            // shredded type (a passthrough late-fetch) skip the shred kernel;
-            // canonical columns (INSERT rows, or folded fetches from
-            // non-matching files) are shredded as usual.
+            // Shredded passthrough: columns already carrying THIS writer's
+            // shredded type (a passthrough late-fetch routed here by layout)
+            // skip all variant work. A shredded column at a DIFFERENT layout
+            // (the layout-writer-cap overflow fallback) folds to canonical
+            // first — per-row, bounded — then rides the kernel path below
+            // with the canonical columns (INSERT rows, or folded fetches).
+            let to_fold: HashSet<String> = out
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| {
+                    ctx.variant_columns.contains(f.name())
+                        && is_shredded_variant_type(f.data_type())
+                        && overrides.get(f.name().as_str()) != Some(f.data_type())
+                })
+                .map(|f| f.name().clone())
+                .collect();
+            let out = if to_fold.is_empty() {
+                out
+            } else {
+                unshred_batch_columns(&out, &to_fold).map_err(to_datafusion_error)?
+            };
             let to_shred: HashMap<String, DataType> = ctx
                 .shred_plain
                 .iter()
                 .filter(|(name, _)| match out.schema().index_of(name.as_str()) {
                     Ok(i) => {
-                        ctx.shred_overrides.get(name.as_str())
-                            != Some(out.schema().field(i).data_type())
+                        overrides.get(name.as_str()) != Some(out.schema().field(i).data_type())
                     }
                     Err(_) => true,
                 })
@@ -469,8 +579,7 @@ async fn writer_task(
                 // writer layout (child order, BinaryView); conform it —
                 // columnar metadata shuffling, not row work.
                 let shredded = shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?;
-                conform_batch_variants(&shredded, &ctx.shred_overrides)
-                    .map_err(to_datafusion_error)?
+                conform_batch_variants(&shredded, &overrides).map_err(to_datafusion_error)?
             };
             let out = with_partition_column(out, partition_calc.as_ref())?;
             if writer.is_none() {
@@ -511,7 +620,6 @@ fn build_update_rows(
     clauses: &[MorClausePlan],
     update_values: &[Vec<Vec<ArrayRef>>],
     table_arrow: &ArrowSchemaRef,
-    shred_overrides: &HashMap<String, DataType>,
 ) -> DFResult<Vec<RecordBatch>> {
     let fb_schema = fbatch.schema();
     let mut by_clause_chunk: HashMap<(u32, u32), (Vec<u32>, Vec<u32>)> = HashMap::new();
@@ -550,12 +658,14 @@ fn build_update_rows(
                     take(fbatch.column(src_idx).as_ref(), &take_idx, None)?
                 }
             };
-            // Shredded passthrough: a fetched variant column that already
-            // carries the writer's shredded type is adopted verbatim — the
-            // output field takes the shredded type instead of casting the
-            // column back to canonical.
-            let adopt_shredded = assigned.is_none()
-                && shred_overrides.get(field.name().as_str()) == Some(arr.data_type());
+            // Shredded passthrough: a fetched variant column carrying ANY
+            // shredded layout is adopted verbatim — the output field takes
+            // the shredded type instead of casting the column back to
+            // canonical (arrow cast cannot fold a shredded variant anyway).
+            // The writer task then routes/folds by ITS layout: a matching
+            // layout writes the arrays untouched; the overflow fallback
+            // folds per-row.
+            let adopt_shredded = assigned.is_none() && is_shredded_variant_type(arr.data_type());
             let (arr, out_field) = if adopt_shredded {
                 let f = Arc::new(
                     field
@@ -1504,7 +1614,8 @@ async fn run_mor_write(
     // each variant column's layout from the table's existing files, and give
     // the writer the exact shredded arrow types the (shredded) batches will
     // carry. Empty map = canonical output, the untouched default.
-    let shred_pairs = if table_props.parquet_shred_variants {
+    let shred_output = table_props.parquet_shred_variants;
+    let shred_pairs = if shred_output {
         with_deadline(deadline, "deriving the shredding layout", async {
             merge_shred_types(&table, snapshot_id).await
         })
@@ -1555,6 +1666,17 @@ async fn run_mor_write(
                 .min(MOR_DEFAULT_WRITE_WORKERS)
         })
         .max(1);
+    // Every VARIANT column by name — passthrough routing works off the
+    // table schema, independent of which columns the layout probe happened
+    // to derive (a probe that saw only canonical files must not disable
+    // passthrough for shredded victims).
+    let variant_columns: HashSet<String> = table_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| matches!(f.field_type.as_ref(), IcebergType::Variant(_)))
+        .map(|f| f.name.clone())
+        .collect();
     let ctx = Arc::new(WriterCtx {
         table: table.clone(),
         table_schema: table_schema.clone(),
@@ -1562,6 +1684,7 @@ async fn run_mor_write(
         clauses: Arc::clone(&clauses),
         shred_plain,
         shred_overrides,
+        variant_columns,
         run_id: Uuid::now_v7(),
         deadline,
     });
@@ -1765,19 +1888,23 @@ async fn run_mor_write(
         // the ROW GROUPS containing matched positions, via sub-file
         // byte-range tasks over the same pinned snapshot.
         //
-        // Shredded passthrough: when the writer outputs the SAME shredded
-        // layout (`write.parquet.shred-variants`), fetched rows carry their
-        // physical shredded variant columns straight through to the writer —
-        // skipping BOTH the per-row unshred fold at read and the per-row
-        // re-shred at write (the dominant merge cost on shredded estates).
-        // Per file: a non-matching file (canonical, or a different layout)
-        // still folds and re-shreds. Disabled when any SET assignment writes
-        // a variant column (assignments evaluate against the canonical type).
-        let passthrough_ok = !ctx.shred_overrides.is_empty()
+        // Shredded passthrough: under `write.parquet.shred-variants`,
+        // fetched rows carry their physical shredded variant columns
+        // straight through to the writer — skipping BOTH the per-row unshred
+        // fold at read and the per-row re-shred at write (the dominant merge
+        // cost on shredded estates). Per file AND per layout: canonical
+        // files pass through canonically; each shredded file's own layout
+        // rides to a matching per-layout writer (see WriterPool). Gated on
+        // the PROPERTY, not on the layout probe — a probe that saw only
+        // canonical files must not force shredded victims through the fold.
+        // Disabled when any SET assignment writes a variant column
+        // (assignments evaluate against the canonical type).
+        let passthrough_ok = shred_output
+            && !ctx.variant_columns.is_empty()
             && !clauses.iter().any(|c| match &c.action {
                 MorActionPlan::Update(assignments) => assignments
                     .iter()
-                    .any(|(name, _)| ctx.shred_overrides.contains_key(name)),
+                    .any(|(name, _)| ctx.variant_columns.contains(name)),
                 _ => false,
             });
         // The fetch task list: late -> sub-file byte-range tasks covering
@@ -1812,7 +1939,8 @@ async fn run_mor_write(
             reader_builder = reader_builder.with_max_predicate_cache_size(mb * 1024 * 1024);
         }
         if passthrough_ok {
-            reader_builder = reader_builder.with_shredded_passthrough(ctx.shred_overrides.clone());
+            reader_builder =
+                reader_builder.with_shredded_passthrough(ctx.variant_columns.clone());
         }
         // Byte-aware decode batches: without a hint the parquet reader's
         // default row-count batches multiply per-row width unboundedly —

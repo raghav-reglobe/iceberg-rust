@@ -17,10 +17,8 @@
 
 //! Parquet file data reader
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
-
-use arrow_schema::DataType;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::scan_memory_gate::ScanMemoryGate;
@@ -62,7 +60,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
-    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    shredded_passthrough: Option<Arc<HashSet<String>>>,
     data_bytes_cache: Option<DataBytesCache>,
     scan_memory_gate: Option<Arc<dyn ScanMemoryGate>>,
 }
@@ -107,15 +105,20 @@ impl ArrowReaderBuilder {
     }
 
     /// Shredded variant passthrough: keep the named variant columns in their
-    /// physical SHREDDED shape when a file's on-disk type equals the expected
-    /// type (map value), instead of folding them back to the canonical
-    /// `{metadata, value}` form. Decided per file — non-matching files still
-    /// fold. Consumers must accept the shredded struct type verbatim (the MoR
-    /// merge writer under `write.parquet.shred-variants` does: its writer
-    /// schema carries the same shredded layout, so the fold + re-shred
-    /// round-trip is skipped entirely).
-    pub fn with_shredded_passthrough(mut self, expected_types: HashMap<String, DataType>) -> Self {
-        self.shredded_passthrough = Some(Arc::new(expected_types));
+    /// physical SHREDDED shape — whatever per-file `typed_value` layout the
+    /// file carries — instead of folding them back to the canonical
+    /// `{metadata, value}` form (a per-row blob reconstruction). Decided per
+    /// file: canonical files pass through canonically as always, and each
+    /// shredded file's batches carry that FILE's own layout, so batches from
+    /// different files may disagree on the column's arrow type. Consumers
+    /// must accept the shredded struct types verbatim AND tolerate that
+    /// per-file variance (the MoR merge writer under
+    /// `write.parquet.shred-variants` does: it routes appends to per-layout
+    /// writers, so the fold + re-shred round-trip is skipped entirely).
+    /// Names should be VARIANT columns of the table schema; non-variant
+    /// columns are ignored by the per-file gate.
+    pub fn with_shredded_passthrough(mut self, columns: HashSet<String>) -> Self {
+        self.shredded_passthrough = Some(Arc::new(columns));
         self
     }
 
@@ -221,7 +224,7 @@ pub struct ArrowReader {
     /// consuming task.
     runtime: Runtime,
     /// See [`ArrowReaderBuilder::with_shredded_passthrough`].
-    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    shredded_passthrough: Option<Arc<HashSet<String>>>,
     /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
     data_bytes_cache: Option<DataBytesCache>,
     /// See [`ArrowReaderBuilder::with_scan_memory_gate`].

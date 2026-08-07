@@ -39,15 +39,27 @@
 //! (partial shredding) — semantics are unchanged either way, only the
 //! physical layout differs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, new_empty_array};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
-use parquet::variant::{VariantArray, shred_variant};
+use parquet::variant::{VariantArray, shred_variant, unshred_variant};
 
 use crate::spec::{Schema, Type};
 use crate::{Error, ErrorKind, Result};
+
+/// Is this arrow type a SHREDDED variant column layout — a struct carrying a
+/// `typed_value` subtree beside `metadata`? A canonical variant is
+/// `{metadata, value}` with no `typed_value`; anything non-struct is not a
+/// variant layout at all. Callers deciding passthrough MUST pair this with an
+/// iceberg-schema check that the column really is `Type::Variant` — a plain
+/// struct column could carry these child names by coincidence.
+pub fn is_shredded_variant_type(t: &DataType) -> bool {
+    matches!(t, DataType::Struct(sub)
+        if sub.iter().any(|f| f.name() == "metadata")
+            && sub.iter().any(|f| f.name() == "typed_value"))
+}
 
 /// Is this field a `{value?, typed_value?}` shred node — the wrapper
 /// `shred_variant` puts around each shredded object field / array element?
@@ -145,6 +157,96 @@ pub fn shred_types_with_arrow_from_file_schema(
     out
 }
 
+/// Fold one SHREDDED variant column back to the canonical
+/// `Struct([metadata: Binary, value: Binary])` layout via arrow-rs's
+/// [`unshred_variant`] kernel. Per-row blob reconstruction — the exact cost
+/// the shredded-passthrough paths exist to avoid; this is the shared,
+/// bounded fallback for columns that cannot ride a passthrough writer.
+/// The returned field keeps `field`'s name, metadata and nullability.
+pub fn fold_shredded_column(field: &Field, col: &ArrayRef) -> Result<(Field, ArrayRef)> {
+    let variant = VariantArray::try_new(col.as_ref()).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("column {} is not a variant array", field.name()),
+        )
+        .with_source(e)
+    })?;
+    let unshredded = unshred_variant(&variant).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("unshredding column {}", field.name()),
+        )
+        .with_source(e)
+    })?;
+    let inner: StructArray = unshredded.into_inner();
+    let metadata = inner.column_by_name("metadata").ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "unshredded variant is missing its 'metadata' field",
+        )
+    })?;
+    let value = inner.column_by_name("value").ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "unshredded variant is missing its 'value' field",
+        )
+    })?;
+    // `unshred_variant` emits BinaryView; canonical iceberg variant carries
+    // plain Binary.
+    let metadata = arrow_cast::cast(metadata.as_ref(), &DataType::Binary)?;
+    let value = arrow_cast::cast(value.as_ref(), &DataType::Binary)?;
+    let sub_fields = Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+    ]);
+    let folded = StructArray::new(
+        sub_fields.clone(),
+        vec![metadata, value],
+        col.nulls().cloned(),
+    );
+    let new_field = Field::new(
+        field.name(),
+        DataType::Struct(sub_fields),
+        field.is_nullable(),
+    )
+    .with_metadata(field.metadata().clone());
+    Ok((new_field, Arc::new(folded) as ArrayRef))
+}
+
+/// Fold exactly the NAMED shredded variant columns of a batch back to the
+/// canonical layout (see [`fold_shredded_column`]). Named columns that are
+/// not shredded (already canonical) pass through untouched.
+pub fn unshred_batch_columns(batch: &RecordBatch, columns: &HashSet<String>) -> Result<RecordBatch> {
+    if columns.is_empty() {
+        return Ok(batch.clone());
+    }
+    let schema = batch.schema();
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut changed = false;
+    for name in columns {
+        let Ok(idx) = schema.index_of(name) else {
+            continue;
+        };
+        if !is_shredded_variant_type(fields[idx].data_type()) {
+            continue;
+        }
+        let (new_field, folded) = fold_shredded_column(&fields[idx], &cols[idx])?;
+        fields[idx] = Arc::new(new_field);
+        cols[idx] = folded;
+        changed = true;
+    }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    let new_schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, cols)
+        .map_err(|e| Error::new(ErrorKind::DataInvalid, "rebuilding folded batch").with_source(e))
+}
+
 /// Are two shredded layouts the SAME SHAPE modulo child order and
 /// Binary/BinaryView leaves — i.e. can [`conform_variant_to_type`] map one
 /// onto the other losslessly? False when either side has a child the other
@@ -186,7 +288,24 @@ pub fn conform_variant_to_type(arr: &ArrayRef, target: &DataType) -> Result<Arra
         return Ok(Arc::clone(arr));
     }
     match (arr.data_type(), target) {
-        (DataType::Struct(_), DataType::Struct(tchildren)) => {
+        (DataType::Struct(schildren), DataType::Struct(tchildren)) => {
+            // A source child ABSENT from the target would be silently
+            // dropped — for a `typed_value` subtree that is data loss (those
+            // values are NOT duplicated in the binary `value` residual).
+            // Callers must fold + re-shred such columns instead.
+            if let Some(extra) = schildren
+                .iter()
+                .find(|sf| !tchildren.iter().any(|tf| tf.name() == sf.name()))
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "conforming variant layout: target lacks source child `{}` — \
+                         dropping it would lose shredded values",
+                        extra.name()
+                    ),
+                ));
+            }
             let src = arr
                 .as_any()
                 .downcast_ref::<StructArray>()
@@ -541,5 +660,107 @@ mod tests {
     #[test]
     fn variant_count() {
         assert_eq!(variant_column_count(&table_schema()), 1);
+    }
+
+    #[test]
+    fn shredded_variant_type_detection() {
+        assert!(!is_shredded_variant_type(&canonical_type()));
+        assert!(!is_shredded_variant_type(&DataType::Int64));
+        let plain = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]));
+        let arr = canonical_doc_array(&[Some(doc_bytes(1, &[]))]);
+        let variant = VariantArray::try_new(&arr).unwrap();
+        let shredded = ArrayRef::from(shred_variant(&variant, &plain).unwrap());
+        assert!(is_shredded_variant_type(shredded.data_type()));
+    }
+
+    /// Conforming a shredded layout to a target that LACKS one of its
+    /// `typed_value` children must refuse — silently dropping the child
+    /// would lose the shredded values (they are not in the `value` residual).
+    #[test]
+    fn conform_refuses_dropping_source_children() {
+        let wide = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let rows = vec![Some(doc_bytes(1, &[10]))];
+        let arr = canonical_doc_array(&rows);
+        let variant = VariantArray::try_new(&arr).unwrap();
+        let shredded = ArrayRef::from(shred_variant(&variant, &wide).unwrap());
+
+        // Target: the same layout with the `b` shred node removed from the
+        // typed_value subtree.
+        let DataType::Struct(root) = shredded.data_type() else {
+            panic!("shredded root is a struct");
+        };
+        let narrowed: Vec<Field> = root
+            .iter()
+            .map(|f| {
+                if f.name() != "typed_value" {
+                    return f.as_ref().clone();
+                }
+                let DataType::Struct(obj) = f.data_type() else {
+                    panic!("typed_value is an object node");
+                };
+                let kept: Vec<Field> = obj
+                    .iter()
+                    .filter(|c| c.name() != "b")
+                    .map(|c| c.as_ref().clone())
+                    .collect();
+                f.as_ref()
+                    .clone()
+                    .with_data_type(DataType::Struct(kept.into()))
+            })
+            .collect();
+        let target = DataType::Struct(narrowed.into());
+
+        let err = conform_variant_to_type(&shredded, &target).unwrap_err();
+        assert!(
+            err.to_string().contains("lose shredded values"),
+            "refusal names the hazard: {err}"
+        );
+    }
+
+    /// `unshred_batch_columns` folds exactly the NAMED shredded columns back
+    /// to canonical — values reconstructed, other columns untouched.
+    #[test]
+    fn unshred_batch_columns_folds_named_only() {
+        let plain = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]));
+        let rows = vec![Some(doc_bytes(7, &[70])), None];
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("doc", canonical_type(), true),
+                Field::new("doc2", canonical_type(), true),
+            ])),
+            vec![canonical_doc_array(&rows), canonical_doc_array(&rows)],
+        )
+        .unwrap();
+        let both = HashMap::from([
+            ("doc".to_string(), plain.clone()),
+            ("doc2".to_string(), plain.clone()),
+        ]);
+        let shredded = shred_record_batch(&batch, &both).unwrap();
+        assert!(is_shredded_variant_type(shredded.column(0).data_type()));
+        assert!(is_shredded_variant_type(shredded.column(1).data_type()));
+
+        let folded =
+            unshred_batch_columns(&shredded, &HashSet::from(["doc".to_string()])).unwrap();
+        // Named column back at canonical shape (metadata + value, no
+        // typed_value); the other keeps its shredded shape.
+        assert!(!is_shredded_variant_type(folded.column(0).data_type()));
+        let DataType::Struct(ch) = folded.column(0).data_type() else {
+            panic!("folded column is a struct");
+        };
+        assert_eq!(
+            ch.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            vec!["metadata", "value"]
+        );
+        assert!(is_shredded_variant_type(folded.column(1).data_type()));
+        // Null slot preserved; values reconstruct.
+        assert!(folded.column(0).is_null(1));
+        let variant = VariantArray::try_new(folded.column(0)).unwrap();
+        let Variant::Object(obj) = variant.value(0) else {
+            panic!("row 0 folds back to an object");
+        };
+        assert_eq!(obj.get("a"), Some(Variant::Int64(7)));
     }
 }

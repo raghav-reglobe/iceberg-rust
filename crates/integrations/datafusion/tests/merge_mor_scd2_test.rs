@@ -1157,8 +1157,14 @@ fn variant_seed_batch(rows: &[(i32, Option<(Vec<u8>, Vec<u8>)>)]) -> RecordBatch
 }
 
 /// Write one SHREDDED seed data file (the layout a shredding engine leaves
-/// behind) and commit it.
-async fn seed_shredded(catalog: &Arc<dyn Catalog>, batch: RecordBatch, plain: &DataType) {
+/// behind) and commit it. Callers seeding more than one file MUST pass
+/// distinct prefixes — the name generator's counter restarts per call.
+async fn seed_shredded_prefixed(
+    catalog: &Arc<dyn Catalog>,
+    batch: RecordBatch,
+    plain: &DataType,
+    prefix: &str,
+) {
     use iceberg::arrow::variant_shred::shred_record_batch as core_shred;
     let table = load_table(catalog).await;
     let plain_map = HashMap::from([("doc".to_string(), plain.clone())]);
@@ -1178,7 +1184,7 @@ async fn seed_shredded(catalog: &Arc<dyn Catalog>, batch: RecordBatch, plain: &D
             .with_variant_shred_types(overrides),
         table.file_io().clone(),
         DefaultLocationGenerator::new(table.metadata()).unwrap(),
-        DefaultFileNameGenerator::new("seed".to_string(), None, DataFileFormat::Parquet),
+        DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet),
     );
     let partition_key = PartitionKey::new(
         table.metadata().default_partition_spec().as_ref().clone(),
@@ -1303,13 +1309,14 @@ async fn merge_shred_write_preserves_shredded_layout() {
         ),
     ]));
     // Seed: ids 1..=2 current, SHREDDED on {a, tags}.
-    seed_shredded(
+    seed_shredded_prefixed(
         &catalog,
         variant_seed_batch(&[
             (1, Some(doc_with_tags(1, &[10, 11]))),
             (2, Some(doc_with_tags(9, &[90]))),
         ]),
         &plain,
+        "seed",
     )
     .await;
 
@@ -1502,6 +1509,166 @@ async fn merge_shred_write_stays_canonical_on_canonical_estate() {
     }
     let state = read_state_ids(&ctx).await;
     assert_eq!(state, vec![(1, false), (1, true)]);
+}
+
+/// Under `write.parquet.shred-variants`, a mixed estate whose files carry
+/// DIFFERENT shredding layouts (duck-style per-file variance) merges with
+/// each late-fetched victim written back in ITS OWN file's layout, verbatim.
+/// The layout probe derives ONE primary layout, and a fold + re-shred of the
+/// other file's victims could only ever produce that primary layout — so
+/// seeing BOTH seed layouts among the merge outputs is behavioral proof the
+/// typed passthrough (reader fold-skip + per-layout writer routing) engaged.
+/// Canonical victims and inserts keep riding the kernel to the primary
+/// layout, and values survive every path exactly.
+#[tokio::test]
+async fn merge_shred_write_preserves_per_file_layouts() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = variant_table(
+        &warehouse,
+        HashMap::from([(
+            "write.parquet.shred-variants".to_string(),
+            "true".to_string(),
+        )]),
+    )
+    .await;
+
+    // Layout A types only `a`; layout B types `a` AND `tags`.
+    let plain_a = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]));
+    let plain_b = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+            true,
+        ),
+    ]));
+    seed_shredded_prefixed(
+        &catalog,
+        variant_seed_batch(&[
+            (1, Some(doc_with_tags(1, &[10]))),
+            (2, Some(doc_with_tags(2, &[20]))),
+        ]),
+        &plain_a,
+        "seed-a",
+    )
+    .await;
+    seed_shredded_prefixed(
+        &catalog,
+        variant_seed_batch(&[(3, Some(doc_with_tags(3, &[30, 31])))]),
+        &plain_b,
+        "seed-b",
+    )
+    .await;
+    // Canonical seed: id 5 (no typed_value anywhere).
+    let table = load_table(&catalog).await;
+    let data_files = write_one_data_file(
+        &table,
+        variant_seed_batch(&[(5, Some(doc_with_tags(5, &[50])))]),
+    )
+    .await;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+
+    // The two shredded seed files' own on-disk types, read back from their
+    // footers (Binary leaves, file child order) — the layouts the merge
+    // must preserve.
+    let table = load_table(&catalog).await;
+    let mut seed_types: Vec<DataType> = Vec::new();
+    for p in live_data_paths(&table).await {
+        let t = doc_type_of(&table, &p).await;
+        if matches!(&t, DataType::Struct(ch) if ch.iter().any(|c| c.name() == "typed_value")) {
+            seed_types.push(t);
+        }
+    }
+    assert_eq!(seed_types.len(), 2, "two shredded seed files");
+    assert_ne!(seed_types[0], seed_types[1], "the seed layouts differ");
+
+    // Update ids 1 (layout A), 3 (layout B), 5 (canonical); insert id 9.
+    let ctx = variant_session(&catalog, &[
+        (1, Some(doc_with_tags(11, &[110])), 20, 200),
+        (3, Some(doc_with_tags(13, &[130])), 20, 201),
+        (5, Some(doc_with_tags(15, &[150])), 20, 202),
+        (9, Some(doc_with_tags(19, &[190])), 20, 203),
+    ])
+    .await;
+    ctx.sql(&variant_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    let mut merge_types: Vec<DataType> = Vec::new();
+    for p in live_data_paths(&table).await {
+        if p.contains("merge-") {
+            merge_types.push(doc_type_of(&table, &p).await);
+        }
+    }
+    // BOTH seed layouts appear among the merge outputs, verbatim — the
+    // passthrough proof (a folded victim could only re-shred to the single
+    // primary layout).
+    for st in &seed_types {
+        assert!(
+            merge_types.iter().any(|t| t == st),
+            "seed layout {st:?} not preserved among merge outputs: {merge_types:?}"
+        );
+    }
+
+    // Values exact on every path. Current rows: batch versions of 1/3/5,
+    // untouched 2, inserted 9.
+    let read_docs = |sql: String| {
+        let ctx = ctx.clone();
+        async move {
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            let mut rows: Vec<(i32, Option<i64>, Option<i64>)> = Vec::new();
+            for b in &batches {
+                let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let a = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let t0 = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((
+                        ids.value(i),
+                        a.is_valid(i).then(|| a.value(i)),
+                        t0.is_valid(i).then(|| t0.value(i)),
+                    ));
+                }
+            }
+            rows
+        }
+    };
+    let current = read_docs(format!(
+        "SELECT id, variant_get_bigint(doc, '$.a') AS a, \
+                variant_get_bigint(doc, '$.tags[0]') AS t0 \
+         FROM {CATALOG}.{NS}.{TABLE} WHERE _is_current ORDER BY id"
+    ))
+    .await;
+    assert_eq!(current, vec![
+        (1, Some(11), Some(110)),
+        (2, Some(2), Some(20)),
+        (3, Some(13), Some(130)),
+        (5, Some(15), Some(150)),
+        (9, Some(19), Some(190)),
+    ]);
+    // Demoted rows — the late-fetched victims that traveled the passthrough
+    // (or, for id 5, the canonical kernel path) — keep their OLD values.
+    let demoted = read_docs(format!(
+        "SELECT id, variant_get_bigint(doc, '$.a') AS a, \
+                variant_get_bigint(doc, '$.tags[0]') AS t0 \
+         FROM {CATALOG}.{NS}.{TABLE} WHERE NOT _is_current ORDER BY id"
+    ))
+    .await;
+    assert_eq!(demoted, vec![
+        (1, Some(1), Some(10)),
+        (3, Some(3), Some(30)),
+        (5, Some(5), Some(50)),
+    ]);
 }
 
 /// Sorted (id, _is_current) projection — a minimal state read for the

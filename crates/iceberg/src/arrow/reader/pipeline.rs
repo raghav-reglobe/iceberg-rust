@@ -24,14 +24,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
-use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use arrow_select::filter::filter_record_batch;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, RowNumber};
 use parquet::encryption::decrypt::FileDecryptionProperties;
-use parquet::variant::{VariantArray, unshred_variant};
 
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
@@ -45,6 +44,7 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_memory_gate::{GateGuard, ScanMemoryGate};
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::arrow::value::arrow_primitive_to_literal;
+use crate::arrow::variant_shred::{fold_shredded_column, is_shredded_variant_type};
 use crate::cache::DataBytesCache;
 use crate::encryption::StandardKeyMetadata;
 use crate::error::Result;
@@ -54,7 +54,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{DataContentType, Datum};
+use crate::spec::{DataContentType, Datum, Type};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -195,12 +195,12 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
-    /// Shredded variant passthrough: column name -> the EXACT shredded Arrow
-    /// type the consumer accepts verbatim. Per FILE, a variant column whose
-    /// physical type equals the expected type skips the unshred fold (and the
-    /// transformer targets the shredded type); any other layout — canonical,
-    /// or a different shredding — folds to canonical as usual.
-    shredded_passthrough: Option<Arc<HashMap<String, DataType>>>,
+    /// Shredded variant passthrough: names of VARIANT columns whose physical
+    /// SHREDDED shape the consumer accepts verbatim, whatever per-file layout
+    /// that is. Per FILE, a named variant column that is shredded on disk
+    /// skips the unshred fold (and the transformer targets that file's own
+    /// shredded type); canonical files pass through canonically as always.
+    shredded_passthrough: Option<Arc<HashSet<String>>>,
     /// See [`ArrowReaderBuilder::with_data_bytes_cache`].
     data_bytes_cache: Option<DataBytesCache>,
     /// See [`ArrowReaderBuilder::with_scan_memory_gate`].
@@ -504,20 +504,26 @@ impl FileScanTaskReader {
         }
 
         // Shredded variant passthrough — decided PER FILE from its physical
-        // schema: only a column whose on-disk type is byte-for-byte the
-        // expected shredded type skips the fold; mixed estates (canonical
-        // files alongside shredded ones) keep folding file-by-file.
+        // schema: a named VARIANT column that is shredded on disk skips the
+        // fold and flows through in that FILE's own shredded layout (the
+        // transformer targets it via a per-task type override). Mixed
+        // estates are fine: canonical files pass through canonically, and
+        // differently-shredded files each carry their own layout — the
+        // consumer (the MoR merge writer's per-layout routing) owns the
+        // variance. The iceberg-schema Variant check keeps a coincidentally
+        // shaped plain struct column from being hijacked.
         let mut fold_skip: HashSet<String> = HashSet::new();
         if let Some(pass) = &self.shredded_passthrough {
             let file_schema = record_batch_stream_builder.schema();
-            for (name, expected) in pass.iter() {
+            for name in pass.iter() {
                 if let Ok(field) = file_schema.field_with_name(name)
-                    && field.data_type() == expected
+                    && is_shredded_variant_type(field.data_type())
                     && let Some(iceberg_field) = task.schema.field_by_name(name)
+                    && matches!(iceberg_field.field_type.as_ref(), Type::Variant(_))
                 {
                     fold_skip.insert(name.clone());
                     record_batch_transformer_builder = record_batch_transformer_builder
-                        .with_type_override(iceberg_field.id, expected.clone());
+                        .with_type_override(iceberg_field.id, field.data_type().clone());
                 }
             }
         }
@@ -1045,10 +1051,7 @@ fn unshred_variant_columns(batch: RecordBatch, skip: &HashSet<String>) -> Result
     // A column in `skip` (shredded passthrough) is deliberately left in its
     // physical shredded shape.
     let needs_unshred = |field: &Field| -> bool {
-        !skip.contains(field.name())
-            && matches!(field.data_type(), DataType::Struct(sub)
-            if sub.iter().any(|f| f.name() == "metadata")
-                && sub.iter().any(|f| f.name() == "typed_value"))
+        !skip.contains(field.name()) && is_shredded_variant_type(field.data_type())
     };
 
     if !schema.fields().iter().any(|f| needs_unshred(f)) {
@@ -1061,57 +1064,11 @@ fn unshred_variant_columns(batch: RecordBatch, skip: &HashSet<String>) -> Result
     for (idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(idx);
         if needs_unshred(field) {
-            // `unshred_variant` returns a variant whose `metadata`/`value` are
-            // BinaryView; cast them to Binary to match iceberg's canonical type.
-            let variant = VariantArray::try_new(col.as_ref())?;
-            let unshredded = unshred_variant(&variant)?;
-            let inner: StructArray = unshredded.into_inner();
-
-            let metadata = inner
-                .column_by_name("metadata")
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "unshredded variant is missing its 'metadata' field",
-                    )
-                })?
-                .clone();
-            let value = inner
-                .column_by_name("value")
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "unshredded variant is missing its 'value' field",
-                    )
-                })?
-                .clone();
-
-            let metadata = arrow_cast::cast(metadata.as_ref(), &DataType::Binary)?;
-            let value = arrow_cast::cast(value.as_ref(), &DataType::Binary)?;
-
-            // Canonical variant sub-fields: metadata + value, both Binary,
-            // non-null, NO field ids (variant internals).
-            let sub_fields = Fields::from(vec![
-                Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, false),
-            ]);
-            let new_struct = StructArray::new(
-                sub_fields.clone(),
-                vec![metadata, value],
-                // Preserve the top-level column's null buffer.
-                col.nulls().cloned(),
-            );
-
-            // Keep the original top-level field's name + field-id metadata + nullability.
-            let new_field = Field::new(
-                field.name(),
-                DataType::Struct(sub_fields),
-                field.is_nullable(),
-            )
-            .with_metadata(field.metadata().clone());
-
+            // Shared per-row fold: `unshred_variant` + view->Binary casts,
+            // preserving the field's name + field-id metadata + nullability.
+            let (new_field, folded) = fold_shredded_column(field, col)?;
             new_fields.push(new_field);
-            new_columns.push(Arc::new(new_struct) as ArrayRef);
+            new_columns.push(folded);
         } else {
             new_fields.push(field.as_ref().clone());
             new_columns.push(Arc::clone(col));
@@ -2285,5 +2242,154 @@ mod tests {
         let folded_out = out.column_by_name("folded").unwrap().as_struct();
         assert!(folded_out.column_by_name("typed_value").is_none());
         assert_eq!(folded_out.fields().len(), 2);
+    }
+
+    /// Write one parquet file whose field-id'd `doc` VARIANT column is either
+    /// SHREDDED (typing `$.a` as Int64) or canonical; return its path.
+    fn write_variant_parquet(dir: &str, name: &str, shredded: bool) -> String {
+        use arrow_array::{BinaryArray, StructArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+        use parquet::variant::VariantBuilder;
+
+        use crate::arrow::variant_shred::shred_record_batch;
+
+        let mut builder = VariantBuilder::new();
+        let mut obj = builder.new_object();
+        obj.insert("a", 7i64);
+        obj.finish();
+        let (meta, value) = builder.finish();
+
+        let canonical_fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+        ]);
+        let doc = Arc::new(StructArray::new(
+            canonical_fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values([meta])) as ArrayRef,
+                Arc::new(BinaryArray::from_iter_values([value])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true])),
+        )) as ArrayRef;
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let doc_field = Field::new("doc", DataType::Struct(canonical_fields), true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )]));
+        let schema = Arc::new(ArrowSchema::new(vec![id_field, doc_field]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            doc,
+        ])
+        .unwrap();
+        let batch = if shredded {
+            let plain = DataType::Struct(
+                vec![Field::new("a", DataType::Int64, true)]
+                    .into_iter()
+                    .collect::<Fields>(),
+            );
+            shred_record_batch(&batch, &HashMap::from([("doc".to_string(), plain)])).unwrap()
+        } else {
+            batch
+        };
+
+        let path = format!("{dir}/{name}");
+        let file = File::create(&path).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    /// The per-file shredded-passthrough gate: with the column NAMED, a
+    /// SHREDDED file's batches keep that file's own shredded layout (fold
+    /// skipped) while a canonical file's batches stay canonical; without the
+    /// name, both fold to / stay at the canonical `{metadata, value}` shape.
+    #[tokio::test]
+    async fn test_shredded_passthrough_gate_per_file() {
+        use arrow_array::cast::AsArray;
+
+        use crate::spec::VariantType;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+        let shredded_path = write_variant_parquet(dir, "shredded.parquet", true);
+        let canonical_path = write_variant_parquet(dir, "canonical.parquet", false);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "doc", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let read_doc_type = |path: String, passthrough: bool| {
+            let schema = Arc::clone(&schema);
+            async move {
+                let file_io = FileIO::new_with_fs();
+                let mut builder = ArrowReaderBuilder::new(file_io, Runtime::current());
+                if passthrough {
+                    builder =
+                        builder.with_shredded_passthrough(HashSet::from(["doc".to_string()]));
+                }
+                let reader = builder.build();
+                let file_size = std::fs::metadata(&path).unwrap().len();
+                let task = FileScanTask::builder()
+                    .with_file_size_in_bytes(file_size)
+                    .with_start(0)
+                    .with_length(file_size)
+                    .with_data_file_path(path)
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(schema)
+                    .with_project_field_ids(vec![1, 2])
+                    .with_case_sensitive(false)
+                    .build();
+                let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+                let batches: Vec<RecordBatch> = reader
+                    .read(tasks)
+                    .unwrap()
+                    .stream()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.len(), 1);
+                batches[0]
+                    .schema()
+                    .field_with_name("doc")
+                    .unwrap()
+                    .data_type()
+                    .clone()
+            }
+        };
+
+        let is_shredded = |t: &DataType| {
+            matches!(t, DataType::Struct(sub)
+                if sub.iter().any(|f| f.name() == "typed_value"))
+        };
+
+        // Passthrough ON: the shredded file keeps its own layout (with the
+        // typed `a` node), the canonical file stays canonical.
+        let t = read_doc_type(shredded_path.clone(), true).await;
+        assert!(is_shredded(&t), "shredded file passes through: {t:?}");
+        let t = read_doc_type(canonical_path.clone(), true).await;
+        assert!(!is_shredded(&t), "canonical file stays canonical: {t:?}");
+
+        // Passthrough OFF: the shredded file FOLDS to canonical.
+        let t = read_doc_type(shredded_path, false).await;
+        assert!(!is_shredded(&t), "un-named shredded column folds: {t:?}");
+        let t = read_doc_type(canonical_path, false).await;
+        assert!(!is_shredded(&t));
     }
 }
