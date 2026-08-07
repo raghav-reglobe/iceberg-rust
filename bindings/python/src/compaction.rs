@@ -418,9 +418,137 @@ fn expire_snapshots(
     Ok(Some(out.into_any().unbind()))
 }
 
+/// READ-ONLY compaction-plan inspection — the `dry_run_inspect` doctrine for
+/// the rewrite path: load the table, run the SAME planner `compact` uses
+/// (same Config knobs), and return the plan as data. Zero writes, zero
+/// commits. Built for balloon-group diagnosis: per group, the exact file
+/// list (path/size/rows) plus every scan-bound delete file (path/size/type/
+/// equality ids) so a "group N/M balloons" report maps to concrete files.
+///
+/// Returns:
+/// ```text
+/// {"groups": [{"partition": str, "total_size_bytes": int,
+///              "delete_file_count": int,
+///              "files": [{"path", "size_bytes", "rows", "n_deletes"}...],
+///              "deletes": [{"path", "size_bytes", "type", "n_eq_ids",
+///                           "bound_files"}...]}],   # deduped per group
+///  "skipped_files": int, "total_input_files": int,
+///  "total_input_bytes": int, "est_output_files": int,
+///  "delete_applicability_len": int}
+/// ```
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, rewrite_all=None))]
+fn plan_inspect(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    target_file_size_bytes: Option<u64>,
+    min_input_files: Option<usize>,
+    delete_file_threshold: Option<usize>,
+    rewrite_all: Option<bool>,
+) -> PyResult<Py<PyAny>> {
+    use pyo3::types::{PyDict, PyList};
+
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    let mut cfg = Config::default();
+    if let Some(v) = target_file_size_bytes {
+        cfg.target_file_size_bytes = v;
+    }
+    if let Some(v) = min_input_files {
+        cfg.min_input_files = v;
+    }
+    if let Some(v) = delete_file_threshold {
+        cfg.delete_file_threshold = v;
+    }
+    if let Some(v) = rewrite_all {
+        cfg.rewrite_all = v;
+    }
+    cfg.validate()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let plan = py.detach(|| {
+        runtime().block_on(async move {
+            let builder = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await);
+            let builder = match crate::runtime::global_data_cache().await {
+                Some(dc) => builder.with_data_bytes_cache(dc),
+                None => builder,
+            };
+            let catalog = builder
+                .load(catalog_name.clone(), catalog_props)
+                .await
+                .map_err(|e| {
+                    PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}"))
+                })?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let ident = TableIdent::new(namespace, table_name);
+            let table = catalog
+                .load_table(&ident)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("load table: {e}")))?;
+            iceberg_compaction::engine::plan_table(&table, &cfg)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("plan: {e}")))
+        })
+    })?;
+
+    let out = PyDict::new(py);
+    let groups = PyList::empty(py);
+    for g in &plan.groups {
+        let gd = PyDict::new(py);
+        gd.set_item("partition", &g.partition_key)?;
+        gd.set_item("total_size_bytes", g.total_size_bytes)?;
+        gd.set_item("delete_file_count", g.delete_file_count)?;
+        let files = PyList::empty(py);
+        let mut deletes: HashMap<String, (u64, String, usize, usize)> = HashMap::new();
+        for t in &g.tasks {
+            let fd = PyDict::new(py);
+            fd.set_item("path", t.data_file_path())?;
+            fd.set_item("size_bytes", t.file_size_in_bytes)?;
+            fd.set_item("rows", t.record_count)?;
+            fd.set_item("n_deletes", t.deletes.len())?;
+            files.append(fd)?;
+            for d in &t.deletes {
+                let e = deletes.entry(d.file_path.clone()).or_insert((
+                    d.file_size_in_bytes,
+                    format!("{:?}", d.file_type),
+                    d.equality_ids.as_ref().map(|v| v.len()).unwrap_or(0),
+                    0,
+                ));
+                e.3 += 1;
+            }
+        }
+        gd.set_item("files", files)?;
+        let dl = PyList::empty(py);
+        let mut sorted: Vec<_> = deletes.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (p, (sz, ty, neq, bound)) in sorted {
+            let dd = PyDict::new(py);
+            dd.set_item("path", p)?;
+            dd.set_item("size_bytes", sz)?;
+            dd.set_item("type", ty)?;
+            dd.set_item("n_eq_ids", neq)?;
+            dd.set_item("bound_files", bound)?;
+            dl.append(dd)?;
+        }
+        gd.set_item("deletes", dl)?;
+        groups.append(gd)?;
+    }
+    out.set_item("groups", groups)?;
+    out.set_item("skipped_files", plan.skipped_files)?;
+    out.set_item("total_input_files", plan.total_input_files)?;
+    out.set_item("total_input_bytes", plan.total_input_bytes)?;
+    out.set_item("est_output_files", plan.est_output_files)?;
+    out.set_item("delete_applicability_len", plan.delete_applicability.len())?;
+    Ok(out.into_any().unbind())
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "compaction")?;
     this.add_function(wrap_pyfunction!(compact, &this)?)?;
+    this.add_function(wrap_pyfunction!(plan_inspect, &this)?)?;
     this.add_function(wrap_pyfunction!(rewrite_manifests, &this)?)?;
     this.add_function(wrap_pyfunction!(remove_orphan_files, &this)?)?;
     this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;

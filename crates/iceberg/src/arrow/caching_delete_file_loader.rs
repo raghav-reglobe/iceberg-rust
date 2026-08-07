@@ -819,6 +819,67 @@ impl PartnerAccessor<ArrayRef> for EqDelRecordBatchPartnerAccessor {
 
 #[cfg(test)]
 mod tests {
+
+    /// BALLOON REPRO (specimen #2/#3 diagnosis, 2026-08-07): the per-data-file
+    /// eq-delete UNION at the recorded production shape — order_document
+    /// group 11: ~91 bound eq-delete files x ~1.09M int32 keys each. The
+    /// engine clones set[0] and extends with every other set's cloned keys
+    /// (delete_filter.rs build_equality_delete_sets), so ONE data file's
+    /// private union materializes ~99M EqDeleteKey(Vec<Option<Datum>>)
+    /// entries — measure it. Run explicitly:
+    ///   cargo test -p iceberg --lib eq_delete_union_memory_repro --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn eq_delete_union_memory_repro() {
+        fn maxrss_mb() -> f64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                / 1e3
+        }
+        const FILES: usize = 91;
+        const KEYS_PER_FILE: u64 = 1_090_000;
+        let fields = vec![("id".to_string(), 1i32)];
+        let base = maxrss_mb();
+        // The per-delete-file sets (shared Arcs in production).
+        let sets: Vec<Arc<EqDeleteSet>> = (0..FILES as u64)
+            .map(|f| {
+                let keys: HashSet<EqDeleteKey> = (0..KEYS_PER_FILE)
+                    .map(|k| {
+                        EqDeleteKey(vec![Some(Datum::int(
+                            ((f * KEYS_PER_FILE + k) % i32::MAX as u64) as i32,
+                        ))])
+                    })
+                    .collect();
+                Arc::new(EqDeleteSet {
+                    keys,
+                    fields: fields.clone(),
+                })
+            })
+            .collect();
+        let after_sets = maxrss_mb();
+        // The engine's per-data-file union (delete_filter.rs:259-263 shape).
+        let mut combined = (*sets[0]).clone();
+        for set in &sets[1..] {
+            combined.union(set);
+        }
+        let after_union = maxrss_mb();
+        println!(
+            "shared sets ({} x {}): +{:.1} MB | ONE per-file union ({} keys): +{:.1} MB | peak {:.1} MB",
+            FILES,
+            KEYS_PER_FILE,
+            after_sets - base,
+            combined.keys.len(),
+            after_union - after_sets,
+            after_union
+        );
+        assert_eq!(combined.keys.len() as u64, FILES as u64 * KEYS_PER_FILE);
+    }
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
