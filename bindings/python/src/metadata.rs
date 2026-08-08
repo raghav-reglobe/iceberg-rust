@@ -359,6 +359,199 @@ fn append_window(
     Ok(d.into_any().unbind())
 }
 
+struct DataFileRow {
+    path: String,
+    size: u64,
+    records: Option<u64>,
+    partition: Vec<Option<serde_json::Value>>,
+    n_deletes: usize,
+    bound_lower: Option<serde_json::Value>,
+    bound_upper: Option<serde_json::Value>,
+}
+
+fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
+    use iceberg::spec::{Literal, PrimitiveLiteral};
+    let Literal::Primitive(p) = lit else {
+        return None; // non-primitive partition/bound values are not expected
+    };
+    Some(match p {
+        PrimitiveLiteral::Boolean(v) => serde_json::Value::Bool(*v),
+        PrimitiveLiteral::Int(v) => serde_json::Value::from(*v),
+        PrimitiveLiteral::Long(v) => serde_json::Value::from(*v),
+        PrimitiveLiteral::Float(v) => serde_json::Value::from(v.into_inner()),
+        PrimitiveLiteral::Double(v) => serde_json::Value::from(v.into_inner()),
+        PrimitiveLiteral::String(v) => serde_json::Value::from(v.clone()),
+        _ => return None,
+    })
+}
+
+/// Live DATA-file inventory of the CURRENT snapshot — the facts a
+/// seeding/registration harness needs, WITHOUT a Python Iceberg client.
+/// Returns a list of dicts, sorted by path:
+///
+/// ```text
+/// {"path": str, "file_size_in_bytes": int, "record_count": int|None,
+///  "partition": [json values in DEFAULT-spec field order]  # the same
+///                shape catalog.add_data_files accepts,
+///  "n_deletes": int,          # delete files bound by scan planning
+///  "bound_lower"/"bound_upper": json|None}  # column stats for
+///                `bound_field` (full dotted name), when requested
+/// ```
+///
+/// Scan planning provides path/size/partition/delete bindings; when
+/// `bound_field` is given, a manifest walk (through the parsed-manifest
+/// cache — cache-hot after the plan) merges that field's lower/upper
+/// column-stat bounds by path.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, bound_field=None, timeout_s=None))]
+fn data_files(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    bound_field: Option<String>,
+    timeout_s: Option<u64>,
+) -> PyResult<Py<PyAny>> {
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    let rows: Vec<DataFileRow> = py.detach(|| {
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "listing data files",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                let meta = table.metadata_ref();
+                if meta.current_snapshot().is_none() {
+                    return Ok::<_, PyErr>(vec![]);
+                }
+                let n_spec_fields = meta.default_partition_spec().fields().len();
+
+                let scan = table
+                    .scan()
+                    .build()
+                    .map_err(|e| PyValueError::new_err(format!("building scan: {e}")))?;
+                let tasks: Vec<_> = scan
+                    .plan_files()
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("planning: {e}")))?
+                    .try_collect()
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("planning: {e}")))?;
+
+                let mut rows: Vec<DataFileRow> = tasks
+                    .iter()
+                    .map(|t: &iceberg::scan::FileScanTask| {
+                        let partition = match t.partition.as_ref() {
+                            Some(p) => (0..n_spec_fields)
+                                .map(|i| p.iter().nth(i).flatten().and_then(literal_to_json))
+                                .collect(),
+                            None => vec![None; n_spec_fields],
+                        };
+                        DataFileRow {
+                            path: t.data_file_path.clone(),
+                            size: t.file_size_in_bytes,
+                            records: t.record_count,
+                            partition,
+                            n_deletes: t.deletes.len(),
+                            bound_lower: None,
+                            bound_upper: None,
+                        }
+                    })
+                    .collect();
+
+                if let Some(field_name) = bound_field {
+                    let field = meta
+                        .current_schema()
+                        .field_by_name(&field_name)
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!("bound_field `{field_name}` not found"))
+                        })?;
+                    let field_id = field.id;
+                    let current = meta.current_snapshot().unwrap();
+                    let mlist = table
+                        .manifest_list_reader(current)
+                        .load()
+                        .await
+                        .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
+                    let mut bounds: HashMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
+                        HashMap::new();
+                    for mf in mlist.entries() {
+                        if mf.content != ManifestContentType::Data {
+                            continue;
+                        }
+                        let manifest = table.load_manifest_cached(mf).await.map_err(|e| {
+                            PyValueError::new_err(format!("manifest {}: {e}", mf.manifest_path))
+                        })?;
+                        for entry in manifest.entries() {
+                            if !entry.is_alive() {
+                                continue;
+                            }
+                            let df = entry.data_file();
+                            let lo = df
+                                .lower_bounds()
+                                .get(&field_id)
+                                .and_then(|d| literal_to_json(&d.clone().into()));
+                            let hi = df
+                                .upper_bounds()
+                                .get(&field_id)
+                                .and_then(|d| literal_to_json(&d.clone().into()));
+                            bounds.insert(df.file_path().to_string(), (lo, hi));
+                        }
+                    }
+                    for r in rows.iter_mut() {
+                        if let Some((lo, hi)) = bounds.get(&r.path) {
+                            r.bound_lower = lo.clone();
+                            r.bound_upper = hi.clone();
+                        }
+                    }
+                }
+                rows.sort_by(|a, b| a.path.cmp(&b.path));
+                Ok(rows)
+            },
+        ))
+    })?;
+    let out = PyList::empty(py);
+    for r in &rows {
+        let d = PyDict::new(py);
+        d.set_item("path", &r.path)?;
+        d.set_item("file_size_in_bytes", r.size)?;
+        d.set_item("record_count", r.records)?;
+        let part = PyList::empty(py);
+        for v in &r.partition {
+            match v {
+                None => part.append(py.None())?,
+                Some(j) => part.append(json_value_to_py(py, j)?)?,
+            }
+        }
+        d.set_item("partition", part)?;
+        d.set_item("n_deletes", r.n_deletes)?;
+        d.set_item("bound_lower", opt_json_to_py(py, &r.bound_lower)?)?;
+        d.set_item("bound_upper", opt_json_to_py(py, &r.bound_upper)?)?;
+        out.append(d)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    Ok(match v {
+        serde_json::Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any().unbind(),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py)?.into_any().unbind()
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any().unbind()
+            }
+        }
+        serde_json::Value::String(s) => s.into_pyobject(py)?.into_any().unbind(),
+        other => other.to_string().into_pyobject(py)?.into_any().unbind(),
+    })
+}
+
+fn opt_json_to_py(py: Python<'_>, v: &Option<serde_json::Value>) -> PyResult<Py<PyAny>> {
+    match v {
+        None => Ok(py.None()),
+        Some(j) => json_value_to_py(py, j),
+    }
+}
+
 struct StatsOut {
     data_files: u64,
     data_records: u64,
@@ -450,6 +643,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(append_window, &this)?)?;
     this.add_function(wrap_pyfunction!(manifest_stats, &this)?)?;
     this.add_function(wrap_pyfunction!(location, &this)?)?;
+    this.add_function(wrap_pyfunction!(data_files, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
