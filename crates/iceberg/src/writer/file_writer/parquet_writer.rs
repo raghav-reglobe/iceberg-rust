@@ -532,6 +532,46 @@ impl MinMaxColAggregator {
 }
 
 impl ParquetWriter {
+    /// Converts EXISTING parquet files to data files with EXPLICIT partition
+    /// values (registration — the metadata-only path for adopting files that
+    /// were written out-of-band, e.g. copies of another table's files). The
+    /// caller supplies each file's partition tuple; nothing here derives
+    /// partitions from data or stats. Footers are read for schema metrics
+    /// exactly like [`Self::parquet_files_to_data_files`].
+    pub async fn parquet_files_to_data_files_with_partition(
+        file_io: &FileIO,
+        entries: Vec<(String, Struct)>,
+        table_metadata: &TableMetadata,
+    ) -> Result<Vec<DataFile>> {
+        let mut data_files: Vec<DataFile> = Vec::new();
+        for (file_path, partition) in entries {
+            let input_file = file_io.new_input(&file_path)?;
+            let file_metadata = input_file.metadata().await?;
+            let file_size_in_bytes = file_metadata.size as usize;
+            let reader = input_file.reader().await?;
+
+            let mut parquet_reader = ArrowFileReader::new(file_metadata, reader);
+            let parquet_metadata = parquet_reader.get_metadata(None).await.map_err(|err| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Error reading Parquet metadata: {err}"),
+                )
+            })?;
+            let mut builder = ParquetWriter::parquet_to_data_file_builder(
+                table_metadata.current_schema().clone(),
+                parquet_metadata,
+                file_size_in_bytes,
+                file_path,
+                HashMap::new(),
+            )?;
+            builder.partition_spec_id(table_metadata.default_partition_spec_id());
+            builder.partition(partition);
+            let data_file = builder.build().unwrap();
+            data_files.push(data_file);
+        }
+        Ok(data_files)
+    }
+
     /// Converts parquet files to data files
     #[allow(dead_code)]
     pub(crate) async fn parquet_files_to_data_files(
