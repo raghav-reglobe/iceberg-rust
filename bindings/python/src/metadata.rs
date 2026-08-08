@@ -367,6 +367,7 @@ struct DataFileRow {
     n_deletes: usize,
     bound_lower: Option<serde_json::Value>,
     bound_upper: Option<serde_json::Value>,
+    arrow_schema: Option<Vec<(String, String)>>,
 }
 
 fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
@@ -394,8 +395,13 @@ fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
 ///  "partition": [json values in DEFAULT-spec field order]  # the same
 ///                shape catalog.add_data_files accepts,
 ///  "n_deletes": int,          # delete files bound by scan planning
-///  "bound_lower"/"bound_upper": json|None}  # column stats for
+///  "bound_lower"/"bound_upper": json|None,  # column stats for
 ///                `bound_field` (full dotted name), when requested
+///  "arrow_schema": {field: type_string}|None}  # the parquet FOOTER's
+///                top-level arrow fields, ENGINE-rendered, when
+///                `include_arrow_schema` (physical-layout inspection —
+///                e.g. variant shredding shapes — without a Python
+///                parquet reader)
 /// ```
 ///
 /// Scan planning provides path/size/partition/delete bindings; when
@@ -403,12 +409,13 @@ fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
 /// cache — cache-hot after the plan) merges that field's lower/upper
 /// column-stat bounds by path.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, bound_field=None, timeout_s=None))]
+#[pyo3(signature = (catalog_props, fqn, bound_field=None, include_arrow_schema=false, timeout_s=None))]
 fn data_files(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
     bound_field: Option<String>,
+    include_arrow_schema: bool,
     timeout_s: Option<u64>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
@@ -453,6 +460,7 @@ fn data_files(
                             n_deletes: t.deletes.len(),
                             bound_lower: None,
                             bound_upper: None,
+                            arrow_schema: None,
                         }
                     })
                     .collect();
@@ -503,6 +511,35 @@ fn data_files(
                         }
                     }
                 }
+                if include_arrow_schema {
+                    use iceberg::arrow::ArrowFileReader;
+                    use iceberg::io::FileMetadata;
+                    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+                    for r in rows.iter_mut() {
+                        let input = table
+                            .file_io()
+                            .new_input(&r.path)
+                            .map_err(|e| PyValueError::new_err(format!("{}: {e}", r.path)))?;
+                        let reader = input
+                            .reader()
+                            .await
+                            .map_err(|e| PyValueError::new_err(format!("{}: {e}", r.path)))?;
+                        let mut pr = ArrowFileReader::new(FileMetadata { size: r.size }, reader);
+                        let meta =
+                            ArrowReaderMetadata::load_async(&mut pr, Default::default())
+                                .await
+                                .map_err(|e| {
+                                    PyValueError::new_err(format!("footer {}: {e}", r.path))
+                                })?;
+                        r.arrow_schema = Some(
+                            meta.schema()
+                                .fields()
+                                .iter()
+                                .map(|f| (f.name().clone(), format!("{}", f.data_type())))
+                                .collect(),
+                        );
+                    }
+                }
                 rows.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(rows)
             },
@@ -525,6 +562,16 @@ fn data_files(
         d.set_item("n_deletes", r.n_deletes)?;
         d.set_item("bound_lower", opt_json_to_py(py, &r.bound_lower)?)?;
         d.set_item("bound_upper", opt_json_to_py(py, &r.bound_upper)?)?;
+        match &r.arrow_schema {
+            None => d.set_item("arrow_schema", py.None())?,
+            Some(fields) => {
+                let sd = PyDict::new(py);
+                for (name, ty) in fields {
+                    sd.set_item(name, ty)?;
+                }
+                d.set_item("arrow_schema", sd)?;
+            }
+        }
         out.append(d)?;
     }
     Ok(out.into_any().unbind())
