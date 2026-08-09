@@ -58,6 +58,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::prelude::SessionContext;
+use iceberg::arrow::variant_shred::{fold_shredded_column, is_shredded_variant_type};
 use parquet::variant::{
     GetOptions, VariantArray, VariantArrayBuilder, VariantPath, json_to_variant, variant_get,
     variant_to_json,
@@ -138,6 +139,17 @@ fn input_array(cv: &ColumnarValue, number_rows: usize) -> DFResult<ArrayRef> {
 fn to_canonical(arr: ArrayRef) -> DFResult<ArrayRef> {
     if arr.data_type() == canonical_variant_type() {
         return Ok(arr);
+    }
+    // SHREDDED input folds through the unshred kernel. Never normalize a
+    // shredded struct with per-row `VariantArray::value` — its typed-Struct
+    // arm is an upstream placeholder (arrow-rs #8091) that panics in debug
+    // and silently yields `Variant::Null` in release, so every typed row of
+    // a raw shredded read rendered as JSON "null".
+    if is_shredded_variant_type(arr.data_type()) {
+        let field = Field::new("v", arr.data_type().clone(), true);
+        let (_, folded) =
+            fold_shredded_column(&field, &arr).map_err(|e| DataFusionError::External(e.into()))?;
+        return Ok(folded);
     }
     let variant = VariantArray::try_new(&arr).map_err(DataFusionError::from)?;
     let mut builder = VariantArrayBuilder::new(variant.len());

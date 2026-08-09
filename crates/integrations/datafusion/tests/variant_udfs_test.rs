@@ -205,3 +205,89 @@ async fn non_literal_path_is_rejected() {
         "unexpected error: {err}"
     );
 }
+
+/// Shredded input renders through the fold, never per-row
+/// `VariantArray::value` — whose typed-Struct arm is an upstream
+/// placeholder (arrow-rs #8091) that silently yields `Variant::Null` in
+/// release builds. Before the `to_canonical` fold-first fix, every
+/// typed row of this table rendered as JSON "null" and typed extraction
+/// returned NULL (the shred-gate "L2" class, root-caused 2026-08-08).
+#[tokio::test]
+async fn shredded_input_renders_typed_and_residual_fields() {
+    use parquet::variant::shred_variant;
+
+    let jsons: ArrayRef = Arc::new(StringArray::from(vec![
+        Some(r#"{"qty": 3, "name": "alice", "meta": {"city": "BLR"}}"#),
+        Some(r#"{"qty": 4, "name": "bob"}"#),
+        Some(r#"{"name": "carol"}"#),
+        None,
+    ]));
+    let canonical = json_to_variant(&jsons).unwrap();
+    // Shred `qty` typed; `name`/`meta` stay in the residual.
+    let shred_type = DataType::Struct(vec![Field::new("qty", DataType::Int64, true)].into());
+    let shredded = ArrayRef::from(shred_variant(&canonical, &shred_type).unwrap());
+    assert!(
+        format!("{:?}", shredded.data_type()).contains("typed_value"),
+        "test setup must produce a shredded layout"
+    );
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("doc", shredded.data_type().clone(), true),
+    ]);
+    let ids: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![ids, shredded]).unwrap();
+
+    let ctx = SessionContext::new();
+    register_variant_functions(&ctx);
+    ctx.register_batch("s", batch).unwrap();
+
+    let json = one_column(&ctx, "SELECT variant_to_json(doc) FROM s ORDER BY id").await;
+    let json = json.as_any().downcast_ref::<StringArray>().unwrap();
+    // Typed AND residual fields present; no "null" placeholder renders.
+    assert!(
+        json.value(0).contains("\"qty\":3"),
+        "typed field lost: {}",
+        json.value(0)
+    );
+    assert!(
+        json.value(0).contains("\"name\":\"alice\""),
+        "residual lost: {}",
+        json.value(0)
+    );
+    assert!(
+        json.value(0).contains("\"city\":\"BLR\""),
+        "nested residual lost: {}",
+        json.value(0)
+    );
+    assert!(
+        json.value(1).contains("\"qty\":4"),
+        "typed field lost: {}",
+        json.value(1)
+    );
+    assert!(
+        json.value(2).contains("\"name\":\"carol\""),
+        "residual-only row lost: {}",
+        json.value(2)
+    );
+    assert!(json.is_null(3), "SQL NULL row must stay NULL");
+
+    let qty = one_column(
+        &ctx,
+        "SELECT variant_get_bigint(doc, '$.qty') FROM s ORDER BY id",
+    )
+    .await;
+    let qty = qty.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(qty.value(0), 3);
+    assert_eq!(qty.value(1), 4);
+    assert!(qty.is_null(2));
+
+    let name = one_column(
+        &ctx,
+        "SELECT variant_get_string(doc, '$.name') FROM s ORDER BY id",
+    )
+    .await;
+    let name = name.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(name.value(0), "alice");
+    assert_eq!(name.value(2), "carol");
+}

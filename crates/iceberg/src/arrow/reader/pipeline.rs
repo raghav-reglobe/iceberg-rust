@@ -2276,11 +2276,9 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             "1".to_string(),
         )]));
-        let doc_field = Field::new("doc", DataType::Struct(canonical_fields), true)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )]));
+        let doc_field = Field::new("doc", DataType::Struct(canonical_fields), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+        );
         let schema = Arc::new(ArrowSchema::new(vec![id_field, doc_field]));
         let batch = RecordBatch::try_new(schema, vec![
             Arc::new(Int32Array::from(vec![1])) as ArrayRef,
@@ -2341,8 +2339,7 @@ mod tests {
                 let file_io = FileIO::new_with_fs();
                 let mut builder = ArrowReaderBuilder::new(file_io, Runtime::current());
                 if passthrough {
-                    builder =
-                        builder.with_shredded_passthrough(HashSet::from(["doc".to_string()]));
+                    builder = builder.with_shredded_passthrough(HashSet::from(["doc".to_string()]));
                 }
                 let reader = builder.build();
                 let file_size = std::fs::metadata(&path).unwrap().len();

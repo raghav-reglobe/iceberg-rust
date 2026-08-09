@@ -216,7 +216,10 @@ pub fn fold_shredded_column(field: &Field, col: &ArrayRef) -> Result<(Field, Arr
 /// Fold exactly the NAMED shredded variant columns of a batch back to the
 /// canonical layout (see [`fold_shredded_column`]). Named columns that are
 /// not shredded (already canonical) pass through untouched.
-pub fn unshred_batch_columns(batch: &RecordBatch, columns: &HashSet<String>) -> Result<RecordBatch> {
+pub fn unshred_batch_columns(
+    batch: &RecordBatch,
+    columns: &HashSet<String>,
+) -> Result<RecordBatch> {
     if columns.is_empty() {
         return Ok(batch.clone());
     }
@@ -487,6 +490,112 @@ pub fn shred_record_batch(
 
 #[cfg(test)]
 mod tests {
+    /// LOCAL-ONLY estate diagnostic: proves the fold loses nothing on a
+    /// real shredded parquet file. For every row of every shredded variant
+    /// column, the fold's output object must contain the union of the
+    /// row's residual-object field names and its typed-present field names
+    /// (a manual reference walk of the physical parts). Run:
+    ///   PQ_FILE=/path/to/file.parquet cargo test -p iceberg \
+    ///     fold_vs_direct_render_diag -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fold_vs_direct_render_diag() {
+        use std::fs::File;
+
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::variant::Variant;
+
+        let path = std::env::var("PQ_FILE").expect("set PQ_FILE");
+        let file = File::open(&path).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder")
+            .with_batch_size(4096)
+            .build()
+            .expect("reader");
+        let mut total = 0usize;
+        let mut diffs = 0usize;
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let schema = batch.schema();
+            for (ci, f) in schema.fields().iter().enumerate() {
+                if !is_shredded_variant_type(f.data_type()) {
+                    continue;
+                }
+                let col = batch.column(ci);
+                use arrow_array::cast::AsArray;
+                let direct = VariantArray::try_new(col.as_ref()).expect("direct variant");
+                let (_, folded_col) = fold_shredded_column(f, col).expect("fold");
+                let folded = VariantArray::try_new(folded_col.as_ref()).expect("folded variant");
+                let sa = col.as_struct();
+                let meta_col = sa.column_by_name("metadata").expect("metadata");
+                let val_col = sa.column_by_name("value");
+                let tv_col = sa.column_by_name("typed_value");
+                for row in 0..batch.num_rows() {
+                    if sa.is_null(row) || folded.is_null(row) {
+                        continue;
+                    }
+                    total += 1;
+                    // expected top-level field names: residual-object names
+                    // UNION typed-present names — the manual reference walker.
+                    let mut expected: Vec<String> = Vec::new();
+                    if let Some(vc) = val_col {
+                        if vc.is_valid(row) {
+                            let m = meta_col.as_binary::<i32>().value(row);
+                            let v = vc.as_binary::<i32>().value(row);
+                            if let Ok(Variant::Object(o)) = Variant::try_new(m, v) {
+                                for (k, _) in o.iter() {
+                                    expected.push(k.to_string());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(tv) = tv_col {
+                        if tv.is_valid(row) {
+                            if let Some(tvs) = tv.as_struct_opt() {
+                                for (fi, tf) in tvs.fields().iter().enumerate() {
+                                    let child = tvs.column(fi);
+                                    let Some(cs) = child.as_struct_opt() else {
+                                        continue;
+                                    };
+                                    if cs.is_null(row) {
+                                        continue;
+                                    }
+                                    let present = ["typed_value", "value"].iter().any(|n| {
+                                        cs.column_by_name(n)
+                                            .map(|c| c.is_valid(row))
+                                            .unwrap_or(false)
+                                    });
+                                    if present && !expected.contains(&tf.name().to_string()) {
+                                        expected.push(tf.name().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let bn: Vec<String> = match folded.value(row) {
+                        Variant::Object(o) => o.iter().map(|(k, _)| k.to_string()).collect(),
+                        _ => vec![],
+                    };
+                    let missing: Vec<_> = expected.iter().filter(|k| !bn.contains(*k)).collect();
+                    if !missing.is_empty() {
+                        diffs += 1;
+                        if diffs <= 8 {
+                            println!(
+                                "DROP col={} row={} expected={} folded={} missing={missing:?}",
+                                f.name(),
+                                row,
+                                expected.len(),
+                                bn.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        println!("diag: {total} row-cols compared, {diffs} differ");
+        assert_eq!(diffs, 0, "fold-vs-direct render diffs found");
+    }
+
     use arrow_array::BinaryArray;
     use arrow_buffer::NullBuffer;
     use parquet::variant::{Variant, VariantBuilder};
@@ -742,8 +851,7 @@ mod tests {
         assert!(is_shredded_variant_type(shredded.column(0).data_type()));
         assert!(is_shredded_variant_type(shredded.column(1).data_type()));
 
-        let folded =
-            unshred_batch_columns(&shredded, &HashSet::from(["doc".to_string()])).unwrap();
+        let folded = unshred_batch_columns(&shredded, &HashSet::from(["doc".to_string()])).unwrap();
         // Named column back at canonical shape (metadata + value, no
         // typed_value); the other keeps its shredded shape.
         assert!(!is_shredded_variant_type(folded.column(0).data_type()));

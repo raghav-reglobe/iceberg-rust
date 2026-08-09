@@ -1939,8 +1939,7 @@ async fn run_mor_write(
             reader_builder = reader_builder.with_max_predicate_cache_size(mb * 1024 * 1024);
         }
         if passthrough_ok {
-            reader_builder =
-                reader_builder.with_shredded_passthrough(ctx.variant_columns.clone());
+            reader_builder = reader_builder.with_shredded_passthrough(ctx.variant_columns.clone());
         }
         // Byte-aware decode batches: without a hint the parquet reader's
         // default row-count batches multiply per-row width unboundedly —
