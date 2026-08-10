@@ -28,8 +28,8 @@ use std::io::Cursor;
 
 use arrow::array::RecordBatch;
 use iceberg::atomic_replace::{
-    ReplaceInput, atomic_partition_replace, atomic_partition_replace_key_range,
-    atomic_partition_replace_prefix,
+    ReplaceInput, atomic_partition_append, atomic_partition_replace,
+    atomic_partition_replace_key_range, atomic_partition_replace_prefix,
 };
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -327,11 +327,71 @@ fn bronze_replace_range(
     })
 }
 
+/// Atomically APPEND rows into the NULL slot of the `partition_column`
+/// identity partition — the streaming-consumer (kafka → bronze) write: no
+/// deletes, ONE RowDelta append snapshot at snapshot isolation carrying
+/// `snapshot_properties` in its summary (the consumer's exactly-once offset
+/// ledger, e.g. `pulse.kafka.offset.<topic>`). Input rows are conformed to
+/// the table schema BY NAME (string columns targeting VARIANT are parsed as
+/// JSON). A ZERO-ROW input is a NO-OP (no snapshot — the ledger only
+/// advances with data). Returns `{snapshot_id, rows_appended, attempts}`.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, batches_ipc, snapshot_properties, partition_column="_is_backfill".to_string(), max_retries=6, parquet_path=None))]
+fn bronze_append(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    batches_ipc: Vec<u8>,
+    snapshot_properties: HashMap<String, String>,
+    partition_column: String,
+    max_retries: u32,
+    parquet_path: Option<String>,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    let input = replace_input(&batches_ipc, parquet_path)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let outcome = atomic_partition_append(
+                catalog.as_ref(),
+                &ident,
+                &partition_column,
+                input,
+                snapshot_properties,
+                max_retries,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("atomic append: {e}")))?;
+            Ok(HashMap::from([
+                (
+                    "snapshot_id".to_string(),
+                    outcome
+                        .snapshot_id
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "rows_appended".to_string(),
+                    outcome.rows_appended.to_string(),
+                ),
+                ("attempts".to_string(), outcome.attempts.to_string()),
+            ]))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "replace")?;
     this.add_function(wrap_pyfunction!(bronze_replace, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_prefix, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_range, &this)?)?;
+    this.add_function(wrap_pyfunction!(bronze_append, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }

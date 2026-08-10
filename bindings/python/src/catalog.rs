@@ -459,12 +459,12 @@ fn add_data_files(
                     .ok_or_else(|| PyValueError::new_err(format!("expected int, got {v}")))?
                     as i32,
             )),
-            PrimitiveType::Long
-            | PrimitiveType::Timestamp
-            | PrimitiveType::Timestamptz => Literal::Primitive(PrimitiveLiteral::Long(
-                v.as_i64()
-                    .ok_or_else(|| PyValueError::new_err(format!("expected long, got {v}")))?,
-            )),
+            PrimitiveType::Long | PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+                Literal::Primitive(PrimitiveLiteral::Long(
+                    v.as_i64()
+                        .ok_or_else(|| PyValueError::new_err(format!("expected long, got {v}")))?,
+                ))
+            }
             PrimitiveType::String => Literal::Primitive(PrimitiveLiteral::String(
                 v.as_str()
                     .ok_or_else(|| PyValueError::new_err(format!("expected string, got {v}")))?

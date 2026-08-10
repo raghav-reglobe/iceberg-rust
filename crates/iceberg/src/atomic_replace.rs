@@ -370,6 +370,141 @@ fn is_commit_conflict(e: &Error) -> bool {
             .contains("Found conflicting concurrent commit")
 }
 
+/// Atomically APPEND rows into the NULL slot of the `partition_column`
+/// identity partition — the streaming-consumer (kafka → bronze) write
+/// primitive: no deletes, ONE `RowDelta` append snapshot carrying
+/// caller-supplied summary properties (the consumer's exactly-once ledger,
+/// e.g. `pulse.kafka.offset.<topic>` = last consumed offset — the table
+/// itself is the checkpoint).
+///
+/// Contracts:
+/// - the table's default partition spec must be a single IDENTITY partition
+///   on `partition_column`; appended rows land in its NULL partition (the
+///   CDC slot — a backfill loader owns the non-null value).
+/// - input batches are conformed to the table schema BY NAME (field-id
+///   metadata attached, primitives cast, structs realigned recursively;
+///   string columns targeting a VARIANT column are parsed as JSON).
+/// - a ZERO-ROW input is a NO-OP: no snapshot, no properties — the offset
+///   ledger only ever advances together with data.
+/// - commit conflicts (concurrent maintenance/backfill commits) retry BY
+///   RERUN with the same data files from a fresh base, `max_attempts`
+///   bounded. Pure appends carry no scan dependency, so snapshot isolation
+///   is used (concurrent appends/maintenance never semantically conflict).
+pub async fn atomic_partition_append(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    input: impl Into<ReplaceInput>,
+    snapshot_properties: HashMap<String, String>,
+    max_attempts: u32,
+) -> Result<ReplaceOutcome> {
+    let input = input.into();
+    let table = catalog.load_table(ident).await?;
+    let schema = table.metadata().current_schema().clone();
+
+    let spec = table.metadata().default_partition_spec().clone();
+    let ok_spec = spec.fields().len() == 1
+        && spec.fields()[0].transform == Transform::Identity
+        && schema
+            .field_id_by_name(partition_column)
+            .is_some_and(|id| id == spec.fields()[0].source_id);
+    if !ok_spec {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "atomic append requires a single-field IDENTITY partition on \
+                 `{partition_column}`; the table's default spec is {spec:?}"
+            ),
+        ));
+    }
+    // The NULL partition slot (appended rows carry partition_column = NULL).
+    let partition_key = PartitionKey::new(
+        spec.as_ref().clone(),
+        schema.clone(),
+        Struct::from_iter(vec![None::<Literal>]),
+    );
+
+    let target_arrow: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema)?);
+
+    // Data files, streamed; the writer opens LAZILY on the first non-empty
+    // batch so a zero-row input never creates writers.
+    let run = Uuid::now_v7();
+    let mut data_writer = None;
+    let mut rows_appended = 0u64;
+    for batch in input.pass()? {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let conformed = conform_batch(&batch, &target_arrow)?;
+        rows_appended += conformed.num_rows() as u64;
+        if data_writer.is_none() {
+            let data_rolling = RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata())?,
+                DefaultFileNameGenerator::new(
+                    format!("cdc-append-{run}"),
+                    None,
+                    DataFileFormat::Parquet,
+                ),
+            );
+            data_writer = Some(
+                DataFileWriterBuilder::new(data_rolling)
+                    .build(Some(partition_key.clone()))
+                    .await?,
+            );
+        }
+        data_writer
+            .as_mut()
+            .expect("writer opened above")
+            .write(conformed)
+            .await?;
+    }
+    if rows_appended == 0 {
+        return Ok(ReplaceOutcome {
+            snapshot_id: table.metadata().current_snapshot_id(),
+            rows_appended: 0,
+            delete_tuples: 0,
+            attempts: 0,
+        });
+    }
+    let data_files = data_writer.expect("rows_appended > 0").close().await?;
+
+    // Commit as ONE RowDelta append snapshot; on conflict, RERUN with the
+    // SAME files from a fresh base.
+    let max_attempts = max_attempts.max(1);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let table = catalog.load_table(ident).await?;
+        let tx = Transaction::new(&table);
+        let mut action = tx
+            .row_delta()
+            .add_data_files(data_files.clone())
+            .set_snapshot_properties(snapshot_properties.clone())
+            .with_snapshot_isolation();
+        action = match table.metadata().current_snapshot_id() {
+            Some(base) => action.validate_from_snapshot(base),
+            None => action.validate_from_empty_table(),
+        };
+        match async { action.apply(tx)?.commit(catalog).await }.await {
+            Ok(committed) => {
+                return Ok(ReplaceOutcome {
+                    snapshot_id: committed.metadata().current_snapshot_id(),
+                    rows_appended,
+                    delete_tuples: 0,
+                    attempts,
+                });
+            }
+            Err(e) if attempts < max_attempts && is_commit_conflict(&e) => {
+                continue; // rerun from a fresh base with the same files
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// How a scan-based replace matches a chunk's prior rows against the
 /// (stringified) key column. Two shapes, one scan/DV/commit path:
 ///

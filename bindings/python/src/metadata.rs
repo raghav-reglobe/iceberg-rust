@@ -479,8 +479,10 @@ fn data_files(
                         .load()
                         .await
                         .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
-                    let mut bounds: HashMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
-                        HashMap::new();
+                    let mut bounds: HashMap<
+                        String,
+                        (Option<serde_json::Value>, Option<serde_json::Value>),
+                    > = HashMap::new();
                     for mf in mlist.entries() {
                         if mf.content != ManifestContentType::Data {
                             continue;
@@ -525,12 +527,11 @@ fn data_files(
                             .await
                             .map_err(|e| PyValueError::new_err(format!("{}: {e}", r.path)))?;
                         let mut pr = ArrowFileReader::new(FileMetadata { size: r.size }, reader);
-                        let meta =
-                            ArrowReaderMetadata::load_async(&mut pr, Default::default())
-                                .await
-                                .map_err(|e| {
-                                    PyValueError::new_err(format!("footer {}: {e}", r.path))
-                                })?;
+                        let meta = ArrowReaderMetadata::load_async(&mut pr, Default::default())
+                            .await
+                            .map_err(|e| {
+                                PyValueError::new_err(format!("footer {}: {e}", r.path))
+                            })?;
                         r.arrow_schema = Some(
                             meta.schema()
                                 .fields()
@@ -584,7 +585,11 @@ fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<Py<PyAny>
             if let Some(i) = n.as_i64() {
                 i.into_pyobject(py)?.into_any().unbind()
             } else {
-                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any().unbind()
+                n.as_f64()
+                    .unwrap_or(f64::NAN)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind()
             }
         }
         serde_json::Value::String(s) => s.into_pyobject(py)?.into_any().unbind(),
