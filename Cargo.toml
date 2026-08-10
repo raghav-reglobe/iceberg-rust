@@ -137,7 +137,14 @@ rstest = "0.26"
 serde = { version = "1.0.219", features = ["rc"] }
 serde_bytes = "0.11.17"
 serde_derive = "1.0.219"
-serde_json = "1.0.142"
+# float_roundtrip: serde_json's default float parse is a fast path that can
+# land 1 ULP off the correctly-rounded f64 (probed live: "61101.263999999996"
+# → 0x...c5 instead of 0x...c4). Every JSON→VARIANT write (parquet-variant's
+# append_json → as_f64) inherits the drift — the kafka→bronze lane's golden
+# gate caught it as 76/1000 rows diverging from the Java sink's Jackson
+# (correctly-rounded) doubles. Feature unification turns the exact parse on
+# for the whole graph, parquet-variant-json included.
+serde_json = { version = "1.0.142", features = ["float_roundtrip"] }
 serde_repr = "0.1.16"
 serde_with = "3.4"
 sqllogictest = "0.29"

@@ -211,6 +211,23 @@ async fn live_data_partitions(table: &Table) -> Vec<iceberg::spec::Struct> {
     out
 }
 
+#[test]
+fn json_float_parse_is_correctly_rounded() {
+    // serde_json's default fast float path can land 1 ULP off the
+    // correctly-rounded f64; the workspace `float_roundtrip` feature pins
+    // the exact parse. Without it every JSON→VARIANT double write
+    // (parquet-variant append_json → as_f64) diverges from Java writers
+    // (Jackson is correctly-rounded) — caught live by the kafka→bronze
+    // golden gate as 76/1000 product_quote rows differing by 1 ULP.
+    let v: serde_json::Value = serde_json::from_str("61101.263999999996").unwrap();
+    assert_eq!(
+        v.as_f64().unwrap().to_bits(),
+        0x40edd5a872b020c4u64,
+        "serde_json float parse is not correctly rounded — is the \
+         workspace float_roundtrip feature still on?"
+    );
+}
+
 #[tokio::test]
 async fn append_lands_in_null_partition_with_ledger_properties() {
     let warehouse = TempDir::new().unwrap();
