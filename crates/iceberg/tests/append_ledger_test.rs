@@ -228,6 +228,32 @@ fn json_float_parse_is_correctly_rounded() {
     );
 }
 
+/// REBASE GUARD — the same pin through the REAL kernel: atomic_replace's
+/// `json_strings_to_variant` rides `parquet::variant::json_to_variant`,
+/// whose float parse comes from serde_json (parquet-variant-json's
+/// `from_json.rs` does `Value::Number.as_f64()`). The serde_json unit above
+/// pins the workspace feature; THIS one survives an upstream swap of the
+/// JSON parser inside the variant kernel — whatever parses the number, the
+/// stored double must be the correctly-rounded bits Java writers produce.
+#[test]
+fn json_to_variant_double_is_correctly_rounded_end_to_end() {
+    use arrow_array::{ArrayRef, StringArray};
+    use parquet::variant::{Variant, json_to_variant};
+
+    let strings: ArrayRef = Arc::new(StringArray::from(vec!["61101.263999999996"]));
+    let arr = json_to_variant(&strings).unwrap();
+    let Variant::Double(d) = arr.value(0) else {
+        panic!("expected Variant::Double, got {:?}", arr.value(0));
+    };
+    assert_eq!(
+        d.to_bits(),
+        0x40edd5a872b020c4u64,
+        "JSON->variant double is not correctly rounded — the 1-ULP class \
+         that failed byte-parity vs the JVM sink on 76/1000 product_quote \
+         documents (K0 golden gate, 2026-08-10)"
+    );
+}
+
 #[tokio::test]
 async fn append_lands_in_null_partition_with_ledger_properties() {
     let warehouse = TempDir::new().unwrap();

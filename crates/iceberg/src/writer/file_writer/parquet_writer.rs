@@ -2755,6 +2755,38 @@ mod tests {
             "a plain struct column must NOT be annotated"
         );
 
+        // REBASE GUARD — physical footer repetition of the variant children.
+        // VariantEncoding.md is normative: "The `value` field must be
+        // annotated as `required` for unshredded Variant values" (`optional`
+        // is reserved for shredded layouts carrying `typed_value`). Upstream
+        // iceberg-rust maps `value` NULLABLE (main as of 2026-08 — the
+        // v0.10.0 rebase imported it), and that extra definition level makes
+        // Doris's Iceberg-VARIANT reader silently render EVERY row's value
+        // as NULL (live incident 2026-08-11; arrow-rs fixed the identical
+        // class in parquet-variant-compute, apache/arrow-rs#10315). If a
+        // future rebase breaks this assertion, RE-APPLY the required-value
+        // mapping in `arrow/schema.rs::variant()` — never relax the test.
+        let child_repetition = |group: &str, child: &str| {
+            let g = fields.iter().find(|f| f.name() == group).unwrap();
+            g.get_fields()
+                .iter()
+                .find(|c| c.name() == child)
+                .unwrap()
+                .get_basic_info()
+                .repetition()
+        };
+        assert_eq!(
+            child_repetition("doc", "metadata"),
+            parquet::basic::Repetition::REQUIRED,
+            "unshredded variant `metadata` must be required in the footer"
+        );
+        assert_eq!(
+            child_repetition("doc", "value"),
+            parquet::basic::Repetition::REQUIRED,
+            "unshredded variant `value` must be required in the footer \
+             (nullable value = the Doris NULL-render legacy class)"
+        );
+
         // Null semantics round-trip: the variant-null VALUE stays a non-null
         // row; the SQL null stays a null group.
         let batches: Vec<_> = reader.build().unwrap().map(|b| b.unwrap()).collect();
