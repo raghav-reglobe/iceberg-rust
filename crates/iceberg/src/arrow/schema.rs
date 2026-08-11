@@ -787,11 +787,19 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     fn variant(&mut self, _v: &VariantType) -> Result<ArrowSchemaOrFieldOrType> {
         // Variant is stored as a struct of two binary sub-fields (no field IDs on sub-fields).
         // Uses Binary (not LargeBinary) matching the Parquet BINARY primitive directly.
-        // `metadata` is always present; `value` is nullable, since in a shredded variant the
-        // value may be absent. The enclosing field carries the `arrow.parquet.variant` extension type
-        // (attached in `field`).
+        // `metadata` is always present; `value` is REQUIRED in the CANONICAL (unshredded)
+        // mapping this converter emits — a variant-null row is the 0x00 value byte, never a
+        // SQL-null child, and a null variant is struct-level null. Writing `value` as
+        // nullable (the prior upstream-parity mapping) adds a definition level that the
+        // established JVM-writer estate does not carry, and at least one production reader
+        // (Doris's Iceberg-VARIANT path) silently reads every such row's value as NULL
+        // (live-caught 2026-08-10: rust-appended bronze rendered NULL through Doris while
+        // byte-identical java-sink rows rendered fine; the ONLY footer delta was value
+        // nullability). Shredded layouts keep their own file-derived types (value IS
+        // optional there) — they never route through this canonical mapping. The enclosing
+        // field carries the `arrow.parquet.variant` extension type (attached in `field`).
         let metadata_field = Field::new("metadata", DataType::Binary, false);
-        let value_field = Field::new("value", DataType::Binary, true);
+        let value_field = Field::new("value", DataType::Binary, false);
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(
             vec![metadata_field, value_field].into(),
         )))
@@ -1813,7 +1821,7 @@ mod tests {
                 "v",
                 DataType::Struct(Fields::from(vec![
                     Field::new("metadata", DataType::Binary, false),
-                    Field::new("value", DataType::Binary, true),
+                    Field::new("value", DataType::Binary, false),
                 ])),
                 true,
             )
@@ -2032,14 +2040,16 @@ mod tests {
 
     #[test]
     fn test_variant_type_to_arrow_type() {
-        // Variant maps to a struct with a required `metadata` and a nullable `value` binary
-        // field, with no field ids on the sub-fields, matching the Parquet BINARY layout.
+        // Variant maps to a struct with REQUIRED `metadata` and `value` binary fields
+        // (canonical/unshredded — JVM-writer estate parity; a nullable `value` adds a
+        // definition level Doris's Iceberg-VARIANT reader silently NULLs on), with no
+        // field ids on the sub-fields, matching the Parquet BINARY layout.
         let arrow_type = type_to_arrow_type(&Type::Variant(VariantType)).unwrap();
         assert_eq!(
             arrow_type,
             DataType::Struct(Fields::from(vec![
                 Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("value", DataType::Binary, false),
             ]))
         );
     }
@@ -2068,7 +2078,7 @@ mod tests {
             field.data_type(),
             &DataType::Struct(Fields::from(vec![
                 Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("value", DataType::Binary, false),
             ]))
         );
     }
@@ -2120,13 +2130,40 @@ mod tests {
         assert_eq!(value.extension_type_name(), Some("arrow.parquet.variant"));
     }
 
-    /// The unshredded Arrow storage of a variant: `metadata` (required) + `value`
-    /// (nullable) binary, with no field ids on the sub-fields.
+    /// The unshredded Arrow storage of a variant: `metadata` + `value`, both
+    /// required binary (the canonical write mapping), no field ids on sub-fields.
     fn variant_storage() -> DataType {
+        DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]))
+    }
+
+    /// The LEGACY nullable-`value` storage (upstream mapping + our own
+    /// pre-2026-08-10 wheels wrote it) must still FOLD to VariantType on read.
+    fn variant_storage_nullable_value() -> DataType {
         DataType::Struct(Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
             Field::new("value", DataType::Binary, true),
         ]))
+    }
+
+    #[test]
+    fn test_legacy_nullable_value_variant_still_folds_on_read() {
+        let field =
+            Field::new("v", variant_storage_nullable_value(), true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    "ARROW:extension:name".to_string(),
+                    "arrow.parquet.variant".to_string(),
+                ),
+            ]));
+        let arrow_schema = ArrowSchema::new(vec![field]);
+        let schema = arrow_schema_to_schema(&arrow_schema).unwrap();
+        assert!(matches!(
+            schema.field_by_name("v").unwrap().field_type.as_ref(),
+            Type::Variant(_)
+        ));
     }
 
     #[test]

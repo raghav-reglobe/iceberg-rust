@@ -2679,11 +2679,12 @@ mod tests {
                 .unwrap(),
         );
 
-        // `value` is nullable in the canonical variant mapping (a shredded
-        // variant may carry no value) — matches `schema_to_arrow_schema`.
+        // `value` is REQUIRED in the canonical variant mapping (JVM-writer
+        // estate parity; a variant-null is the 0x00 value byte, an SQL null is
+        // struct-level) — matches `schema_to_arrow_schema`.
         let canonical_fields = Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, true),
+            Field::new("value", DataType::Binary, false),
         ]);
         let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
         // Row 0 carries a variant NULL VALUE; row 1 is an SQL null.
