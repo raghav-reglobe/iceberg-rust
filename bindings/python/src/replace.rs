@@ -23,13 +23,14 @@
 //! RFC). Input rows arrive as an Arrow IPC STREAM (`pyarrow.ipc.new_stream`
 //! serialized bytes) — version-proof across pyarrow/pyo3 combinations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use arrow::array::RecordBatch;
 use iceberg::atomic_replace::{
     ReplaceInput, atomic_partition_append, atomic_partition_replace,
-    atomic_partition_replace_key_range, atomic_partition_replace_prefix,
+    atomic_partition_replace_key_range, atomic_partition_replace_key_set,
+    atomic_partition_replace_prefix,
 };
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -386,11 +387,120 @@ fn bronze_append(
     })
 }
 
+/// Atomically UPSERT an exact `_cdc.key` SET — the repair-through-the-stream
+/// doorway: prior rows with `key_column IN keys` (and `op_column IN
+/// op_values`) inside the `partition_column = partition_value` identity
+/// partition are deleted via scan + consolidated V3 DELETION VECTORS, and
+/// the input rows appended, as ONE RowDelta snapshot at snapshot isolation
+/// with rescan-retry. `summary_props` land on the committed snapshot — the
+/// streaming lane's `pulse.kafka.offset.<topic>` ledger (offsets-in-
+/// snapshot; the ledger must ride the SAME commit as the data it covers).
+///
+/// LAYERING (operator ruling 2026-08-12): the safety scope is BAKED —
+/// `_is_backfill = true AND op IN ('R','r')` is a write INVARIANT ("a
+/// repair commit physically cannot touch CDC rows"), enforced by
+/// construction here rather than by caller convention. A generic
+/// `replace_where(filters=…)` was considered and REJECTED.
+///
+/// Defensive no-ops (the lane never issues either): EMPTY `keys` or a
+/// ZERO-ROW input returns the current snapshot with `attempts=0` and
+/// commits NOTHING (unlike the prefix mode, where zero-row still deletes —
+/// an upsert with nothing to upsert must not delete, and the caller's
+/// ledger must never ride a phantom commit).
+///
+/// Returns `{snapshot_id, rows_appended, delete_tuples_est, attempts}`.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, batches_ipc, keys, summary_props, key_column="_cdc.key".to_string(), op_column=Some("_cdc.op".to_string()), op_values=vec!["R".to_string(), "r".to_string()], partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, parquet_path=None))]
+#[allow(clippy::too_many_arguments)]
+fn bronze_replace_keys(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    batches_ipc: Vec<u8>,
+    keys: Vec<String>,
+    summary_props: HashMap<String, String>,
+    key_column: String,
+    op_column: Option<String>,
+    op_values: Vec<String>,
+    partition_column: String,
+    partition_value: bool,
+    max_retries: u32,
+    parquet_path: Option<String>,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    let input = replace_input(&batches_ipc, parquet_path)?;
+    let zero_rows = match &input {
+        ReplaceInput::Batches(b) => b.iter().map(|x| x.num_rows()).sum::<usize>() == 0,
+        ReplaceInput::LocalParquet(_) => false,
+    };
+    let key_set: HashSet<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let outcome = if key_set.is_empty() || zero_rows {
+                // Defensive no-op — read the current snapshot, commit nothing.
+                let t = catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("atomic key-set replace: {e}")))?;
+                iceberg::atomic_replace::ReplaceOutcome {
+                    snapshot_id: t.metadata().current_snapshot_id(),
+                    rows_appended: 0,
+                    delete_tuples: 0,
+                    attempts: 0,
+                }
+            } else {
+                atomic_partition_replace_key_set(
+                    catalog.as_ref(),
+                    &ident,
+                    &partition_column,
+                    partition_value,
+                    &key_column,
+                    key_set,
+                    op_column.as_deref(),
+                    &op_values,
+                    input,
+                    summary_props,
+                    max_retries,
+                    false,
+                )
+                .await
+                .map_err(|e| PyValueError::new_err(format!("atomic key-set replace: {e}")))?
+            };
+            Ok(HashMap::from([
+                (
+                    "snapshot_id".to_string(),
+                    outcome
+                        .snapshot_id
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "rows_appended".to_string(),
+                    outcome.rows_appended.to_string(),
+                ),
+                (
+                    "delete_tuples_est".to_string(),
+                    outcome.delete_tuples.to_string(),
+                ),
+                ("attempts".to_string(), outcome.attempts.to_string()),
+            ]))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "replace")?;
     this.add_function(wrap_pyfunction!(bronze_replace, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_prefix, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_range, &this)?)?;
+    this.add_function(wrap_pyfunction!(bronze_replace_keys, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_append, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())

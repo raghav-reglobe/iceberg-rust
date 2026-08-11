@@ -528,6 +528,16 @@ pub enum KeyMatcher {
     Prefix(String),
     /// `.0 <= parse::<i64>(key_column) <= .1`, inclusive.
     I64Range(i64, i64),
+    /// Exact SET membership on the stringified key — the
+    /// repair-through-the-stream upsert shape (`_cdc.key IN <keys>`).
+    /// PLANNING deliberately uses a lexicographic `[min(keys), max(keys)]`
+    /// range bracket, NEVER an IN-list: repair ticks legitimately carry
+    /// thousands of keys, and past ~200 values Iceberg's IN evaluation
+    /// disables stats/page pruning entirely (`IN_PREDICATE_LIMIT` — the
+    /// measured 201-value cliff), while a range predicate is limit-immune
+    /// and correct as a SUPERSET for arbitrary strings (lex order is
+    /// total; the row-wise set test drops the false positives).
+    KeySet(HashSet<String>),
 }
 
 impl KeyMatcher {
@@ -551,6 +561,18 @@ impl KeyMatcher {
                     None
                 }
             }
+            KeyMatcher::KeySet(keys) => {
+                let lo = keys.iter().min()?;
+                let hi = keys.iter().max()?;
+                Some(
+                    Reference::new(key_column)
+                        .greater_than_or_equal_to(Datum::string(lo.clone()))
+                        .and(
+                            Reference::new(key_column)
+                                .less_than_or_equal_to(Datum::string(hi.clone())),
+                        ),
+                )
+            }
         }
     }
 
@@ -561,6 +583,7 @@ impl KeyMatcher {
                 .trim()
                 .parse::<i64>()
                 .is_ok_and(|k| *lo <= k && k <= *hi),
+            KeyMatcher::KeySet(keys) => keys.contains(key),
         }
     }
 }
@@ -627,6 +650,68 @@ pub async fn atomic_partition_replace_prefix(
         op_column,
         op_values,
         input,
+        HashMap::new(),
+        max_attempts,
+        dry_run,
+    )
+    .await
+}
+
+/// Atomically UPSERT an exact KEY SET of an identity partition — the
+/// repair-through-the-stream primitive
+/// (`.claude/plans/bronze-repair-through-stream.md`): prior rows whose
+/// (stringified, possibly nested) key column is IN `keys` (and
+/// `op_column IN op_values` when given) are deleted via scan +
+/// consolidated V3 deletion vectors, and the input rows appended, as ONE
+/// `RowDelta` snapshot at snapshot isolation with rescan-retry — the
+/// [`atomic_partition_replace_prefix`] machinery with a
+/// [`KeyMatcher::KeySet`] predicate. `snapshot_properties` land on the
+/// committed snapshot (the streaming lane's `pulse.kafka.offset.<topic>`
+/// ledger rides here — offsets-in-snapshot).
+///
+/// Deviations from the prefix mode, both deliberate:
+/// - EMPTY `keys` is a NO-OP (returns the current snapshot, commits
+///   nothing) — there is no "everything under the prefix" analogue for a
+///   set, and the caller's ledger must never advance on a commit that
+///   never happened.
+/// - A zero-row input with non-empty keys still deletes those keys'
+///   prior rows (delete-only upsert). The streaming lane never issues it
+///   (every repair row carries its key); the python doorway additionally
+///   no-ops that case defensively.
+pub async fn atomic_partition_replace_key_set(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: bool,
+    key_column: &str,
+    keys: HashSet<String>,
+    op_column: Option<&str>,
+    op_values: &[String],
+    input: impl Into<ReplaceInput>,
+    snapshot_properties: HashMap<String, String>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
+    if keys.is_empty() {
+        let table = catalog.load_table(ident).await?;
+        return Ok(ReplaceOutcome {
+            snapshot_id: table.metadata().current_snapshot_id(),
+            rows_appended: 0,
+            delete_tuples: 0,
+            attempts: 0,
+        });
+    }
+    atomic_partition_replace_scan(
+        catalog,
+        ident,
+        partition_column,
+        partition_value,
+        key_column,
+        &KeyMatcher::KeySet(keys),
+        op_column,
+        op_values,
+        input,
+        snapshot_properties,
         max_attempts,
         dry_run,
     )
@@ -674,6 +759,7 @@ pub async fn atomic_partition_replace_key_range(
         op_column,
         op_values,
         input,
+        HashMap::new(),
         max_attempts,
         dry_run,
     )
@@ -691,6 +777,7 @@ async fn atomic_partition_replace_scan(
     op_column: Option<&str>,
     op_values: &[String],
     input: impl Into<ReplaceInput>,
+    snapshot_properties: HashMap<String, String>,
     max_attempts: u32,
     dry_run: bool,
 ) -> Result<ReplaceOutcome> {
@@ -1023,6 +1110,7 @@ async fn atomic_partition_replace_scan(
             .add_data_files(data_files.clone())
             .add_delete_files(new_delete_files)
             .remove_delete_files(removed_delete_files)
+            .set_snapshot_properties(snapshot_properties.clone())
             .validate_from_snapshot(base_snapshot)
             .with_snapshot_isolation();
         match async { action.apply(tx)?.commit(catalog).await }.await {
