@@ -22,6 +22,7 @@ mod compaction;
 mod data_file;
 mod datafusion_table_provider;
 mod error;
+mod l3_cache;
 mod manifest;
 mod merge;
 mod metadata;

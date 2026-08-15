@@ -19,6 +19,8 @@ use std::sync::{Arc, OnceLock};
 
 use iceberg::cache::{DataBytesCache, ObjectBytesCacheRef};
 use iceberg_cache_foyer::{EvictionPolicy, FoyerObjectBytesCacheBuilder};
+
+use crate::l3_cache::{L3Http, TieredBytesCache};
 use tokio::runtime::{Handle, Runtime};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -59,6 +61,35 @@ fn cache_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// The shared L3 cache client (pulse-cached daemon), DARK unless
+/// `ICEBERG_CACHE_L3_ENDPOINT` is set (e.g.
+/// `http://pulse-cached.pulse-compute.svc:8090`). Fail-open by contract:
+/// any daemon error is a miss and reads fall through to direct S3 —
+/// unset-env behavior is byte-identical to today. Knobs:
+/// `ICEBERG_CACHE_L3_CONNECT_TIMEOUT_MS` (500),
+/// `ICEBERG_CACHE_L3_TIMEOUT_MS` (10000 — covers the daemon's own
+/// read-through S3 fetch on an L3-wide miss).
+fn l3_client() -> Option<Arc<L3Http>> {
+    static L3: OnceLock<Option<Arc<L3Http>>> = OnceLock::new();
+    L3.get_or_init(|| {
+        let endpoint = std::env::var("ICEBERG_CACHE_L3_ENDPOINT")
+            .ok()
+            .filter(|e| !e.is_empty())?;
+        let connect_ms = env_mb("ICEBERG_CACHE_L3_CONNECT_TIMEOUT_MS", 500);
+        let timeout_ms = env_mb("ICEBERG_CACHE_L3_TIMEOUT_MS", 10_000);
+        L3Http::new(&endpoint, connect_ms, timeout_ms).map(Arc::new)
+    })
+    .clone()
+}
+
+/// Wraps a local store with the L3 tier when configured; identity when not.
+fn maybe_tier(local: ObjectBytesCacheRef) -> ObjectBytesCacheRef {
+    match l3_client() {
+        Some(l3) => Arc::new(TieredBytesCache::new(Some(local), l3)) as ObjectBytesCacheRef,
+        None => local,
+    }
+}
+
 pub async fn global_object_cache() -> ObjectBytesCacheRef {
     OBJECT_CACHE
         .get_or_init(|| async {
@@ -71,7 +102,7 @@ pub async fn global_object_cache() -> ObjectBytesCacheRef {
                 builder = builder.with_disk(dir.join("manifest"), disk_bytes as usize);
             }
             match builder.build().await {
-                Ok(cache) => Arc::new(cache) as ObjectBytesCacheRef,
+                Ok(cache) => maybe_tier(Arc::new(cache) as ObjectBytesCacheRef),
                 Err(e) => {
                     // The cache must never block the platform: fall back to
                     // a memory-only store (e.g. when the disk dir is bad).
@@ -82,7 +113,7 @@ pub async fn global_object_cache() -> ObjectBytesCacheRef {
                     .build()
                     .await
                     .expect("memory-only foyer cache must build");
-                    Arc::new(fallback) as ObjectBytesCacheRef
+                    maybe_tier(Arc::new(fallback) as ObjectBytesCacheRef)
                 }
             }
         })
@@ -120,12 +151,20 @@ static DATA_CACHE: tokio::sync::OnceCell<Option<DataBytesCache>> =
 pub async fn global_data_cache() -> Option<DataBytesCache> {
     DATA_CACHE
         .get_or_init(|| async {
-            let dir = cache_dir()?;
-            let disk_mb = env_mb("ICEBERG_DATA_CACHE_MB", 0);
-            if disk_mb == 0 {
-                return None;
-            }
+            let disk_mb = cache_dir()
+                .map(|_| env_mb("ICEBERG_DATA_CACHE_MB", 0))
+                .unwrap_or(0);
             let max_file_bytes = env_mb("ICEBERG_CACHE_MAX_FILE_MB", 256) * 1024 * 1024;
+            if disk_mb == 0 {
+                // No pod-local data cache — but a configured L3 endpoint
+                // still gives whole-file caching through the shared tier
+                // alone (the daemon absorbs the scan's ranged GETs).
+                return l3_client().map(|l3| DataBytesCache {
+                    cache: Arc::new(TieredBytesCache::new(None, l3)) as ObjectBytesCacheRef,
+                    max_file_bytes,
+                });
+            }
+            let dir = cache_dir()?;
             // Small memory tier (the disk tier is the store); block size
             // sized above the per-file cap so capped files are admitted.
             // Eviction: the merge access pattern is a CYCLIC whole-set scan
@@ -155,7 +194,7 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
                 .with_eviction_policy(policy);
             match builder.build().await {
                 Ok(cache) => Some(DataBytesCache {
-                    cache: Arc::new(cache) as ObjectBytesCacheRef,
+                    cache: maybe_tier(Arc::new(cache) as ObjectBytesCacheRef),
                     max_file_bytes,
                 }),
                 Err(e) => {

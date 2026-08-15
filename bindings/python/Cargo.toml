@@ -41,6 +41,9 @@ datafusion-ffi = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 iceberg-cache-foyer = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-compaction = { workspace = true }
 iceberg-datafusion = { workspace = true }
