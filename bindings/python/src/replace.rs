@@ -28,9 +28,9 @@ use std::io::Cursor;
 
 use arrow::array::RecordBatch;
 use iceberg::atomic_replace::{
-    ReplaceInput, atomic_partition_append, atomic_partition_replace,
-    atomic_partition_replace_key_range, atomic_partition_replace_key_set,
-    atomic_partition_replace_prefix,
+    ReplaceInput, atomic_partition_append, atomic_partition_replace_key_range,
+    atomic_partition_replace_key_set, atomic_partition_replace_prefix,
+    atomic_partition_replace_with_props,
 };
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -96,7 +96,7 @@ fn decode_ipc(batches_ipc: &[u8]) -> PyResult<Vec<RecordBatch>> {
 /// without writing or committing. Returns
 /// `{snapshot_id, rows_appended, delete_tuples_est, attempts}`.
 #[pyfunction]
-#[pyo3(signature = (catalogs, table, batches_ipc, pk_columns, partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false, parquet_path=None))]
+#[pyo3(signature = (catalogs, table, batches_ipc, pk_columns, partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, dry_run=false, parquet_path=None, summary_props=None))]
 #[allow(clippy::too_many_arguments)]
 fn bronze_replace(
     py: Python<'_>,
@@ -109,6 +109,7 @@ fn bronze_replace(
     max_retries: u32,
     dry_run: bool,
     parquet_path: Option<String>,
+    summary_props: Option<HashMap<String, String>>,
 ) -> PyResult<HashMap<String, String>> {
     let (catalog_name, namespace, table_name) = split_fqn(&table)?;
     let Some(props) = catalogs.get(&catalog_name).cloned() else {
@@ -124,13 +125,14 @@ fn bronze_replace(
         runtime().block_on(async move {
             let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
             let ident = TableIdent::new(namespace, table_name);
-            let outcome = atomic_partition_replace(
+            let outcome = atomic_partition_replace_with_props(
                 catalog.as_ref(),
                 &ident,
                 &partition_column,
                 Literal::bool(partition_value),
                 &pk_columns,
                 input,
+                summary_props.unwrap_or_default(),
                 max_retries,
                 dry_run,
             )

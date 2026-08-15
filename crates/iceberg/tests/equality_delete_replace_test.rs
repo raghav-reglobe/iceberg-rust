@@ -486,7 +486,9 @@ async fn atomic_replace_via_partition_scoped_equality_deletes() {
 
 mod replace_api {
     use arrow_array::{Array, BinaryArray};
-    use iceberg::atomic_replace::{ReplaceOutcome, atomic_partition_replace};
+    use iceberg::atomic_replace::{
+        ReplaceOutcome, atomic_partition_replace, atomic_partition_replace_with_props,
+    };
     use iceberg::spec::VariantType;
 
     use super::*;
@@ -587,6 +589,49 @@ mod replace_api {
             )),
         ])
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_with_props_lands_summary_on_the_one_snapshot() {
+        // The offset-ledger contract (`bronze_replace_keys` parity): caller
+        // summary props must ride the SAME RowDelta snapshot as the replace
+        // — a separate ledger commit would open a lost-write window.
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = setup(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        let snaps_before = table.metadata().snapshots().count();
+
+        let out = atomic_partition_replace_with_props(
+            &catalog,
+            &ident,
+            "_is_backfill",
+            Literal::bool(true),
+            &["id".to_string()],
+            vec![external_batch(&table, &[(1, "r-props-1", "r", Some(true))])],
+            HashMap::from([(
+                "pulse.kafka.offset.bronze_dbnew.db.t".to_string(),
+                "77".to_string(),
+            )]),
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.attempts, 1);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get("pulse.kafka.offset.bronze_dbnew.db.t")
+                .map(String::as_str),
+            Some("77"),
+            "summary props must land on the replace snapshot itself"
+        );
     }
 
     #[tokio::test]

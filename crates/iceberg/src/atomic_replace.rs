@@ -181,6 +181,37 @@ pub async fn atomic_partition_replace(
     max_attempts: u32,
     dry_run: bool,
 ) -> Result<ReplaceOutcome> {
+    atomic_partition_replace_with_props(
+        catalog,
+        ident,
+        partition_column,
+        partition_value,
+        equality_columns,
+        input,
+        HashMap::new(),
+        max_attempts,
+        dry_run,
+    )
+    .await
+}
+
+/// [`atomic_partition_replace`] with caller-supplied snapshot summary
+/// properties — they land on the ONE committed RowDelta snapshot (the
+/// offset-ledger contract, [`atomic_partition_replace_key_set`] parity:
+/// a ledger on a separate commit would open a lost-write window between
+/// the two).
+#[allow(clippy::too_many_arguments)]
+pub async fn atomic_partition_replace_with_props(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: Literal,
+    equality_columns: &[String],
+    input: impl Into<ReplaceInput>,
+    snapshot_properties: HashMap<String, String>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
     let input = input.into();
     let table = catalog.load_table(ident).await?;
     let schema = table.metadata().current_schema().clone();
@@ -340,6 +371,9 @@ pub async fn atomic_partition_replace(
             .row_delta()
             .add_data_files(data_files.clone())
             .add_delete_files(delete_files.clone());
+        if !snapshot_properties.is_empty() {
+            action = action.set_snapshot_properties(snapshot_properties.clone());
+        }
         action = match table.metadata().current_snapshot_id() {
             Some(base) => action.validate_from_snapshot(base),
             None => action.validate_from_empty_table(),
