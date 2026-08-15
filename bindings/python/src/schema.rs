@@ -149,7 +149,21 @@ fn update_schema(
             let tx = Transaction::new(&table);
             let mut action = tx.update_schema();
             for (name, ty) in adds {
-                action = action.add_column(AddColumn::optional(name, ty));
+                // Dotted add name = NESTED add: "_cdc.seq" -> leaf "seq"
+                // under parent path "_cdc" (AddColumn::with_parent — the
+                // mongo-silver/bronze VARIANT-safe nested-evolve path;
+                // pyiceberg is ruled out on VARIANT tables). Platform
+                // column names never contain literal dots, so the split
+                // is unambiguous by convention.
+                match name.rsplit_once('.') {
+                    Some((parent, leaf)) => {
+                        action =
+                            action.add_column(AddColumn::optional(leaf, ty).with_parent(parent));
+                    }
+                    None => {
+                        action = action.add_column(AddColumn::optional(name, ty));
+                    }
+                }
             }
             for name in drop_columns {
                 action = action.delete_column(name);

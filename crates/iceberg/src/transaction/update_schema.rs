@@ -76,6 +76,16 @@ impl AddColumn {
             .build()
     }
 
+    /// Set a parent path, making this a NESTED addition (the documented
+    /// companion to [`AddColumn::optional`]/[`AddColumn::required`] — e.g.
+    /// add `seq` under the `_cdc` struct). The parent may resolve to a
+    /// struct, a map value, or a list element (see
+    /// [`UpdateSchemaAction::add_column`]).
+    pub fn with_parent(mut self, parent: impl ToString) -> Self {
+        self.parent = Some(parent.to_string());
+        self
+    }
+
     fn to_nested_field(&self) -> NestedFieldRef {
         let mut field = NestedField::new(
             DEFAULT_FIELD_ID,
