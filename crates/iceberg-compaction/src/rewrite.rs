@@ -178,7 +178,7 @@ async fn flush_chunk(
             (shredded.pop().expect("one batch in, one out"), overrides)
         };
         if sink.is_none() {
-            *sink = Some(CompactSink::build(table, overrides).await?);
+            *sink = Some(CompactSink::build(table, cfg.target_file_size_bytes, overrides).await?);
         }
         sink.as_mut().expect("just built").write(slice).await?;
     }
@@ -213,12 +213,20 @@ enum CompactSink {
 impl CompactSink {
     async fn build(
         table: &Table,
+        target_file_size_bytes: u64,
         variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
     ) -> Result<Self> {
         let schema = table.metadata().current_schema().clone();
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        let rolling = RollingFileWriterBuilder::new(
             ParquetWriterBuilder::new(bloom_writer_properties(table), schema.clone())
                 .with_variant_shred_types(variant_shred_types),
+            // OUTPUT rolling must honor the configured target: the planner's
+            // input bin-packing bounds what a group READS, not what it
+            // WRITES — a delete-pressure group (or a variant-heavy rewrite)
+            // can emit far more than its input accounting, and the rolling
+            // writer's built-in default (512 MiB) silently emitted ~4x the
+            // requested target on such groups.
+            usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),
             table.file_io().clone(),
             DefaultLocationGenerator::new(table.metadata())?,
             // Unique per group: DefaultFileNameGenerator's counter resets with
