@@ -75,6 +75,14 @@ pub type ObjectCacheProvider = Arc<dyn ObjectCacheProvide>;
 pub trait ObjectBytesCache: Send + Sync + std::fmt::Debug {
     /// Gets the raw file bytes cached for `path`, if present.
     async fn get(&self, path: &str) -> Option<Bytes>;
+    /// [`Self::get`] with the object's known length when the caller has it
+    /// (manifest-recorded data-file / manifest sizes). Local stores don't
+    /// need it (default: ignored); a remote tier can use it to reserve an
+    /// exact fetch budget instead of a worst-case one. Pass the TRUE size —
+    /// never clamp — and `None` when unknown.
+    async fn get_with_size_hint(&self, path: &str, _size_hint: Option<u64>) -> Option<Bytes> {
+        self.get(path).await
+    }
     /// Caches the raw file bytes fetched from `path`.
     async fn set(&self, path: &str, bytes: Bytes);
     /// Cumulative statistics for this store, when the implementation tracks

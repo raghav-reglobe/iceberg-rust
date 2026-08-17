@@ -907,7 +907,11 @@ impl ArrowReader {
             && file_size_in_bytes > 0
             && file_size_in_bytes <= dc.max_file_bytes
         {
-            let bytes = match dc.cache.get(data_file_path).await {
+            let bytes = match dc
+                .cache
+                .get_with_size_hint(data_file_path, Some(file_size_in_bytes))
+                .await
+            {
                 Some(bytes) => bytes,
                 None => {
                     // ONE whole-object fetch replaces the scan's N ranged

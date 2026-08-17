@@ -19,9 +19,9 @@ use std::sync::{Arc, OnceLock};
 
 use iceberg::cache::{DataBytesCache, ObjectBytesCacheRef};
 use iceberg_cache_foyer::{EvictionPolicy, FoyerObjectBytesCacheBuilder};
+use tokio::runtime::{Handle, Runtime};
 
 use crate::l3_cache::{L3Http, TieredBytesCache};
-use tokio::runtime::{Handle, Runtime};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 

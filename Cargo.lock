@@ -6107,6 +6107,8 @@ version = "0.10.0"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "async-trait",
+ "bytes",
  "datafusion",
  "datafusion-ffi",
  "futures",
@@ -6118,6 +6120,7 @@ dependencies = [
  "iceberg-storage-opendal",
  "parquet",
  "pyo3",
+ "reqwest 0.12.28",
  "serde_json",
  "tokio",
 ]

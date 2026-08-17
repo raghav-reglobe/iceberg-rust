@@ -108,13 +108,23 @@ impl L3Http {
     }
 
     /// Fetch `path` through the daemon. `None` on ANY failure (fail-open).
-    pub async fn get(&self, path: &str) -> Option<Bytes> {
+    ///
+    /// `size_hint` = the object's known length (manifest-recorded), sent as
+    /// `x-size-hint` so the daemon reserves an EXACT fetch budget on a miss
+    /// instead of a worst-case `max_file` slot (or a probe HEAD). Always the
+    /// TRUE size, never clamped — an over-`max_file` hint is the daemon's
+    /// bypass signal. Absent/0 = unknown.
+    pub async fn get(&self, path: &str, size_hint: Option<u64>) -> Option<Bytes> {
         let now = now_ms();
         if !self.breaker.allows(now) {
             return None;
         }
         let url = format!("{}/o", self.endpoint);
-        let resp = self.client.get(&url).header("x-path", path).send().await;
+        let mut req = self.client.get(&url).header("x-path", path);
+        if let Some(size) = size_hint.filter(|s| *s > 0) {
+            req = req.header("x-size-hint", size.to_string());
+        }
+        let resp = req.send().await;
         match resp {
             Ok(r) if r.status().is_success() => match r.bytes().await {
                 Ok(b) => {
@@ -159,12 +169,16 @@ impl TieredBytesCache {
 #[async_trait]
 impl ObjectBytesCache for TieredBytesCache {
     async fn get(&self, path: &str) -> Option<Bytes> {
+        self.get_with_size_hint(path, None).await
+    }
+
+    async fn get_with_size_hint(&self, path: &str, size_hint: Option<u64>) -> Option<Bytes> {
         if let Some(local) = &self.local {
             if let Some(bytes) = local.get(path).await {
                 return Some(bytes);
             }
         }
-        let bytes = self.l3.get(path).await?;
+        let bytes = self.l3.get(path, size_hint).await?;
         // Populate the pod-local tier so subsequent reads skip the hop.
         if let Some(local) = &self.local {
             local.set(path, bytes.clone()).await;
@@ -211,6 +225,49 @@ mod tests {
         b.on_failure(2_000);
         b.on_failure(2_000);
         assert!(b.allows(2_000), "reset run-up is below threshold again");
+    }
+
+    /// One-shot HTTP responder: accepts a single connection, captures the
+    /// request head, answers 200 with `body`. Returns (endpoint, captured).
+    async fn one_shot_server(body: &'static [u8]) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            head
+        });
+        (endpoint, handle)
+    }
+
+    /// The known object length rides `x-size-hint` (exact-budget reserve on
+    /// the daemon side); an unknown length sends NO hint header.
+    #[tokio::test]
+    async fn size_hint_header_rides_the_request() {
+        let (endpoint, captured) = one_shot_server(b"abc").await;
+        let l3 = L3Http::new(&endpoint, 1_000, 2_000).unwrap();
+        assert_eq!(
+            l3.get("s3://b/k.parquet", Some(12_345)).await,
+            Some(Bytes::from_static(b"abc"))
+        );
+        let head = captured.await.unwrap().to_ascii_lowercase();
+        assert!(head.contains("x-path: s3://b/k.parquet"), "{head}");
+        assert!(head.contains("x-size-hint: 12345"), "{head}");
+
+        let (endpoint, captured) = one_shot_server(b"abc").await;
+        let l3 = L3Http::new(&endpoint, 1_000, 2_000).unwrap();
+        l3.get("s3://b/k.parquet", None).await.unwrap();
+        let head = captured.await.unwrap().to_ascii_lowercase();
+        assert!(!head.contains("x-size-hint"), "{head}");
     }
 
     /// A dead endpoint must be a MISS, never an error (fail-open), and the

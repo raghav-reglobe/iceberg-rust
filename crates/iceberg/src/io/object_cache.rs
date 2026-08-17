@@ -145,7 +145,12 @@ impl ObjectCache {
             }
             CacheBackend::Shared(bytes_cache) => {
                 let path = &manifest_file.manifest_path;
-                let avro = match bytes_cache.get(path).await {
+                // The manifest list records each manifest's exact length —
+                // hand it to the store as a fetch-size hint.
+                let hint = u64::try_from(manifest_file.manifest_length)
+                    .ok()
+                    .filter(|v| *v > 0);
+                let avro = match bytes_cache.get_with_size_hint(path, hint).await {
                     Some(bytes) => bytes,
                     None => {
                         let bytes = self.file_io.new_input(path)?.read().await?;
