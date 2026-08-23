@@ -359,10 +359,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::catalog::TableCommit;
+    use crate::atomic_replace::atomic_partition_replace_key_set;
     use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::spec::{
-        DataFile, DataFileFormat, FormatVersion, Literal, ManifestStatus, NestedField,
-        PartitionKey, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionSpec,
+        DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList,
+        ManifestStatus, NestedField, PartitionKey, PrimitiveType, Schema, Struct, Transform,
+        Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -625,5 +627,226 @@ mod tests {
         assert_eq!(scan_ids(&table).await, vec![
             4, 5, 6, 7, 8, 9, 101, 102, 103
         ]);
+    }
+
+    /// REGRESSION sibling of
+    /// `rewrite_binds_carried_manifests_to_their_source_spec`, for the
+    /// ADDED-delete-files half of the same spec-arity class: a RowDelta
+    /// commit's new MoR delete files (V3 DVs) inherit their REFERENCED data
+    /// file's partition spec, so a key-set replace matching rows in files
+    /// written under an OLDER spec adds mixed-spec delete files in ONE
+    /// commit. Before the fix, `write_added_delete_manifest` wrote them all
+    /// through one writer bound to the current DEFAULT spec — the spec-0
+    /// DV's zero-literal partition tuple panicked in
+    /// `construct_partition_summaries` ("itertools: .zip_eq() reached end of
+    /// one iterator before the other"; the 2026-08-23 bronze-repair
+    /// crash-loop: the pyo3 boundary re-raised the panic and killed the
+    /// whole ingest lane). The fix groups added delete files by spec id —
+    /// one content=Deletes manifest per spec (Java
+    /// `MergingSnapshotProducer` parity).
+    #[tokio::test]
+    async fn row_delta_added_dvs_bind_delete_manifests_per_spec() {
+        let warehouse = TempDir::new().unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let ns = NamespaceIdent::new("db".to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        // The replace API needs a STRING key column — this test carries its
+        // own 3-column schema (id, k, flag) instead of the module's (id,
+        // flag) pair.
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "k", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "flag", Type::Primitive(PrimitiveType::Boolean)).into(),
+            ])
+            .build()
+            .unwrap();
+        let ident = TableIdent::new(ns.clone(), "t_dv_spec".to_string());
+        // S0: born UNPARTITIONED (spec-0).
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t_dv_spec".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let spec0_id = table.metadata().default_partition_spec_id();
+
+        // Local writer for the 3-column schema.
+        async fn write_row_file(
+            table: &Table,
+            name: &str,
+            rows: &[(i32, &str, Option<bool>)],
+            partition_key: Option<PartitionKey>,
+        ) -> DataFile {
+            let schema = table.metadata().current_schema().clone();
+            let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone()),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata()).unwrap(),
+                DefaultFileNameGenerator::new(name.to_string(), None, DataFileFormat::Parquet),
+            );
+            let arrow_schema: Arc<ArrowSchema> =
+                Arc::new(crate::arrow::schema_to_arrow_schema(&schema).unwrap());
+            let batch = RecordBatch::try_new(arrow_schema, vec![
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::LargeStringArray::from(
+                    rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ])
+            .unwrap();
+            let mut writer = DataFileWriterBuilder::new(rolling)
+                .build(partition_key)
+                .await
+                .unwrap();
+            writer.write(batch).await.unwrap();
+            let files = writer.close().await.unwrap();
+            assert_eq!(files.len(), 1);
+            files.into_iter().next().unwrap()
+        }
+
+        // S1: rows under spec-0 (zero partition literals; flag=true exists
+        // only as a column VALUE — the pre-partition-evolution shape).
+        let file_a = write_row_file(
+            &table,
+            "file-a",
+            &[(1, "k1", Some(true)), (2, "k2", Some(true))],
+            None,
+        )
+        .await;
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(vec![file_a])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        // Evolve: identity partition on `flag` becomes the default spec.
+        let table = catalog.load_table(&ident).await.unwrap();
+        let flag_id = table
+            .metadata()
+            .current_schema()
+            .field_id_by_name("flag")
+            .unwrap();
+        let evolve = TableCommit::builder()
+            .ident(ident.clone())
+            .updates(vec![
+                TableUpdate::AddSpec {
+                    spec: UnboundPartitionSpec::builder()
+                        .add_partition_field(flag_id, "flag".to_string(), Transform::Identity)
+                        .unwrap()
+                        .build(),
+                },
+                TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ])
+            .requirements(vec![])
+            .build();
+        let table = catalog.update_table(evolve).await.unwrap();
+        let spec1_id = table.metadata().default_partition_spec_id();
+        assert_ne!(spec0_id, spec1_id, "spec evolution must mint a new spec id");
+
+        // S2: a row under the NEW spec (one partition literal) — the replace
+        // below matches rows in BOTH specs' files.
+        let spec1_key = PartitionKey::new(
+            table.metadata().default_partition_spec().as_ref().clone(),
+            table.metadata().current_schema().clone(),
+            Struct::from_iter([Some(Literal::bool(true))]),
+        );
+        let file_c = write_row_file(&table, "file-c", &[(3, "k3", Some(true))], Some(spec1_key))
+            .await;
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files(vec![file_c])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        // S3: the repair-doorway path — replace keys k1 (spec-0 file) + k3
+        // (spec-1 file). Pre-fix this PANICKED writing the delete manifest.
+        let replacement_schema: Arc<ArrowSchema> = Arc::new(
+            crate::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap(),
+        );
+        let replacement = RecordBatch::try_new(replacement_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 3])),
+            Arc::new(arrow_array::LargeStringArray::from(vec!["k1", "k3"])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(true)])),
+        ])
+        .unwrap();
+        let out = atomic_partition_replace_key_set(
+            &catalog,
+            &ident,
+            "flag",
+            true,
+            "k",
+            HashSet::from(["k1".to_string(), "k3".to_string()]),
+            None,
+            &[],
+            vec![replacement],
+            HashMap::new(),
+            6,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.rows_appended, 2);
+        assert_eq!(out.delete_tuples, 2, "one prior row superseded per key");
+
+        // The committed snapshot carries one content=Deletes manifest PER
+        // SPEC, each bound to its entries' spec.
+        let table = catalog.load_table(&ident).await.unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let bytes = table
+            .file_io()
+            .new_input(snapshot.manifest_list())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let manifest_list =
+            ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
+        let mut delete_manifest_specs: Vec<i32> = manifest_list
+            .entries()
+            .iter()
+            .filter(|mf| {
+                mf.content == ManifestContentType::Deletes
+                    && mf.added_snapshot_id == snapshot.snapshot_id()
+            })
+            .map(|mf| mf.partition_spec_id)
+            .collect();
+        delete_manifest_specs.sort_unstable();
+        let mut expected = vec![spec0_id, spec1_id];
+        expected.sort_unstable();
+        assert_eq!(
+            delete_manifest_specs, expected,
+            "added delete files must be grouped into one manifest per spec"
+        );
+
+        // Read-back: exactly one live row per id after the replace.
+        let ids = scan_ids(&table).await;
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }

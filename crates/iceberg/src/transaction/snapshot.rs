@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeFrom;
 
@@ -498,9 +498,19 @@ impl<'a> SnapshotProducer<'a> {
         self.added_delete_files = delete_files;
     }
 
-    // Write a content=Deletes manifest for added MoR delete files (position/equality
-    // deletes, incl. V3 deletion vectors) and return the ManifestFile for the ManifestList.
-    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+    // Write content=Deletes manifests for added MoR delete files (position/
+    // equality deletes, incl. V3 deletion vectors) and return the ManifestFiles
+    // for the ManifestList — ONE MANIFEST PER PARTITION SPEC. A delete file
+    // inherits its REFERENCED data file's spec (a V3 DV targeting a file
+    // written under an older spec carries that older spec id + partition
+    // arity), so one commit can legitimately hold mixed-spec delete files on
+    // any table whose spec evolved. A manifest binds exactly ONE spec (Java
+    // parity: `MergingSnapshotProducer` keeps new delete files grouped by
+    // spec id); writing a foreign-arity entry through a default-spec writer
+    // panicked in `construct_partition_summaries` ("itertools: .zip_eq()
+    // reached end of one iterator before the other") — the 2026-08-23
+    // bronze-repair crash class (DVs on pre-partition-evolution op=R files).
+    async fn write_added_delete_manifest(&mut self) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
             return Err(Error::new(
@@ -511,21 +521,34 @@ impl<'a> SnapshotProducer<'a> {
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
-            let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
-                .data_file(delete_file);
-            if format_version == FormatVersion::V1 {
-                builder.snapshot_id(snapshot_id).build()
-            } else {
-                builder.build()
-            }
-        });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
-        for entry in manifest_entries {
-            writer.add_entry(entry)?;
+        // BTreeMap: deterministic manifest order across commits/attempts.
+        let mut by_spec: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
+        for delete_file in added_delete_files {
+            by_spec
+                .entry(delete_file.partition_spec_id)
+                .or_default()
+                .push(delete_file);
         }
-        writer.write_manifest_file().await
+        let mut manifests = Vec::with_capacity(by_spec.len());
+        for (spec_id, files) in by_spec {
+            let manifest_entries = files.into_iter().map(|delete_file| {
+                let builder = ManifestEntry::builder()
+                    .status(crate::spec::ManifestStatus::Added)
+                    .data_file(delete_file);
+                if format_version == FormatVersion::V1 {
+                    builder.snapshot_id(snapshot_id).build()
+                } else {
+                    builder.build()
+                }
+            });
+            let mut writer =
+                self.new_manifest_writer_for_spec_id(ManifestContentType::Deletes, spec_id)?;
+            for entry in manifest_entries {
+                writer.add_entry(entry)?;
+            }
+            manifests.push(writer.write_manifest_file().await?);
+        }
+        Ok(manifests)
     }
 
     // Write a data manifest containing DELETED-status entries and return the ManifestFile.
@@ -594,10 +617,12 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // Process added MoR delete files (content=Deletes manifest, e.g. V3 deletion vectors).
+        // Process added MoR delete files (content=Deletes manifests, e.g. V3
+        // deletion vectors) — one manifest per partition spec (see
+        // `write_added_delete_manifest`).
         if !self.added_delete_files.is_empty() {
-            let added_delete_manifest = self.write_added_delete_manifest().await?;
-            manifest_files.push(added_delete_manifest);
+            let added_delete_manifests = self.write_added_delete_manifest().await?;
+            manifest_files.extend(added_delete_manifests);
         }
 
         // Process delete entries.
