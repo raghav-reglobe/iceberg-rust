@@ -179,6 +179,9 @@ fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult
 /// pool's total reservation would exceed `limit - reserve` (the sorter then
 /// spills and retries — its normal path), while unspillable requests pass
 /// straight to the inner pool and always find at least `reserve` bytes free.
+/// A spillable consumer holding nothing yet always gets its first grant
+/// (a sorter with no in-memory batches cannot spill, so refusing it would
+/// be a hard failure); the cap governs growth.
 /// Unspillable consumers still fail cleanly at the true limit (the inner
 /// pool's top-consumers report is preserved on that path).
 ///
@@ -253,7 +256,12 @@ impl MemoryPool for UnspillableReservePool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> datafusion::common::Result<()> {
-        if reservation.consumer().can_spill() {
+        // The cap applies to GROWTH: a spillable consumer holding nothing yet
+        // always gets its first grant (bounded by one batch). Refusing it
+        // would be a hard failure — a sorter with no in-memory batches has
+        // nothing to spill — while a late-starting sorter meeting a pool
+        // already at the cap is exactly what a skewed partition produces.
+        if reservation.consumer().can_spill() && reservation.size() > 0 {
             let reserved = self.inner.reserved();
             if reserved.saturating_add(additional) > self.spillable_cap {
                 return Err(resources_datafusion_err!(
@@ -1151,6 +1159,18 @@ mod unspillable_reserve_tests {
         // once the sorter spills (shrinks), the join can proceed
         sorter.shrink(300);
         join.try_grow(100).expect("freed spillable memory is usable by unspillable");
+        assert_eq!(p.reserved(), 700);
+    }
+
+    #[test]
+    fn empty_spillable_always_gets_its_first_grant() {
+        let p = pool(1000, 40); // spillable_cap = 600
+        let mut fat = MemoryConsumer::new("fat").with_can_spill(true).register(&p);
+        let mut thin = MemoryConsumer::new("thin").with_can_spill(true).register(&p);
+        fat.try_grow(600).unwrap();
+        thin.try_grow(100).expect("first grant passes even at the cap");
+        assert!(thin.try_grow(1).is_err(), "growth beyond the cap is refused");
+        assert!(fat.try_grow(1).is_err());
         assert_eq!(p.reserved(), 700);
     }
 
