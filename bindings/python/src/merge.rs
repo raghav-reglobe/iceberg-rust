@@ -34,9 +34,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::execution::context::SessionContext;
+use datafusion::common::resources_datafusion_err;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
-    TrackConsumersPool, UnboundedMemoryPool,
+    TrackConsumersPool, UnboundedMemoryPool, human_readable_size,
 };
 use datafusion::physical_plan::displayable;
 use iceberg::{Catalog, CatalogBuilder};
@@ -164,6 +165,121 @@ fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult
 /// (join builds, sorts, aggregates) — arrow allocations made directly by the
 /// merge exec nodes (fetch batches, evaluated SET stores, writer buffers)
 /// are byte-bounded separately and do not pass through the pool.
+/// Keeps the LAST `reserve` bytes of a bounded pool for consumers that
+/// cannot spill.
+///
+/// DataFusion's `ExternalSorter` grows its (spillable) in-memory reservation
+/// until the pool refuses and only THEN spills. Under a greedy pool, N sort
+/// partitions therefore fill 100% of the pool with spillable batches, and
+/// whichever UNSPILLABLE consumer asks next — the hash-join build side, a
+/// partition's own pre-spill merge reservation — fails the whole statement.
+/// Pool SIZE only scales the fill: the same hot-key bucket class failed at
+/// 18G, 30G and 36.9G pools with one signature (2026-09-07). This wrapper
+/// changes the RULE instead: a spillable `try_grow` is refused once the
+/// pool's total reservation would exceed `limit - reserve` (the sorter then
+/// spills and retries — its normal path), while unspillable requests pass
+/// straight to the inner pool and always find at least `reserve` bytes free.
+/// Unspillable consumers still fail cleanly at the true limit (the inner
+/// pool's top-consumers report is preserved on that path).
+///
+/// Installed only when `MERGE_DF_UNSPILLABLE_RESERVE_PCT` (1..=90, percent of
+/// the bounded limit) is set on a bounded pool; unset = the pre-existing
+/// greedy behaviour, byte-identical.
+#[derive(Debug)]
+struct UnspillableReservePool {
+    inner: Arc<dyn MemoryPool>,
+    /// The bounded limit of the inner pool.
+    limit: usize,
+    /// `limit - reserve`: the most the pool may hold in TOTAL at the moment a
+    /// spillable consumer is granted more.
+    spillable_cap: usize,
+}
+
+impl UnspillableReservePool {
+    fn new(inner: Arc<dyn MemoryPool>, limit: usize, reserve_pct: usize) -> Self {
+        let reserve = limit / 100 * reserve_pct.min(90);
+        Self {
+            inner,
+            limit,
+            spillable_cap: limit.saturating_sub(reserve),
+        }
+    }
+
+    /// `MERGE_DF_UNSPILLABLE_RESERVE_PCT` parsed and bounded to 1..=90;
+    /// `None` = no reserve (unset, unparsable, or out of range).
+    fn reserve_pct_from_env() -> Option<usize> {
+        std::env::var("MERGE_DF_UNSPILLABLE_RESERVE_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|p| (1..=90).contains(p))
+    }
+}
+
+impl std::fmt::Display for UnspillableReservePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "UnspillableReservePool(spillable_cap: {}, limit: {}, inner: {})",
+            human_readable_size(self.spillable_cap),
+            human_readable_size(self.limit),
+            self.inner
+        )
+    }
+}
+
+impl MemoryPool for UnspillableReservePool {
+    fn name(&self) -> &str {
+        "unspillable_reserve"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::common::Result<()> {
+        if reservation.consumer().can_spill() {
+            let reserved = self.inner.reserved();
+            if reserved.saturating_add(additional) > self.spillable_cap {
+                return Err(resources_datafusion_err!(
+                    "Failed to allocate additional {} for {} (spillable) with {} already allocated for this reservation - spillable consumers are capped at {} of the {} pool ({} kept for unspillable consumers); {} reserved in total",
+                    human_readable_size(additional),
+                    reservation.consumer().name(),
+                    human_readable_size(reservation.size()),
+                    human_readable_size(self.spillable_cap),
+                    human_readable_size(self.limit),
+                    human_readable_size(self.limit - self.spillable_cap),
+                    human_readable_size(reserved)
+                ));
+            }
+        }
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
+
 #[derive(Debug)]
 struct PeakTrackingPool {
     inner: Arc<dyn MemoryPool>,
@@ -278,10 +394,21 @@ async fn session_with_catalogs(
         .and_then(|v| v.parse::<usize>().ok())
     {
         None => Arc::new(UnboundedMemoryPool::default()),
-        Some(limit_mb) => Arc::new(TrackConsumersPool::new(
-            GreedyMemoryPool::new(limit_mb * 1024 * 1024),
-            std::num::NonZeroUsize::new(5).expect("non-zero"),
-        )),
+        Some(limit_mb) => {
+            let limit = limit_mb * 1024 * 1024;
+            let tracked: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
+                GreedyMemoryPool::new(limit),
+                std::num::NonZeroUsize::new(5).expect("non-zero"),
+            ));
+            // MERGE_DF_UNSPILLABLE_RESERVE_PCT: keep the last N% of the bounded
+            // pool for consumers that cannot spill (see UnspillableReservePool).
+            // Unset = the greedy pool alone, byte-identical to before.
+            match UnspillableReservePool::reserve_pct_from_env() {
+                Some(pct) => Arc::new(UnspillableReservePool::new(tracked, limit, pct))
+                    as Arc<dyn MemoryPool>,
+                None => tracked,
+            }
+        }
     };
     let pool = Arc::new(PeakTrackingPool::new(inner));
     let mut rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
@@ -1000,4 +1127,52 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(sql_collect_ipc, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod unspillable_reserve_tests {
+    use super::*;
+
+    fn pool(limit: usize, pct: usize) -> Arc<dyn MemoryPool> {
+        let greedy: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        Arc::new(UnspillableReservePool::new(greedy, limit, pct))
+    }
+
+    #[test]
+    fn spillable_is_capped_below_the_reserve_and_unspillable_is_not() {
+        let p = pool(1000, 40); // spillable_cap = 600
+        let mut sorter = MemoryConsumer::new("sorter").with_can_spill(true).register(&p);
+        let mut join = MemoryConsumer::new("join").with_can_spill(false).register(&p);
+        sorter.try_grow(600).expect("spillable fills up to the cap");
+        assert!(sorter.try_grow(1).is_err(), "spillable may not enter the reserve");
+        join.try_grow(300).expect("unspillable grows into the reserve");
+        assert_eq!(p.reserved(), 900);
+        assert!(join.try_grow(200).is_err(), "unspillable still bounded by the limit");
+        // once the sorter spills (shrinks), the join can proceed
+        sorter.shrink(300);
+        join.try_grow(100).expect("freed spillable memory is usable by unspillable");
+        assert_eq!(p.reserved(), 700);
+    }
+
+    #[test]
+    fn spillable_cap_accounts_for_unspillable_holdings() {
+        let p = pool(1000, 20); // spillable_cap = 800
+        let mut join = MemoryConsumer::new("join").with_can_spill(false).register(&p);
+        let mut sorter = MemoryConsumer::new("sorter").with_can_spill(true).register(&p);
+        join.try_grow(500).unwrap();
+        // total may not exceed 800 when a spillable asks: 500 + 300 ok, +1 refused
+        sorter.try_grow(300).unwrap();
+        assert!(sorter.try_grow(1).is_err());
+    }
+
+    #[test]
+    fn env_parse_is_bounded() {
+        for (raw, want) in [("40", Some(40)), (" 5 ", Some(5)), ("90", Some(90)),
+                            ("0", None), ("91", None), ("abc", None), ("", None)] {
+            unsafe { std::env::set_var("MERGE_DF_UNSPILLABLE_RESERVE_PCT", raw) };
+            assert_eq!(UnspillableReservePool::reserve_pct_from_env(), want, "raw={raw:?}");
+        }
+        unsafe { std::env::remove_var("MERGE_DF_UNSPILLABLE_RESERVE_PCT") };
+        assert_eq!(UnspillableReservePool::reserve_pct_from_env(), None);
+    }
 }
