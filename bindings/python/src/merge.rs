@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
-use datafusion::execution::context::SessionContext;
 use datafusion::common::resources_datafusion_err;
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
     TrackConsumersPool, UnboundedMemoryPool, human_readable_size,
@@ -1149,27 +1149,45 @@ mod unspillable_reserve_tests {
     #[test]
     fn spillable_is_capped_below_the_reserve_and_unspillable_is_not() {
         let p = pool(1000, 40); // spillable_cap = 600
-        let mut sorter = MemoryConsumer::new("sorter").with_can_spill(true).register(&p);
-        let mut join = MemoryConsumer::new("join").with_can_spill(false).register(&p);
+        let sorter = MemoryConsumer::new("sorter")
+            .with_can_spill(true)
+            .register(&p);
+        let join = MemoryConsumer::new("join")
+            .with_can_spill(false)
+            .register(&p);
         sorter.try_grow(600).expect("spillable fills up to the cap");
-        assert!(sorter.try_grow(1).is_err(), "spillable may not enter the reserve");
-        join.try_grow(300).expect("unspillable grows into the reserve");
+        assert!(
+            sorter.try_grow(1).is_err(),
+            "spillable may not enter the reserve"
+        );
+        join.try_grow(300)
+            .expect("unspillable grows into the reserve");
         assert_eq!(p.reserved(), 900);
-        assert!(join.try_grow(200).is_err(), "unspillable still bounded by the limit");
+        assert!(
+            join.try_grow(200).is_err(),
+            "unspillable still bounded by the limit"
+        );
         // once the sorter spills (shrinks), the join can proceed
         sorter.shrink(300);
-        join.try_grow(100).expect("freed spillable memory is usable by unspillable");
+        join.try_grow(100)
+            .expect("freed spillable memory is usable by unspillable");
         assert_eq!(p.reserved(), 700);
     }
 
     #[test]
     fn empty_spillable_always_gets_its_first_grant() {
         let p = pool(1000, 40); // spillable_cap = 600
-        let mut fat = MemoryConsumer::new("fat").with_can_spill(true).register(&p);
-        let mut thin = MemoryConsumer::new("thin").with_can_spill(true).register(&p);
+        let fat = MemoryConsumer::new("fat").with_can_spill(true).register(&p);
+        let thin = MemoryConsumer::new("thin")
+            .with_can_spill(true)
+            .register(&p);
         fat.try_grow(600).unwrap();
-        thin.try_grow(100).expect("first grant passes even at the cap");
-        assert!(thin.try_grow(1).is_err(), "growth beyond the cap is refused");
+        thin.try_grow(100)
+            .expect("first grant passes even at the cap");
+        assert!(
+            thin.try_grow(1).is_err(),
+            "growth beyond the cap is refused"
+        );
         assert!(fat.try_grow(1).is_err());
         assert_eq!(p.reserved(), 700);
     }
@@ -1177,8 +1195,12 @@ mod unspillable_reserve_tests {
     #[test]
     fn spillable_cap_accounts_for_unspillable_holdings() {
         let p = pool(1000, 20); // spillable_cap = 800
-        let mut join = MemoryConsumer::new("join").with_can_spill(false).register(&p);
-        let mut sorter = MemoryConsumer::new("sorter").with_can_spill(true).register(&p);
+        let join = MemoryConsumer::new("join")
+            .with_can_spill(false)
+            .register(&p);
+        let sorter = MemoryConsumer::new("sorter")
+            .with_can_spill(true)
+            .register(&p);
         join.try_grow(500).unwrap();
         // total may not exceed 800 when a spillable asks: 500 + 300 ok, +1 refused
         sorter.try_grow(300).unwrap();
@@ -1187,10 +1209,21 @@ mod unspillable_reserve_tests {
 
     #[test]
     fn env_parse_is_bounded() {
-        for (raw, want) in [("40", Some(40)), (" 5 ", Some(5)), ("90", Some(90)),
-                            ("0", None), ("91", None), ("abc", None), ("", None)] {
+        for (raw, want) in [
+            ("40", Some(40)),
+            (" 5 ", Some(5)),
+            ("90", Some(90)),
+            ("0", None),
+            ("91", None),
+            ("abc", None),
+            ("", None),
+        ] {
             unsafe { std::env::set_var("MERGE_DF_UNSPILLABLE_RESERVE_PCT", raw) };
-            assert_eq!(UnspillableReservePool::reserve_pct_from_env(), want, "raw={raw:?}");
+            assert_eq!(
+                UnspillableReservePool::reserve_pct_from_env(),
+                want,
+                "raw={raw:?}"
+            );
         }
         unsafe { std::env::remove_var("MERGE_DF_UNSPILLABLE_RESERVE_PCT") };
         assert_eq!(UnspillableReservePool::reserve_pct_from_env(), None);

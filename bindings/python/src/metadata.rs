@@ -689,6 +689,342 @@ fn manifest_stats(
     Ok(d.into_any().unbind())
 }
 
+// ── cdc_probe ────────────────────────────────────────────────────────────────
+// The merge worker's per-slice bronze probe, on the SAME parquet stack that
+// writes bronze (the ingest lane's compaction writes parquet-rs files). It
+// replaces a pyarrow (Arrow C++) read of the whole `_cdc` struct: pyarrow
+// 25.0.0 mis-decoded 1-bit RLE_DICTIONARY indices on Neoverse V1 and aborted
+// the worker from a C++ thread (2026-09-19/20 incident). Raw facts only — the
+// caller keeps every gate/fail-open rule:
+//   * `rows`   — footer row count.
+//   * `ops`    — distinct non-null `_cdc.op` values, read through a ONE-LEAF
+//                projection (the old read decoded all seven `_cdc` leaves);
+//                stops early once both an R-class and a non-R value are seen.
+//   * `stats`  — per requested leaf path: footer min/max aggregated over row
+//                groups, typed `ts` (epoch micros) or `int`, with `present`,
+//                `missing` (some row group lacks min/max) and `other` (some
+//                row group's stats are neither of the wanted types) flags.
+// Fail-open PER FILE: a file that cannot be probed returns `{"path","error"}`.
+
+const CDC_OP_LEAF: &str = "_cdc.op";
+
+#[derive(Default, Debug, Clone, PartialEq)]
+struct LeafStats {
+    present: bool,
+    missing: bool,
+    other: bool,
+    /// "ts" | "int" | "" (no typed stats seen)
+    kind: &'static str,
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+#[derive(Default, Debug)]
+struct FileProbe {
+    path: String,
+    /// The footer parsed: `rows`/`stats` are valid even when `error` is set
+    /// (an error then means only the `_cdc.op` read failed).
+    footer_ok: bool,
+    rows: i64,
+    ops: Option<Vec<String>>,
+    stats: Vec<(String, LeafStats)>,
+    error: Option<String>,
+}
+
+fn is_r_class(op: &str) -> bool {
+    op.eq_ignore_ascii_case("r")
+}
+
+/// Footer statistics of one leaf, aggregated over every row group.
+fn leaf_stats(md: &parquet::file::metadata::ParquetMetaData, leaf_path: &str) -> LeafStats {
+    use parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType};
+    use parquet::file::statistics::Statistics;
+    let mut out = LeafStats::default();
+    let descr = md.file_metadata().schema_descr();
+    let Some(j) = (0..descr.num_columns()).find(|&j| descr.column(j).path().string() == leaf_path)
+    else {
+        return out;
+    };
+    out.present = true;
+    let col = descr.column(j);
+    // Timestamp unit -> micros multiplier/divisor. None = not a timestamp.
+    let ts_to_micros: Option<(i64, i64)> = match col.logical_type_ref() {
+        Some(LogicalType::Timestamp(t)) => Some(match t.unit {
+            TimeUnit::MILLIS => (1_000, 1),
+            TimeUnit::MICROS => (1, 1),
+            TimeUnit::NANOS => (1, 1_000),
+        }),
+        Some(_) => None,
+        None => match col.converted_type() {
+            ConvertedType::TIMESTAMP_MILLIS => Some((1_000, 1)),
+            ConvertedType::TIMESTAMP_MICROS => Some((1, 1)),
+            _ => None,
+        },
+    };
+    // Plain signed integers only (an unsigned/decimal/date/time annotation is
+    // not an exact int bound for the caller) — fail safe to `other`.
+    let plain_int = matches!(
+        col.physical_type(),
+        PhysicalType::INT32 | PhysicalType::INT64
+    ) && ts_to_micros.is_none()
+        && match col.logical_type_ref() {
+            None => matches!(
+                col.converted_type(),
+                ConvertedType::NONE
+                    | ConvertedType::INT_8
+                    | ConvertedType::INT_16
+                    | ConvertedType::INT_32
+                    | ConvertedType::INT_64
+            ),
+            Some(LogicalType::Integer(int)) => int.is_signed,
+            Some(_) => false,
+        };
+    for rg in md.row_groups() {
+        let raw: Option<(i64, i64)> = match rg.column(j).statistics() {
+            Some(Statistics::Int64(v)) => match (v.min_opt(), v.max_opt()) {
+                (Some(lo), Some(hi)) => Some((*lo, *hi)),
+                _ => None,
+            },
+            Some(Statistics::Int32(v)) => match (v.min_opt(), v.max_opt()) {
+                (Some(lo), Some(hi)) => Some((*lo as i64, *hi as i64)),
+                _ => None,
+            },
+            Some(_) => {
+                out.other = true;
+                continue;
+            }
+            None => None,
+        };
+        let Some((lo, hi)) = raw else {
+            out.missing = true;
+            continue;
+        };
+        let (lo, hi, kind) = if let Some((mul, div)) = ts_to_micros {
+            (
+                lo.saturating_mul(mul) / div,
+                hi.saturating_mul(mul) / div,
+                "ts",
+            )
+        } else if plain_int {
+            (lo, hi, "int")
+        } else {
+            out.other = true;
+            continue;
+        };
+        out.kind = kind;
+        out.min = Some(out.min.map_or(lo, |m| m.min(lo)));
+        out.max = Some(out.max.map_or(hi, |m| m.max(hi)));
+    }
+    out
+}
+
+/// Distinct non-null strings of a (possibly nested) arrow array's single
+/// string leaf — walks struct wrappers down to the leaf the projection kept.
+fn collect_ops(
+    array: &arrow::array::ArrayRef,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::DataType;
+    match array.data_type() {
+        DataType::Struct(_) => {
+            let st = array.as_struct();
+            if st.num_columns() != 1 {
+                return Err(format!(
+                    "projection kept {} children of `_cdc`, expected 1",
+                    st.num_columns()
+                ));
+            }
+            collect_ops(st.column(0), seen)
+        }
+        _ => {
+            let utf8 = arrow::compute::cast(array, &DataType::Utf8)
+                .map_err(|e| format!("cast `_cdc.op` to utf8: {e}"))?;
+            let strs = utf8.as_string::<i32>();
+            for i in 0..strs.len() {
+                if strs.is_valid(i) {
+                    let v = strs.value(i);
+                    if !seen.contains(v) {
+                        seen.insert(v.to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Probe one parquet file through any async reader (S3 via the table's
+/// FileIO in production; a local file in tests).
+async fn probe_parquet<R>(
+    path: String,
+    mut reader: R,
+    stat_leaves: &[String],
+    want_ops: bool,
+) -> FileProbe
+where
+    R: parquet::arrow::async_reader::AsyncFileReader + Unpin + Send + 'static,
+{
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    let mut out = FileProbe {
+        path,
+        ..Default::default()
+    };
+    let meta = match ArrowReaderMetadata::load_async(&mut reader, Default::default()).await {
+        Ok(m) => m,
+        Err(e) => {
+            out.error = Some(format!("footer: {e}"));
+            return out;
+        }
+    };
+    let md = meta.metadata().clone();
+    out.footer_ok = true;
+    out.rows = md.file_metadata().num_rows();
+    out.stats = stat_leaves
+        .iter()
+        .map(|p| (p.clone(), leaf_stats(&md, p)))
+        .collect();
+    if !want_ops || out.rows == 0 {
+        return out;
+    }
+    let descr = md.file_metadata().schema_descr();
+    let Some(leaf) =
+        (0..descr.num_columns()).find(|&j| descr.column(j).path().string() == CDC_OP_LEAF)
+    else {
+        out.error = Some(format!("no `{CDC_OP_LEAF}` leaf"));
+        return out;
+    };
+    let mask = ProjectionMask::leaves(descr, [leaf]);
+    let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, meta)
+        .with_projection(mask)
+        .with_batch_size(65_536)
+        .build();
+    let mut stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            out.error = Some(format!("open `{CDC_OP_LEAF}`: {e}"));
+            return out;
+        }
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(batch) = stream.next().await {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                out.error = Some(format!("read `{CDC_OP_LEAF}`: {e}"));
+                return out;
+            }
+        };
+        if batch.num_columns() != 1 {
+            out.error = Some(format!("projection kept {} columns", batch.num_columns()));
+            return out;
+        }
+        if let Err(e) = collect_ops(batch.column(0), &mut seen) {
+            out.error = Some(e);
+            return out;
+        }
+        // Both classes present: the caller's gate is already decided.
+        if seen.iter().any(|o| is_r_class(o)) && seen.iter().any(|o| !is_r_class(o)) {
+            break;
+        }
+    }
+    out.ops = Some(seen.into_iter().collect());
+    out
+}
+
+/// Per-slice bronze probe: `[{path, rows, ops, stats: {leaf: {...}}} | {path,
+/// error}]` for each of `paths` (order preserved). ONE `loadTable` for the
+/// FileIO; footers + the single `_cdc.op` leaf are the only bytes read.
+/// `stat_leaves` = leaf paths whose footer min/max the caller wants
+/// (`_cdc.ts`, a business timestamp, a single-column integer PK).
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, paths, stat_leaves=None, want_ops=true, timeout_s=None))]
+fn cdc_probe(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    paths: Vec<String>,
+    stat_leaves: Option<Vec<String>>,
+    want_ops: bool,
+    timeout_s: Option<u64>,
+) -> PyResult<Py<PyAny>> {
+    use iceberg::arrow::ArrowFileReader;
+    use iceberg::io::FileMetadata;
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    let stat_leaves = stat_leaves.unwrap_or_default();
+    let probes: Vec<FileProbe> = py.detach(|| {
+        runtime().block_on(metadata_deadline(
+            timeout_s,
+            "probing bronze files",
+            async move {
+                let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
+                let file_io = table.file_io().clone();
+                let leaves = std::sync::Arc::new(stat_leaves);
+                let out: Vec<FileProbe> = futures::stream::iter(paths.into_iter().map(|path| {
+                    let file_io = file_io.clone();
+                    let leaves = leaves.clone();
+                    async move {
+                        let fail = |path: String, e: String| FileProbe {
+                            path,
+                            error: Some(e),
+                            ..Default::default()
+                        };
+                        let input = match file_io.new_input(&path) {
+                            Ok(i) => i,
+                            Err(e) => return fail(path, format!("open: {e}")),
+                        };
+                        let size = match input.metadata().await {
+                            Ok(m) => m.size,
+                            Err(e) => return fail(path, format!("stat: {e}")),
+                        };
+                        let reader = match input.reader().await {
+                            Ok(r) => r,
+                            Err(e) => return fail(path, format!("reader: {e}")),
+                        };
+                        let pr = ArrowFileReader::new(FileMetadata { size }, reader);
+                        probe_parquet(path, pr, &leaves, want_ops).await
+                    }
+                }))
+                .buffered(8)
+                .collect()
+                .await;
+                Ok::<_, PyErr>(out)
+            },
+        ))
+    })?;
+    let out = PyList::empty(py);
+    for p in &probes {
+        let d = PyDict::new(py);
+        d.set_item("path", &p.path)?;
+        if let Some(e) = &p.error {
+            d.set_item("error", e)?;
+            // rows may still be known (footer read, op read failed)
+        }
+        d.set_item("footer_ok", p.footer_ok)?;
+        d.set_item("rows", p.rows)?;
+        match &p.ops {
+            None => d.set_item("ops", py.None())?,
+            Some(v) => d.set_item("ops", v.clone())?,
+        }
+        let sd = PyDict::new(py);
+        for (leaf, st) in &p.stats {
+            let one = PyDict::new(py);
+            one.set_item("present", st.present)?;
+            one.set_item("missing", st.missing)?;
+            one.set_item("other", st.other)?;
+            one.set_item("kind", st.kind)?;
+            one.set_item("min", st.min)?;
+            one.set_item("max", st.max)?;
+            sd.set_item(leaf, one)?;
+        }
+        d.set_item("stats", sd)?;
+        out.append(d)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "metadata")?;
     this.add_function(wrap_pyfunction!(head, &this)?)?;
@@ -696,6 +1032,132 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(manifest_stats, &this)?)?;
     this.add_function(wrap_pyfunction!(location, &this)?)?;
     this.add_function(wrap_pyfunction!(data_files, &this)?)?;
+    this.add_function(wrap_pyfunction!(cdc_probe, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cdc_probe_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+
+    /// A bronze-shaped file: `id` int64, `uzi_updated` ts, `_cdc{op, ts, offset}`.
+    /// Dictionary encoding is on by default, so a 2-value `op` column gets the
+    /// 1-bit RLE_DICTIONARY indices that the incident files carry.
+    fn write_file(path: &std::path::Path, ops: &[Option<&str>], row_group_rows: usize) {
+        let n = ops.len();
+        let id: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| 100 + i)));
+        let upd: ArrayRef = Arc::new(TimestampMicrosecondArray::from_iter_values(
+            (0..n as i64).map(|i| 1_700_000_000_000_000 + i * 1_000_000),
+        ));
+        let op: ArrayRef = Arc::new(StringArray::from(ops.to_vec()));
+        let cts: ArrayRef = Arc::new(TimestampMicrosecondArray::from_iter_values(
+            (0..n as i64).map(|i| 1_700_000_500_000_000 + i * 1_000_000),
+        ));
+        let off: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
+        let cdc_fields = vec![
+            Arc::new(Field::new("op", DataType::Utf8, true)),
+            Arc::new(Field::new(
+                "ts",
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new("offset", DataType::Int64, false)),
+        ];
+        let cdc: ArrayRef = Arc::new(StructArray::new(
+            cdc_fields.clone().into(),
+            vec![op, cts, off],
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "uzi_updated",
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("_cdc", DataType::Struct(cdc_fields.into()), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id, upd, cdc]).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group_rows))
+            .build();
+        let mut w = ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props))
+            .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn probe(path: &std::path::Path, leaves: &[&str], want_ops: bool) -> FileProbe {
+        let leaves: Vec<String> = leaves.iter().map(|s| s.to_string()).collect();
+        let p = path.to_str().unwrap().to_string();
+        runtime().block_on(async {
+            let f = tokio::fs::File::open(&p).await.unwrap();
+            probe_parquet(p.clone(), f, &leaves, want_ops).await
+        })
+    }
+
+    #[test]
+    fn two_value_dictionary_op_column_reads_exactly() {
+        // 200k rows of alternating U/I = the incident shape (1-bit indices),
+        // across several row groups.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cdc.parquet");
+        let ops: Vec<Option<&str>> = (0..200_000)
+            .map(|i| Some(if i % 3 == 0 { "U" } else { "I" }))
+            .collect();
+        write_file(&path, &ops, 65_536);
+        let out = probe(&path, &["_cdc.ts", "uzi_updated", "id"], true);
+        assert_eq!(out.error, None);
+        assert!(out.footer_ok);
+        assert_eq!(out.rows, 200_000);
+        assert_eq!(out.ops, Some(vec!["I".to_string(), "U".to_string()]));
+        let st: HashMap<_, _> = out.stats.into_iter().collect();
+        let ts = &st["_cdc.ts"];
+        assert!(ts.present && !ts.missing && !ts.other && ts.kind == "ts");
+        assert_eq!(ts.min, Some(1_700_000_500_000_000));
+        assert_eq!(ts.max, Some(1_700_000_500_000_000 + 199_999 * 1_000_000));
+        let id = &st["id"];
+        assert!(id.present && id.kind == "int");
+        assert_eq!((id.min, id.max), (Some(100), Some(100 + 199_999)));
+    }
+
+    #[test]
+    fn r_class_mix_stops_early_and_nulls_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.parquet");
+        let mut ops: Vec<Option<&str>> = vec![None, Some("r"), Some("U")];
+        ops.extend(std::iter::repeat(Some("D")).take(500_000));
+        write_file(&path, &ops, 100_000);
+        let out = probe(&path, &[], true);
+        assert_eq!(out.error, None);
+        let got = out.ops.unwrap();
+        // the first batch already holds an R-class and a non-R value -> early
+        // stop: "D" may or may not be present, the gate inputs must be.
+        assert!(got.iter().any(|o| is_r_class(o)) && got.iter().any(|o| !is_r_class(o)));
+        assert!(!got.iter().any(|o| o.is_empty()));
+    }
+
+    #[test]
+    fn only_r_and_absent_leaf_and_no_ops_wanted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.parquet");
+        write_file(&path, &vec![Some("R"); 10], 1024);
+        let out = probe(&path, &["nope", "_cdc.op"], true);
+        assert_eq!(out.ops, Some(vec!["R".to_string()]));
+        let st: HashMap<_, _> = out.stats.into_iter().collect();
+        assert!(!st["nope"].present);
+        // a string leaf has stats of neither wanted type
+        assert!(st["_cdc.op"].present && st["_cdc.op"].other && st["_cdc.op"].min.is_none());
+        let out = probe(&path, &[], false);
+        assert_eq!((out.rows, out.ops), (10, None));
+    }
 }
