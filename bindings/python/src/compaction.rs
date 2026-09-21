@@ -87,16 +87,19 @@ fn compact(
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
 
+    // The engine reports progress as `tracing` events; render them on stderr.
+    crate::progress::install();
+
     let mut cfg = Config::default();
-    // Cooperative BUDGET (soft): between groups the pass stops starting new
-    // ones once the next would cross it at the pass's own slowest group
-    // pace, and COMMITS what it finished — the result's `complete` = 0 says
-    // planned work remains. The first group always runs. See `Config::budget`.
     // Groups rewritten at once (default 1). Memory-bound, not core-bound:
     // the caller derives it from what it measured. See the Config field.
     if let Some(n) = max_concurrent_groups {
         cfg.max_concurrent_groups = n.max(1);
     }
+    // Cooperative BUDGET (soft): between groups the pass stops starting new
+    // ones once the next would cross it at the pass's own slowest group
+    // pace, and COMMITS what it finished — the result's `complete` = 0 says
+    // planned work remains. The first group always runs. See `Config::budget`.
     // Out-of-range seconds (infinity, 1e300) mean "no bound", never a panic.
     let now = std::time::Instant::now();
     cfg.budget = match budget_s {

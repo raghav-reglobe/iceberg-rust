@@ -106,6 +106,19 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
     Ok(out)
 }
 
+/// `tracing` target of a pass's PROGRESS events: one event per phase (`load`,
+/// `plan`, `commit`, `done`), per group started (`rewrite`) and finished
+/// (`group-done`, with its own `wall_s`), plus `budget-stop` and
+/// `group-skipped`. The library prints nothing; an application that wants
+/// progress — a hang self-reports by its last event, and the phase it dies in
+/// scopes the diagnosis — subscribes to this target.
+pub const PROGRESS_TARGET: &str = "iceberg_compaction::progress";
+
+/// Whole seconds, rounded — progress events carry integers.
+fn secs(d: std::time::Duration) -> u64 {
+    d.as_secs_f64().round() as u64
+}
+
 /// What a [`compact_table`] pass did. `complete == false` means the pass was
 /// budget-bounded ([`Config::budget`]) and committed only the groups it
 /// finished — the table still holds planned work for a later pass.
@@ -153,13 +166,14 @@ pub async fn compact_table(
     ident: &TableIdent,
     cfg: &Config,
 ) -> Result<CompactOutcome> {
-    // Phase progress to stderr: a hang self-reports by its last phase line,
-    // and the phase it dies in scopes the diagnosis.
+    // Progress events — see [`PROGRESS_TARGET`].
     let t0 = std::time::Instant::now();
     let phase = |name: &str| {
-        eprintln!(
-            "compact-phase table={ident} phase={name} elapsed_s={:.0}",
-            t0.elapsed().as_secs_f64()
+        tracing::info!(
+            target: PROGRESS_TARGET,
+            table = %ident,
+            phase = name,
+            elapsed_s = secs(t0.elapsed())
         );
     };
     phase("load");
@@ -208,11 +222,14 @@ pub async fn compact_table(
                 && started > 0
                 && std::time::Instant::now() + slowest_group >= budget
             {
-                eprintln!(
-                    "compact-phase table={ident} phase=budget-stop groups_started={started}/{n_groups} in_flight={} slowest_group_s={:.0} elapsed_s={:.0}",
-                    in_flight.len(),
-                    slowest_group.as_secs_f64(),
-                    t0.elapsed().as_secs_f64()
+                tracing::info!(
+                    target: PROGRESS_TARGET,
+                    table = %ident,
+                    phase = "budget-stop",
+                    groups_started = %format_args!("{started}/{n_groups}"),
+                    in_flight = in_flight.len(),
+                    slowest_group_s = secs(slowest_group),
+                    elapsed_s = secs(t0.elapsed())
                 );
                 stop_starting = true;
                 break;
@@ -220,10 +237,13 @@ pub async fn compact_table(
             let idx = order[started];
             started += 1;
             let gi = started; // 1-based position in execution order
-            eprintln!(
-                "compact-phase table={ident} phase=rewrite group={gi}/{n_groups} files={} elapsed_s={:.0}",
-                plan.groups[idx].tasks.len(),
-                t0.elapsed().as_secs_f64()
+            tracing::info!(
+                target: PROGRESS_TARGET,
+                table = %ident,
+                phase = "rewrite",
+                group = %format_args!("{gi}/{n_groups}"),
+                files = plan.groups[idx].tasks.len(),
+                elapsed_s = secs(t0.elapsed())
             );
             let (table, reader, plan, task_cfg) = (
                 table.clone(),
@@ -257,12 +277,15 @@ pub async fn compact_table(
             }
         };
         let group = &plan.groups[idx];
-        eprintln!(
-            "compact-phase table={ident} phase=group-done group={gi}/{n_groups} files={} wall_s={:.0} in_flight={} elapsed_s={:.0}",
-            group.tasks.len(),
-            wall.as_secs_f64(),
-            in_flight.len(),
-            t0.elapsed().as_secs_f64()
+        tracing::info!(
+            target: PROGRESS_TARGET,
+            table = %ident,
+            phase = "group-done",
+            group = %format_args!("{gi}/{n_groups}"),
+            files = group.tasks.len(),
+            wall_s = secs(wall),
+            in_flight = in_flight.len(),
+            elapsed_s = secs(t0.elapsed())
         );
         slowest_group = slowest_group.max(wall);
         handled += 1;
@@ -284,9 +307,13 @@ pub async fn compact_table(
             // deleting data a broken read failed to surface.
             if !group.tasks.iter().all(|t| !t.deletes.is_empty()) {
                 groups_skipped += 1;
-                eprintln!(
-                    "compact-phase table={ident} phase=group-skipped group={gi}/{n_groups} files={} reason=empty-read-without-deletes",
-                    group.tasks.len()
+                tracing::info!(
+                    target: PROGRESS_TARGET,
+                    table = %ident,
+                    phase = "group-skipped",
+                    group = %format_args!("{gi}/{n_groups}"),
+                    files = group.tasks.len(),
+                    reason = "empty-read-without-deletes"
                 );
                 continue;
             }

@@ -26,6 +26,7 @@ mod l3_cache;
 mod manifest;
 mod merge;
 mod metadata;
+mod progress;
 mod replace;
 mod runtime;
 mod schema;
