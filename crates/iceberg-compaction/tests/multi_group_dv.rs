@@ -45,14 +45,16 @@ use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
 
-/// target=1 => each candidate file is its own bin => its own group => its own
-/// commit. min_input_files=1 + delete_file_threshold=1 so every file (undersized
-/// and/or delete-bearing) is a candidate.
+/// target=1 => each file is its own bin => its own group. `rewrite_all` keeps
+/// the delete-free lone files in the plan (alone their rewrite removes nothing,
+/// so the planner would otherwise leave them be) — the point here is an N-group
+/// plan, N outputs, one commit.
 fn per_file_groups_cfg() -> Config {
     Config {
         target_file_size_bytes: 1,
         min_input_files: 1,
         delete_file_threshold: 1,
+        rewrite_all: true,
         ..Config::default()
     }
 }

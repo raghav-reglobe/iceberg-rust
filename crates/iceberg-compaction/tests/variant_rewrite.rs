@@ -725,6 +725,9 @@ async fn shred_write_flag_is_a_noop_on_canonical_input() {
 
     let cfg = Config {
         shred_variants: true,
+        // ONE delete-free input file: alone its rewrite removes nothing, so
+        // only `rewrite_all` plans it — and the rewrite's layout is the point.
+        rewrite_all: true,
         ..aggressive_cfg()
     };
     compact_table(&catalog, &ident, &cfg).await.unwrap();

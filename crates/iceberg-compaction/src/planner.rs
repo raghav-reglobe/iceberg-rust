@@ -1,7 +1,9 @@
 //! Compaction planner — mirrors iceberg-go's `Config.PlanCompaction`: group scan
 //! tasks by partition, classify each as candidate (undersized or delete-pressure)
 //! or skipped (optimal / oversized-without-deletes), bin-pack candidates to
-//! `target_file_size_bytes`, and drop bins below `min_input_files`.
+//! `target_file_size_bytes`, and drop bins below `min_input_files` — and, beyond
+//! iceberg-go, a lone file whose rewrite would remove nothing (iceberg-java's
+//! `group.size() > 1` rule; see `is_noop_bin`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -44,7 +46,8 @@ impl Group {
     /// Read cost this group's rewrite REMOVES, in objects a scan opens: the
     /// delete files bound to its inputs (reabsorbed) plus the data files the
     /// bin-pack folds away. A lone delete-free file scores 0 — rewriting it
-    /// changes nothing a reader sees.
+    /// changes nothing a reader sees, so only a `rewrite_all` plan contains
+    /// such a group (`is_noop_bin`).
     pub fn objects_removed(&self, target_file_size_bytes: u64) -> usize {
         objects_removed(
             self.tasks.len(),
@@ -100,6 +103,20 @@ fn is_candidate(size: u64, delete_count: usize, cfg: &Config) -> bool {
         return false; // right-sized: skip (optimal)
     }
     true // undersized: candidate
+}
+
+/// A bin whose rewrite removes nothing a reader opens: ONE file with no bound
+/// delete. It folds into nothing and reabsorbs nothing, so the output is the
+/// input again — and because it is still undersized afterwards, a
+/// `min_input_files = 1` plan would re-select and re-write it on EVERY pass
+/// (one such file per partition: the bin-pack's remainder). iceberg-java
+/// never plans it either (`SizeBasedFileRewritePlanner.enoughInputFiles`
+/// requires `group.size() > 1`); iceberg-go only avoids it through its
+/// `MinInputFiles` default of 5. A lone file WITH a bound delete stays
+/// planned — reabsorbing the delete is the point of `delete_file_threshold =
+/// 1` — and `rewrite_all` means what it says.
+fn is_noop_bin(files: usize, bound_deletes: usize, cfg: &Config) -> bool {
+    files == 1 && bound_deletes == 0 && !cfg.rewrite_all
 }
 
 /// Call-site policy: `rewrite_all` bypasses candidacy (Spark `rewrite-all`
@@ -182,6 +199,10 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
             }
             let total_size_bytes: u64 = bin.iter().map(|t| t.file_size_in_bytes).sum();
             let delete_file_count: usize = bin.iter().map(|t| t.deletes.len()).sum();
+            if is_noop_bin(bin.len(), delete_file_count, cfg) {
+                plan.skipped_files += 1; // nothing to fold, nothing to reabsorb
+                continue;
+            }
             plan.est_output_files += total_size_bytes.div_ceil(target).max(1) as usize;
             plan.groups.push(Group {
                 partition_key: key.clone(),
@@ -196,8 +217,36 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, Plan, bin_pack, is_candidate, objects_removed, should_rewrite};
+    use super::{
+        Group, Plan, bin_pack, is_candidate, is_noop_bin, objects_removed, should_rewrite,
+    };
     use crate::config::Config;
+
+    // --- a lone file whose rewrite removes nothing is not planned ---
+
+    #[test]
+    fn lone_delete_free_bin_is_a_noop_unless_rewrite_all() {
+        let aggressive = Config {
+            min_input_files: 1,
+            delete_file_threshold: 1,
+            ..Config::default()
+        };
+        assert!(is_noop_bin(1, 0, &aggressive), "one file, nothing bound");
+        assert!(!is_noop_bin(1, 1, &aggressive), "its delete is reabsorbed");
+        assert!(!is_noop_bin(2, 0, &aggressive), "two files fold into one");
+        // Below the delete THRESHOLD is still a bound delete: the rule is
+        // about what the rewrite removes, not about candidacy.
+        let high_threshold = Config {
+            delete_file_threshold: 1000,
+            ..aggressive.clone()
+        };
+        assert!(!is_noop_bin(1, 1, &high_threshold));
+        let all = Config {
+            rewrite_all: true,
+            ..aggressive
+        };
+        assert!(!is_noop_bin(1, 0, &all), "rewrite_all means every file");
+    }
 
     // --- execution order: most read cost removed first ---
 

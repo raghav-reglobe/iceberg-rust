@@ -1,15 +1,16 @@
 //! Integration test: a BUDGET-bounded pass (`Config::budget`) commits the groups
 //! it finished instead of all-or-nothing, and successive bounded passes converge.
 //!
-//! With `target_file_size_bytes=1` every candidate file is its own group, so 4
-//! files give a 4-group plan. A budget that is already exhausted when the pass
+//! With `target_file_size_bytes=1` every file is its own group, and
+//! `rewrite_all` keeps the two delete-free lone files in the plan (the no-op
+//! tail), so 4 files give a 4-group plan. A budget that is already exhausted when the pass
 //! starts still runs exactly ONE group (the progress guarantee) — and because
 //! groups execute most-read-cost-removed first, that group is a DELETE-BEARING
 //! one. Asserts per pass: one `Replace` snapshot, exact live rows (no
 //! resurrection, no loss), never more than one DV per data file, and the
 //! delete-file count falling by exactly the group that ran.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,7 +36,7 @@ use iceberg::{
     TableCreation, TableIdent,
 };
 use iceberg_compaction::config::Config;
-use iceberg_compaction::engine::compact_table;
+use iceberg_compaction::engine::{compact_table, current_data_files};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
@@ -46,8 +47,17 @@ fn per_file_groups_cfg() -> Config {
         target_file_size_bytes: 1,
         min_input_files: 1,
         delete_file_threshold: 1,
+        rewrite_all: true,
         ..Config::default()
     }
+}
+
+async fn live_data_paths(table: &Table) -> BTreeSet<String> {
+    current_data_files(table)
+        .await
+        .unwrap()
+        .into_keys()
+        .collect()
 }
 
 async fn write_one_data_file(table: &Table, name: &str, ids: Vec<i32>) -> DataFile {
@@ -293,6 +303,64 @@ async fn generous_budget_is_an_unbounded_pass() {
     assert_eq!((out.groups_planned, out.groups_rewritten), (4, 4));
     assert_eq!(out.reabsorbed_deletes, 2);
     let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(live_ids(&table).await, LIVE);
+    assert_eq!(delete_state(&table).await, (0, 0));
+}
+
+/// Without `rewrite_all` a lone delete-free file is NOT planned: its rewrite
+/// would remove nothing a reader opens, and a `min_input_files = 1` plan would
+/// re-select it on every pass — `complete` would then cost the no-op tail each
+/// time. The delete-bearing lone files still are; bounded passes reach
+/// `complete` through them alone and the untouched files keep their paths.
+#[tokio::test]
+async fn lone_delete_free_files_are_left_alone() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident) = table_with_trailing_dvs(&warehouse).await;
+    let cfg = Config {
+        rewrite_all: false,
+        ..per_file_groups_cfg()
+    };
+    let before = live_data_paths(&catalog.load_table(&ident).await.unwrap()).await;
+    assert_eq!(before.len(), 4);
+
+    // Bounded, budget spent: one of the TWO planned groups runs.
+    let bounded = Config {
+        budget: Some(Instant::now()),
+        ..cfg.clone()
+    };
+    let out = compact_table(&catalog, &ident, &bounded).await.unwrap();
+    assert_eq!((out.groups_planned, out.groups_rewritten), (2, 1));
+    assert_eq!(out.groups_skipped, 0);
+    assert!(!out.complete);
+
+    // Bounded again: the one group left always runs, and that is the plan.
+    let bounded = Config {
+        budget: Some(Instant::now()),
+        ..cfg.clone()
+    };
+    let out = compact_table(&catalog, &ident, &bounded).await.unwrap();
+    assert_eq!((out.groups_planned, out.groups_rewritten), (1, 1));
+    assert!(
+        out.complete,
+        "no no-op tail stands between the pass and done"
+    );
+
+    // Nothing left to plan: no work, no snapshot.
+    let table = catalog.load_table(&ident).await.unwrap();
+    let snaps = table.metadata().snapshots().count();
+    let out = compact_table(&catalog, &ident, &cfg).await.unwrap();
+    assert_eq!((out.groups_planned, out.groups_rewritten), (0, 0));
+    assert!(out.complete);
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), snaps);
+
+    // The delete-free files are the very files they were.
+    let after = live_data_paths(&table).await;
+    let kept: Vec<&String> = before.intersection(&after).collect();
+    assert_eq!(kept.len(), 2, "kept: {kept:?}");
+    assert!(kept.iter().any(|p| p.contains("file-a")), "{kept:?}");
+    assert!(kept.iter().any(|p| p.contains("file-b")), "{kept:?}");
+    assert_eq!(after.len(), 4);
     assert_eq!(live_ids(&table).await, LIVE);
     assert_eq!(delete_state(&table).await, (0, 0));
 }
