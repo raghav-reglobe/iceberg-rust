@@ -61,14 +61,19 @@ fn parse_type(s: &str) -> PyResult<Type> {
         "double" | "float" => Type::Primitive(PrimitiveType::Double),
         "boolean" | "bool" => Type::Primitive(PrimitiveType::Boolean),
         "timestamp" => Type::Primitive(PrimitiveType::Timestamp),
+        // A source column the upstream writer typed WITH a zone must evolve
+        // onto the target with the same type a fresh create would give it;
+        // refusing the keyword failed the whole evolution commit (every
+        // other added column with it), and did so again on every merge.
+        "timestamptz" | "timestamp_tz" => Type::Primitive(PrimitiveType::Timestamptz),
         "date" => Type::Primitive(PrimitiveType::Date),
         "time" => Type::Primitive(PrimitiveType::Time),
         "binary" | "blob" => Type::Primitive(PrimitiveType::Binary),
         other => {
             return Err(PyValueError::new_err(format!(
                 "unsupported add_column type `{other}` (expected one of \
-                 variant/string/long/int/double/boolean/timestamp/date/time/\
-                 binary/decimal(p,s))"
+                 variant/string/long/int/double/boolean/timestamp/timestamptz/\
+                 date/time/binary/decimal(p,s))"
             )));
         }
     })
@@ -187,4 +192,52 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(update_schema, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod parse_type_tests {
+    use super::*;
+
+    #[test]
+    fn zoned_timestamp_is_its_own_type() {
+        for kw in ["timestamptz", "TIMESTAMPTZ", " timestamp_tz "] {
+            assert_eq!(
+                parse_type(kw).unwrap(),
+                Type::Primitive(PrimitiveType::Timestamptz),
+                "{kw}"
+            );
+        }
+        // the zoneless keyword keeps its meaning
+        assert_eq!(
+            parse_type("timestamp").unwrap(),
+            Type::Primitive(PrimitiveType::Timestamp)
+        );
+    }
+
+    #[test]
+    fn the_rest_of_the_vocabulary_is_unchanged() {
+        assert_eq!(
+            parse_type("bigint").unwrap(),
+            Type::Primitive(PrimitiveType::Long)
+        );
+        assert_eq!(
+            parse_type("float").unwrap(),
+            Type::Primitive(PrimitiveType::Double)
+        );
+        assert_eq!(
+            parse_type("DECIMAL(18, 4)").unwrap(),
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 18,
+                scale: 4
+            })
+        );
+        assert_eq!(parse_type("variant").unwrap(), Type::Variant(VariantType));
+    }
+
+    #[test]
+    fn an_unknown_keyword_is_still_refused_and_names_the_vocabulary() {
+        // pyo3 errors need the interpreter only to be RENDERED; is_err does not.
+        assert!(parse_type("timestamptz_ns").is_err());
+        assert!(parse_type("geometry").is_err());
+    }
 }
