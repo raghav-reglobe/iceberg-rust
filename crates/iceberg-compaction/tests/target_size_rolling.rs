@@ -214,7 +214,7 @@ async fn output_rolls_at_configured_target_not_writer_default() {
     }
     let ident = TableIdent::new(ns, "t".to_string());
 
-    // The bronze_ladder shape: explicit small target, shred-preserving,
+    // An aggressive maintenance call: explicit small target, shred-preserving,
     // every file a candidate. Each input file's output alone is many times
     // the target — with the old default-threshold writer the whole group
     // came back as ONE file.

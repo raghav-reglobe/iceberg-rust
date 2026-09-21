@@ -18,8 +18,7 @@
 //! VARIANT rewrite spike: the compaction engine must round-trip a canonical
 //! (unshredded) VARIANT column byte-for-byte — read the `{metadata, value}`
 //! pair, binpack, and write it back unchanged. This is the gate for running
-//! the maintenance tiers' rewrite (Tier 2/3) on mongo silver tables, whose
-//! documents live in canonical VARIANT columns.
+//! the rewrite on tables whose documents live in canonical VARIANT columns.
 //!
 //! Covers:
 //! - canonical round-trip: two undersized data files with mixed variant
@@ -280,7 +279,7 @@ async fn compaction_round_trips_canonical_variant() {
     // Two undersized files with mixed payloads + one NULL variant slot.
     let seeded: Vec<(i32, Option<VariantBytes>)> = vec![
         (1, Some(variant_object())),
-        (2, Some(variant_string("hello mongo"))),
+        (2, Some(variant_string("hello variant"))),
         (3, None),
         (4, Some(variant_long(42))),
         (5, Some(variant_string("second file"))),

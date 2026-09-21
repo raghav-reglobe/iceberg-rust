@@ -1,5 +1,5 @@
 //! Compaction config — mirrors iceberg-go's `table/compaction.Config`, with
-//! pulse's 128 MB target (iceberg-go defaults to 512 MB).
+//! a 128 MB default target (iceberg-go defaults to 512 MB).
 
 use anyhow::{Result, bail};
 
@@ -53,8 +53,8 @@ pub struct Config {
     /// and between sort-chunk flushes; when exceeded the pass aborts with a
     /// "compaction deadline exceeded" error BEFORE the commit — the commit
     /// itself, once entered, always runs to completion (cancelling a REST
-    /// commit in flight leaves the outcome unknown; the merge doorway's
-    /// `timeout_s` doctrine). `None` (default) = unbounded.
+    /// commit in flight leaves the outcome unknown). `None` (default) =
+    /// unbounded.
     pub deadline: Option<std::time::Instant>,
     /// Cooperative BUDGET — the soft twin of `deadline`. Checked only BETWEEN
     /// groups: once a group has run, the pass refuses to START another one

@@ -75,8 +75,8 @@ pub async fn current_data_files(table: &Table) -> Result<HashMap<String, DataFil
 /// (`RewriteFileGroup.danglingDVs()` = `tasks.flatMap(t -> t.deletes())`); this map
 /// only resolves a bound delete's path back to its full `DataFile` (needed to mark
 /// it removed). Keyed by the delete's OWN path, NOT `referenced_data_file`:
-/// iceberg-rust's `referenced_data_file()` accessor returns None for some
-/// cross-engine (duckdb-written) DVs, so a referenced_data_file map silently misses
+/// `referenced_data_file()` is None for DVs from a writer that omits that manifest
+/// field (the path then lives only in the Puffin blob), so such a map silently misses
 /// them and the rewrite leaves them dangling (the multi-DV corruption). The delete's
 /// own `file_path` is always populated, and it's what the scan task carries.
 pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataFile>> {
@@ -153,9 +153,8 @@ pub async fn compact_table(
     ident: &TableIdent,
     cfg: &Config,
 ) -> Result<CompactOutcome> {
-    // Phase progress to stderr (Loki-visible): a hang self-reports by its
-    // last phase line instead of an 8h stall-watchdog cycle, and the phase
-    // it dies in scopes the diagnosis.
+    // Phase progress to stderr: a hang self-reports by its last phase line,
+    // and the phase it dies in scopes the diagnosis.
     let t0 = std::time::Instant::now();
     let phase = |name: &str| {
         eprintln!(

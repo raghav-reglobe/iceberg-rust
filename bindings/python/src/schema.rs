@@ -28,14 +28,13 @@ use pyo3::prelude::*;
 
 use crate::runtime::runtime;
 
-/// Map a simple type keyword to an Iceberg `Type`. Covers the mongo-silver
-/// needs: scalars + `variant`. `variant` is the whole point of routing schema
-/// evolution through iceberg-rust rather than duckdb's `ALTER ADD COLUMN`
-/// (which cannot add a VARIANT column) — and unlike pyiceberg-python this path
-/// does not corrupt VARIANT -> unknown.
+/// Map a simple type keyword to an Iceberg `Type`: scalars + `variant`.
+/// `variant` is the point of evolving schemas through this path — engines whose
+/// `ALTER ADD COLUMN` cannot add a VARIANT column exist, and a Python-side
+/// metadata round trip can turn VARIANT into `unknown`.
 fn parse_type(s: &str) -> PyResult<Type> {
     let norm = s.trim().to_ascii_lowercase();
-    // `decimal(p,s)` / `decimal(p, s)` — the mongo variant-schema discovery
+    // `decimal(p,s)` / `decimal(p, s)` — variant-schema discovery
     // emits `DECIMAL(p,s)` for unwrapped ExtendedJSON `$numberDecimal` fields.
     if let Some(args) = norm
         .strip_prefix("decimal(")
@@ -85,9 +84,8 @@ fn parse_type(s: &str) -> PyResult<Type> {
 /// `UpdateSchemaAction` -> `Transaction::commit`.
 ///
 /// VARIANT-SAFE: goes through the same iceberg-rust path that creates VARIANT
-/// tables, so (a) unlike pyiceberg-python it never corrupts VARIANT -> unknown
-/// on load/write, and (b) unlike duckdb's `ALTER ADD COLUMN` it CAN add a
-/// VARIANT column (the mongo nested-doc-field case). Added columns are always
+/// tables, so (a) it never turns VARIANT into `unknown` on load/write, and (b)
+/// it CAN add a VARIANT column (a nested document field). Added columns are always
 /// optional/nullable (a new column is undefined for existing rows).
 ///
 /// `catalog_props` are standard Iceberg REST catalog properties (`uri`,
@@ -154,12 +152,10 @@ fn update_schema(
             let tx = Transaction::new(&table);
             let mut action = tx.update_schema();
             for (name, ty) in adds {
-                // Dotted add name = NESTED add: "_cdc.seq" -> leaf "seq"
-                // under parent path "_cdc" (AddColumn::with_parent — the
-                // mongo-silver/bronze VARIANT-safe nested-evolve path;
-                // pyiceberg is ruled out on VARIANT tables). Platform
-                // column names never contain literal dots, so the split
-                // is unambiguous by convention.
+                // Dotted add name = NESTED add: "address.zip" -> leaf "zip"
+                // under parent path "address" (AddColumn::with_parent). A
+                // column name with a literal dot cannot be expressed here;
+                // the split takes the LAST dot.
                 match name.rsplit_once('.') {
                     Some((parent, leaf)) => {
                         action =

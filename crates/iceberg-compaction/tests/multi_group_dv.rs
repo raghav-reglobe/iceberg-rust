@@ -297,17 +297,17 @@ async fn multi_group_reabsorbs_all_dvs_no_multi_dv() {
 /// A SURVIVOR file (large/optimal → not a compaction candidate) that carries a DV
 /// must pass through compaction UNTOUCHED — its DV neither dropped nor joined by
 /// others — while smaller files are compacted and their DVs reabsorbed. This is the
-/// shape the prod incident hit (a large survivor whose DV ended up clustered with
+/// shape a real table hit (a large survivor whose DV ended up clustered with
 /// others) that `multi_group_reabsorbs_all_dvs_no_multi_dv` (all files compacted,
 /// no survivor) never exercised.
 ///
-/// NB on coverage: this reproduces the *structure* but not the prod *trigger*.
-/// Prod's DVs were duckdb-written, where iceberg-rust's `referenced_data_file()`
-/// accessor returns None — so the OLD engine (which keyed delete files by
+/// NB on coverage: this reproduces the *structure* but not the original *trigger*.
+/// Those DVs came from a writer that omits the manifest field, so
+/// `referenced_data_file()` returned None — and the OLD engine (which keyed delete files by
 /// referenced_data_file) silently missed them and left them dangling. iceberg-rust-
 /// written DVs (here) always populate referenced_data_file, so both the old and the
-/// fixed engine reabsorb them; the duckdb-specific path is only validatable on a real
-/// cluster. The fix (sourcing removed deletes from the scan's `FileScanTask.deletes`,
+/// fixed engine reabsorb them; the foreign-writer path needs such files to validate.
+/// The fix (sourcing removed deletes from the scan's `FileScanTask.deletes`,
 /// matching iceberg-go/iceberg-java) is robust regardless. This test guards the
 /// survivor invariant — untouched, no clustering, no orphans — against regressions.
 #[tokio::test]

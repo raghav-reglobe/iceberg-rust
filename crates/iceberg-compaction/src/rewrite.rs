@@ -2,9 +2,9 @@
 //! (DV-applied), sort, write new data files, then atomically swap them in
 //! (remove old + add new) in one snapshot. Mirrors iceberg-go's `RewriteFiles`.
 //!
-//! The commit (`commit_rewrite`) is complete and uses the primitive Phase 0
-//! confirmed present: iceberg-rust's RowDelta (#2678). The read→sort→write that
-//! produces the new files are the two net-new pieces (sort + bloom).
+//! The commit (`commit_rewrite`) is one `RewriteFiles` transaction action; the
+//! read→sort→write that produces the new files is this module's own work
+//! (sort + bloom).
 
 use anyhow::Result;
 use arrow_array::RecordBatch;
@@ -37,7 +37,7 @@ use crate::variant_shred;
 /// (`Operation::Replace`, mirroring iceberg-go/iceberg-java): `delete_data_files`
 /// + `delete_delete_files` + `add_data_files`.
 ///
-/// The rewritten output already has the deletes applied (read path, #2681), and
+/// The rewritten output already has the deletes applied (by the read path), and
 /// `delete_delete_files` expunges the old DVs by referenced data file (fork:
 /// content-aware manifest rewrite shared with RowDelta), so no delete file
 /// references the removed data afterward — true DV reabsorption. `Replace`
@@ -57,11 +57,10 @@ pub async fn commit_rewrite(
         .add_data_files(added);
     // Input-protected rebase: `table` is the handle the whole compaction
     // planned and read from, so its current snapshot is the planning base.
-    // A concurrent commit that only APPENDS (streaming sink, merge inserts
-    // on other files) rebases fine; one that touches the inputs — e.g. a
-    // merge writing a DV against a file being rewritten — aborts
-    // non-retryably instead of silently resurrecting its deleted rows (the
-    // 2026-08-01 merge×maintenance dup-current class).
+    // A concurrent commit that only APPENDS (a streaming writer, inserts on
+    // other files) rebases fine; one that touches the inputs — e.g. a
+    // row-level delete writing a DV against a file being rewritten — aborts
+    // non-retryably instead of silently resurrecting its deleted rows.
     if let Some(snap) = table.metadata().current_snapshot_id() {
         action = action.validate_rebase_from(snap);
     }
@@ -70,7 +69,7 @@ pub async fn commit_rewrite(
     Ok(new_table)
 }
 
-/// Read one group's files (DVs applied, #2681), sort by `_valid_from`, write new
+/// Read one group's files (DVs applied), sort by the configured key, write new
 /// parquet -> the data files to add. Handles both unpartitioned and partitioned
 /// tables. The caller (engine `compact_table`) accumulates every group's output
 /// and removed files, then commits them all in ONE `RewriteFiles` via
@@ -89,9 +88,8 @@ pub async fn commit_rewrite(
 /// concat overflowed arrow's i32 string offsets. Groups under the chunk
 /// budget (the common case) still produce ONE fully-sorted run; oversized
 /// groups degrade gracefully to several sorted runs (slightly looser
-/// per-file `_valid_from` bounds, full correctness).
-/// Cooperative deadline check — the compaction twin of the merge doorway's
-/// `timeout_s`. Returns a plain error naming the phase; never called on the
+/// per-file sort-key bounds, full correctness).
+/// Cooperative deadline check. Returns a plain error naming the phase; never called on the
 /// commit path (a commit, once entered, runs to completion).
 pub(crate) fn check_deadline(cfg: &Config, what: &str) -> Result<()> {
     if let Some(d) = cfg.deadline
@@ -337,15 +335,15 @@ fn bloom_writer_properties(table: &Table) -> WriterProperties {
     builder.build()
 }
 
-/// Scan a group's data files into Arrow record batches (deletes/DVs applied,
-/// #2681) via iceberg-rust's `ArrowReader`.
+/// Scan a group's data files into Arrow record batches (deletes/DVs applied)
+/// via the `ArrowReader`.
 ///
 /// The reader is built ONCE per compaction run and shared across groups
 /// (`ArrowReader` is `Clone` over `Arc`-shared state): its delete-file
 /// cache persists, so a delete pile bound to many groups is downloaded and
-/// decoded ONCE per run instead of once per group — with N groups over an
-/// op=R replace pile the per-group loader re-decoded overlapping subsets of
-/// the same pile up to N times (the ~26 min/group grind).
+/// decoded ONCE per run instead of once per group — with N groups bound to
+/// one large delete pile, a per-group loader re-decoded overlapping subsets
+/// of the same pile up to N times.
 pub(crate) async fn read_group(
     reader: &ArrowReader,
     tasks: Vec<FileScanTask>,

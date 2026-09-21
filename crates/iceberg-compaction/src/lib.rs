@@ -24,7 +24,7 @@
 //! Module map:
 //!   - config  : compaction tunables (iceberg-go `Config`, 128 MB target)
 //!   - planner : partition-grouped candidate selection + bin-packing
-//!   - sort    : sort group batches by `_valid_from` (arrow kernels)
+//!   - sort    : sort group batches by the configured key (arrow kernels)
 //!   - rewrite : read (DVs applied) -> sort -> write (+partition +bloom) ->
 //!               commit (RewriteFiles: swap data files + reabsorb DVs)
 //!   - engine  : load -> enumerate data+delete files -> plan -> rewrite-loop
