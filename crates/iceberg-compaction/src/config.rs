@@ -74,6 +74,16 @@ pub struct Config {
     /// reserve between the two for one group plus the commit — a budget
     /// equal to the deadline loses the whole pass to the deadline.
     pub budget: Option<std::time::Instant>,
+    /// How many groups are rewritten at once (iceberg-java
+    /// `max-concurrent-file-group-rewrites`). A group's work is CPU-bound and
+    /// single-threaded, so one group leaves most of a multi-core pod idle;
+    /// each group in flight also holds its own working set — up to
+    /// `sort_chunk_bytes` of decoded rows, a write slice and the writer's
+    /// column buffers — so the right number is bounded by MEMORY, not cores,
+    /// and is the caller's to derive from what it has measured. Groups still
+    /// commit together, in the one `RewriteFiles`. Default 1 (one at a time);
+    /// 0 is read as 1.
+    pub max_concurrent_groups: usize,
 }
 
 /// The instant `secs` after `now`, for turning a caller's seconds into a
@@ -105,6 +115,7 @@ impl Default for Config {
             rewrite_all: false,
             deadline: None,
             budget: None,
+            max_concurrent_groups: 1,
         }
     }
 }

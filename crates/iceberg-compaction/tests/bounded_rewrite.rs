@@ -364,3 +364,104 @@ async fn lone_delete_free_files_are_left_alone() {
     assert_eq!(live_ids(&table).await, LIVE);
     assert_eq!(delete_state(&table).await, (0, 0));
 }
+
+/// `max_concurrent_groups > 1`: the groups run as separate tasks and the pass
+/// still commits ONE `Replace` holding every group — same rows, same
+/// reabsorbed DVs, one distinct output per group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_groups_commit_once_with_every_group() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident) = table_with_trailing_dvs(&warehouse).await;
+    let table = catalog.load_table(&ident).await.unwrap();
+    let before = live_data_paths(&table).await;
+    let snaps = table.metadata().snapshots().count();
+
+    let cfg = Config {
+        max_concurrent_groups: 3,
+        ..per_file_groups_cfg()
+    };
+    let out = compact_table(&catalog, &ident, &cfg).await.unwrap();
+    assert!(out.complete);
+    assert_eq!((out.groups_planned, out.groups_rewritten), (4, 4));
+    assert_eq!(
+        (out.rewritten, out.added, out.reabsorbed_deletes),
+        (4, 4, 2)
+    );
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snaps + 1,
+        "one commit"
+    );
+    assert_eq!(
+        table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .operation,
+        Operation::Replace
+    );
+    let after = live_data_paths(&table).await;
+    assert_eq!(after.len(), 4, "one distinct output per group");
+    assert!(before.is_disjoint(&after));
+    assert_eq!(live_ids(&table).await, LIVE);
+    assert_eq!(delete_state(&table).await, (0, 0));
+}
+
+/// The budget rules when groups START, whatever the width: a spent budget
+/// still starts exactly one group, and commits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spent_budget_starts_one_group_at_any_width() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident) = table_with_trailing_dvs(&warehouse).await;
+    let cfg = Config {
+        budget: Some(Instant::now()),
+        max_concurrent_groups: 3,
+        ..per_file_groups_cfg()
+    };
+    let out = compact_table(&catalog, &ident, &cfg).await.unwrap();
+    assert_eq!((out.groups_planned, out.groups_rewritten), (4, 1));
+    assert_eq!(out.reabsorbed_deletes, 1, "value order holds at any width");
+    assert!(!out.complete);
+    let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(live_ids(&table).await, LIVE);
+    assert_eq!(delete_state(&table).await, (1, 1));
+}
+
+/// A failed group fails the pass and NOTHING commits — one at a time or with
+/// other groups in flight, which finish before the pass answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_group_commits_nothing() {
+    for width in [1usize, 3] {
+        let warehouse = TempDir::new().unwrap();
+        let (catalog, ident) = table_with_trailing_dvs(&warehouse).await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        let snapshot = table.metadata().current_snapshot_id();
+
+        // Take file A away from under the plan: its group cannot be read.
+        let a = live_data_paths(&table)
+            .await
+            .into_iter()
+            .find(|p| p.contains("file-a"))
+            .unwrap();
+        table.file_io().delete(&a).await.unwrap();
+
+        let cfg = Config {
+            max_concurrent_groups: width,
+            ..per_file_groups_cfg()
+        };
+        assert!(
+            compact_table(&catalog, &ident, &cfg).await.is_err(),
+            "width {width}"
+        );
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(
+            table.metadata().current_snapshot_id(),
+            snapshot,
+            "width {width}: no commit"
+        );
+        assert_eq!(delete_state(&table).await, (2, 1), "width {width}");
+    }
+}

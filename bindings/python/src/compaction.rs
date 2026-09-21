@@ -69,7 +69,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None, max_concurrent_groups=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -82,6 +82,7 @@ fn compact(
     rewrite_all: Option<bool>,
     timeout_s: Option<u64>,
     budget_s: Option<f64>,
+    max_concurrent_groups: Option<usize>,
 ) -> PyResult<HashMap<String, i64>> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
@@ -91,6 +92,11 @@ fn compact(
     // ones once the next would cross it at the pass's own slowest group
     // pace, and COMMITS what it finished — the result's `complete` = 0 says
     // planned work remains. The first group always runs. See `Config::budget`.
+    // Groups rewritten at once (default 1). Memory-bound, not core-bound:
+    // the caller derives it from what it measured. See the Config field.
+    if let Some(n) = max_concurrent_groups {
+        cfg.max_concurrent_groups = n.max(1);
+    }
     // Out-of-range seconds (infinity, 1e300) mean "no bound", never a panic.
     let now = std::time::Instant::now();
     cfg.budget = match budget_s {

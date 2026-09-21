@@ -7,9 +7,11 @@
 //! manifest-enum, and commit boundaries here are wired and correct.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
-use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataContentType, DataFile, ManifestContentType, ManifestList};
 use iceberg::table::Table;
@@ -137,6 +139,15 @@ pub struct CompactOutcome {
 /// snapshot). Committing per group instead re-ran the manifest carry-forward over
 /// each prior snapshot, which duplicated data files. All reads are against the
 /// loaded snapshot, so the once-built `files`/`delete_files` maps stay valid.
+///
+/// Up to [`Config::max_concurrent_groups`] groups run at once, each as a task
+/// on the table runtime's CPU handle (a group's decode / sort / encode is
+/// CPU-bound and runs inline in its task, so only separate tasks use separate
+/// cores). The tasks share nothing mutable: a task returns its output files
+/// and every accumulation below happens here, on the coordinator. When the
+/// pass stops starting groups — budget, deadline or a failed group — the
+/// groups in flight are always awaited before this function returns, so
+/// nothing of the pass is still writing once the caller has its answer.
 pub async fn compact_table(
     catalog: &dyn Catalog,
     ident: &TableIdent,
@@ -157,7 +168,7 @@ pub async fn compact_table(
     phase("plan");
     let mut files = current_data_files(&table).await?;
     let delete_files = current_delete_files(&table).await?;
-    let plan = plan_table(&table, cfg).await?;
+    let plan = Arc::new(plan_table(&table, cfg).await?);
 
     // ONE reader for the whole run — its delete-file cache is shared across
     // groups, so a delete pile bound to many groups decodes once per run.
@@ -174,32 +185,87 @@ pub async fn compact_table(
     let mut groups_skipped = 0usize;
     let mut handled = 0usize;
     let mut slowest_group = std::time::Duration::ZERO;
-    for (gi, &idx) in order.iter().enumerate() {
-        let group = &plan.groups[idx];
-        crate::rewrite::check_deadline(cfg, "between groups")?;
-        // The budget is checked only HERE, between groups: never START a group
-        // that, at this pass's own slowest measured pace, would cross it. The
-        // first group has no evidence and always runs (progress guarantee).
-        if let Some(budget) = cfg.budget
-            && gi > 0
-            && std::time::Instant::now() + slowest_group >= budget
-        {
+    let slots = cfg.max_concurrent_groups.max(1);
+    let task_cfg = Arc::new(cfg.clone());
+    let cpu = table.runtime().cpu().clone();
+    let mut in_flight = FuturesUnordered::new();
+    let mut started = 0usize; // groups started so far == next position in `order`
+    let mut stop_starting = false;
+    let mut failed: Option<anyhow::Error> = None;
+    loop {
+        while failed.is_none() && !stop_starting && in_flight.len() < slots && started < n_groups {
+            if let Err(e) = crate::rewrite::check_deadline(cfg, "between groups") {
+                failed = Some(e);
+                break;
+            }
+            // The budget is checked only HERE, where a group would START:
+            // never start one that, at the slowest wall a FINISHED group of
+            // this pass took, would cross it. Wall under concurrency is the
+            // honest predictor — it is what a group started now will take.
+            // The first group has no evidence and always runs (progress
+            // guarantee); groups already in flight were admitted under this
+            // same rule and are awaited and committed.
+            if let Some(budget) = cfg.budget
+                && started > 0
+                && std::time::Instant::now() + slowest_group >= budget
+            {
+                eprintln!(
+                    "compact-phase table={ident} phase=budget-stop groups_started={started}/{n_groups} in_flight={} slowest_group_s={:.0} elapsed_s={:.0}",
+                    in_flight.len(),
+                    slowest_group.as_secs_f64(),
+                    t0.elapsed().as_secs_f64()
+                );
+                stop_starting = true;
+                break;
+            }
+            let idx = order[started];
+            started += 1;
+            let gi = started; // 1-based position in execution order
             eprintln!(
-                "compact-phase table={ident} phase=budget-stop groups_done={gi}/{n_groups} slowest_group_s={:.0} elapsed_s={:.0}",
-                slowest_group.as_secs_f64(),
+                "compact-phase table={ident} phase=rewrite group={gi}/{n_groups} files={} elapsed_s={:.0}",
+                plan.groups[idx].tasks.len(),
                 t0.elapsed().as_secs_f64()
             );
-            break;
+            let (table, reader, plan, task_cfg) = (
+                table.clone(),
+                run_reader.clone(),
+                plan.clone(),
+                task_cfg.clone(),
+            );
+            in_flight.push(cpu.spawn(async move {
+                let g0 = std::time::Instant::now();
+                let added = read_sort_write(&table, &reader, &plan.groups[idx], &task_cfg).await;
+                (gi, idx, added, g0.elapsed())
+            }));
         }
+        let Some(joined) = in_flight.next().await else {
+            break; // nothing in flight and nothing more to start
+        };
+        // A failed group fails the pass (nothing commits) — but only after
+        // the groups still in flight have been awaited (see the fn doc).
+        let (gi, idx, added, wall) = match joined {
+            Ok(done) => done,
+            Err(e) => {
+                failed.get_or_insert(e.into());
+                continue;
+            }
+        };
+        let added = match added {
+            Ok(added) => added,
+            Err(e) => {
+                failed.get_or_insert(e);
+                continue;
+            }
+        };
+        let group = &plan.groups[idx];
         eprintln!(
-            "compact-phase table={ident} phase=rewrite group={}/{n_groups} files={} elapsed_s={:.0}",
-            gi + 1,
+            "compact-phase table={ident} phase=group-done group={gi}/{n_groups} files={} wall_s={:.0} in_flight={} elapsed_s={:.0}",
             group.tasks.len(),
+            wall.as_secs_f64(),
+            in_flight.len(),
             t0.elapsed().as_secs_f64()
         );
-        let g0 = std::time::Instant::now();
-        let added = read_sort_write(&table, &run_reader, group, cfg).await?;
-        slowest_group = slowest_group.max(g0.elapsed());
+        slowest_group = slowest_group.max(wall);
         handled += 1;
         if added.is_empty() {
             // The group produced no live rows. That is LEGITIMATE when every
@@ -220,8 +286,7 @@ pub async fn compact_table(
             if !group.tasks.iter().all(|t| !t.deletes.is_empty()) {
                 groups_skipped += 1;
                 eprintln!(
-                    "compact-phase table={ident} phase=group-skipped group={}/{n_groups} files={} reason=empty-read-without-deletes",
-                    gi + 1,
+                    "compact-phase table={ident} phase=group-skipped group={gi}/{n_groups} files={} reason=empty-read-without-deletes",
                     group.tasks.len()
                 );
                 continue;
@@ -246,6 +311,9 @@ pub async fn compact_table(
         }
         all_added.extend(added);
         groups_rewritten += 1;
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
 
     let mut outcome = CompactOutcome {
