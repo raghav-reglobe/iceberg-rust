@@ -288,17 +288,89 @@ impl MemoryPool for UnspillableReservePool {
     }
 }
 
+/// Bytes reserved per consumer NAME right now, and that table as it stood at
+/// the pool's high-water mark.
+#[derive(Debug, Default)]
+struct ConsumerLedger {
+    current: HashMap<String, usize>,
+    at_peak: Vec<(String, usize)>,
+}
+
 #[derive(Debug)]
 struct PeakTrackingPool {
     inner: Arc<dyn MemoryPool>,
     peak: AtomicUsize,
+    /// WHO held the peak, not only how big it was. The pool's total is the
+    /// operators' own ACCOUNTING, not resident memory: a reservation sized
+    /// from `get_array_memory_size` counts a buffer once per batch that
+    /// shares it (view arrays, slices), so a total can exceed the machine by
+    /// orders of magnitude on an unbounded pool — and on a bounded one the
+    /// same inflation spills or refuses early. Naming the holders is what
+    /// tells accounting from memory.
+    ///
+    /// `None` unless the caller asked for it: the peak alone costs one atomic
+    /// per reservation change; the ledger adds a lock and a map lookup, so a
+    /// run nobody is investigating pays nothing for it.
+    ledger: Option<Mutex<ConsumerLedger>>,
+}
+
+/// How many holders `peak_mem_consumers` names.
+const PEAK_CONSUMERS: usize = 5;
+
+/// Environment switch for the ledger: `MERGE_DF_PEAK_CONSUMERS` = `1` /
+/// `true` / `on` / `yes` (any case). Unset or anything else = off.
+const PEAK_CONSUMERS_ENV: &str = "MERGE_DF_PEAK_CONSUMERS";
+
+fn peak_consumers_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// `ExternalSorter[3]` and `ExternalSorter[7]` are one holder: partitions of
+/// one operator.
+fn consumer_family(name: &str) -> &str {
+    match name.rfind('[') {
+        // a non-empty name, then `[digits]` with at least one digit
+        Some(i)
+            if i > 0
+                && name.ends_with(']')
+                && i + 2 < name.len()
+                && name[i + 1..name.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            &name[..i]
+        }
+        _ => name,
+    }
 }
 
 impl PeakTrackingPool {
+    /// The high-water mark only (one atomic per reservation change).
     fn new(inner: Arc<dyn MemoryPool>) -> Self {
         Self {
             inner,
             peak: AtomicUsize::new(0),
+            ledger: None,
+        }
+    }
+
+    /// The high-water mark AND who held it.
+    fn with_consumers(inner: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            ledger: Some(Mutex::new(ConsumerLedger::default())),
+            ..Self::new(inner)
+        }
+    }
+
+    /// `with_consumers` when [`PEAK_CONSUMERS_ENV`] asks for it, else `new`.
+    fn from_env(inner: Arc<dyn MemoryPool>) -> Self {
+        if peak_consumers_enabled(std::env::var(PEAK_CONSUMERS_ENV).ok().as_deref()) {
+            Self::with_consumers(inner)
+        } else {
+            Self::new(inner)
         }
     }
 
@@ -306,9 +378,68 @@ impl PeakTrackingPool {
         self.peak.load(Ordering::Relaxed)
     }
 
-    fn bump(&self) {
-        self.peak
-            .fetch_max(self.inner.reserved(), Ordering::Relaxed);
+    /// The largest holders at the pool's high-water mark, as a JSON object
+    /// `{consumer: bytes}` (at most [`PEAK_CONSUMERS`], largest first).
+    /// `None` when the ledger was not asked for.
+    fn peak_consumers_json(&self) -> Option<String> {
+        let ledger = self
+            .ledger
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let body: Vec<String> = ledger
+            .at_peak
+            .iter()
+            .map(|(name, bytes)| {
+                format!(
+                    "\"{}\":{bytes}",
+                    name.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect();
+        Some(format!("{{{}}}", body.join(",")))
+    }
+
+    fn grew(&self, reservation: &MemoryReservation, additional: usize) {
+        let Some(ledger) = self.ledger.as_ref() else {
+            self.peak
+                .fetch_max(self.inner.reserved(), Ordering::Relaxed);
+            return;
+        };
+        let mut ledger = ledger.lock().unwrap_or_else(|e| e.into_inner());
+        // No allocation on the hot path: a name is copied once, on first sight.
+        let family = consumer_family(reservation.consumer().name());
+        match ledger.current.get_mut(family) {
+            Some(bytes) => *bytes += additional,
+            None => {
+                ledger.current.insert(family.to_string(), additional);
+            }
+        }
+        let reserved = self.inner.reserved();
+        if reserved > self.peak.fetch_max(reserved, Ordering::Relaxed) {
+            let mut holders: Vec<(String, usize)> = ledger
+                .current
+                .iter()
+                .filter(|(_, bytes)| **bytes > 0)
+                .map(|(name, bytes)| (name.clone(), *bytes))
+                .collect();
+            holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            holders.truncate(PEAK_CONSUMERS);
+            ledger.at_peak = holders;
+        }
+    }
+
+    fn shrank(&self, reservation: &MemoryReservation, shrink: usize) {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return;
+        };
+        let mut ledger = ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bytes) = ledger
+            .current
+            .get_mut(consumer_family(reservation.consumer().name()))
+        {
+            *bytes = bytes.saturating_sub(shrink);
+        }
     }
 }
 
@@ -333,11 +464,12 @@ impl MemoryPool for PeakTrackingPool {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
-        self.bump();
+        self.grew(reservation, additional);
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
+        self.shrank(reservation, shrink);
     }
 
     fn try_grow(
@@ -346,7 +478,7 @@ impl MemoryPool for PeakTrackingPool {
         additional: usize,
     ) -> datafusion::common::Result<()> {
         self.inner.try_grow(reservation, additional)?;
-        self.bump();
+        self.grew(reservation, additional);
         Ok(())
     }
 
@@ -394,7 +526,8 @@ async fn session_with_catalogs(
     //
     // A pool is installed EVEN when unbounded, wrapped in the peak tracker,
     // so every call reports its pool-visible high-water mark
-    // (`peak_mem_bytes` in the result). The bounded shape mirrors what
+    // (`peak_mem_bytes` in the result; the holders behind it only on
+    // request — MERGE_DF_PEAK_CONSUMERS=1). The bounded shape mirrors what
     // `RuntimeEnvBuilder::with_memory_limit` builds (Greedy inside
     // TrackConsumersPool), keeping the top-consumers OOM report.
     let inner: Arc<dyn MemoryPool> = match std::env::var("MERGE_DF_MEMORY_LIMIT_MB")
@@ -418,7 +551,7 @@ async fn session_with_catalogs(
             }
         }
     };
-    let pool = Arc::new(PeakTrackingPool::new(inner));
+    let pool = Arc::new(PeakTrackingPool::from_env(inner));
     let mut rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>);
     if let Ok(dir) = std::env::var("MERGE_DF_SPILL_DIR") {
@@ -569,8 +702,10 @@ async fn doorway_deadline<T>(
 /// `count` — the number of rows appended by the merge (inserts plus updated
 /// row versions) — and `peak_mem_bytes`, the DataFusion memory pool's
 /// high-water mark for this call (pool-registered operators: joins, sorts,
-/// aggregates). Raises `ValueError` on planning or execution failure, and
-/// on deadline expiry.
+/// aggregates). With `MERGE_DF_PEAK_CONSUMERS=1` in the environment the dict
+/// also carries `peak_mem_consumers`, a JSON object `{consumer: bytes}` of
+/// the largest holders at that mark. Raises `ValueError` on planning or
+/// execution failure, and on deadline expiry.
 #[pyfunction]
 #[pyo3(signature = (catalogs, sql, scan_files=None, timeout_s=None, write_workers=None, scoped_tables=None, late_materialization=None, local_tables=None))]
 fn merge_into(
@@ -718,6 +853,11 @@ fn merge_into(
             // per-slice pressure signal. The worker's existing "-> {out}"
             // slice log prints it with zero new plumbing.
             out.insert("peak_mem_bytes".to_string(), pool.peak().to_string());
+            // Who held it (largest first) — tells operator ACCOUNTING from
+            // memory: see `PeakTrackingPool::ledger`.
+            if let Some(holders) = pool.peak_consumers_json() {
+                out.insert("peak_mem_consumers".to_string(), holders);
+            }
             // Cumulative per-process cache stats (manifest + data tiers) —
             // the worker logs this result line per slice, so cache
             // effectiveness lands in run-pod logs with zero new plumbing.
@@ -800,7 +940,8 @@ fn parse_window_slices(
 ///
 /// Returns a dict: `count` (total appended rows), `slices_total` /
 /// `slices_done` (executed) / `slices_committed`, `mount_ms`,
-/// `peak_mem_bytes`, held telemetry (`held_installed`, `held_rows`,
+/// `peak_mem_bytes` (+ `peak_mem_consumers` when `MERGE_DF_PEAK_CONSUMERS=1`),
+/// held telemetry (`held_installed`, `held_rows`,
 /// `held_bytes`, `target_scans_direct`, `target_scans_served`,
 /// `provider_serves`, optional `held_dropped`), optional `failed_slice` /
 /// `failed_error` / `budget_stopped`, and `slices` — a JSON list of
@@ -934,6 +1075,11 @@ fn merge_into_window(
                 })?,
             );
             out.insert("peak_mem_bytes".to_string(), pool.peak().to_string());
+            // Who held it (largest first) — tells operator ACCOUNTING from
+            // memory: see `PeakTrackingPool::ledger`.
+            if let Some(holders) = pool.peak_consumers_json() {
+                out.insert("peak_mem_consumers".to_string(), holders);
+            }
             if let Some(stats) = crate::runtime::cache_stats_json() {
                 out.insert("cache_stats".to_string(), stats);
             }
@@ -1135,6 +1281,103 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(sql_collect_ipc, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod peak_tracking_tests {
+    use super::*;
+
+    #[test]
+    fn names_the_holders_at_the_high_water_mark() {
+        let inner: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let tracker = Arc::new(PeakTrackingPool::with_consumers(inner));
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&tracker) as Arc<dyn MemoryPool>;
+        // two partitions of one operator + one other consumer
+        let s0 = MemoryConsumer::new("ExternalSorter[0]").register(&pool);
+        let s1 = MemoryConsumer::new("ExternalSorter[1]").register(&pool);
+        let scan = MemoryConsumer::new("iceberg-scan-decode").register(&pool);
+        s0.try_grow(600).unwrap();
+        scan.try_grow(100).unwrap();
+        s1.try_grow(300).unwrap(); // high-water mark: 1000
+        assert_eq!(tracker.peak(), 1000);
+        assert_eq!(
+            tracker.peak_consumers_json().as_deref(),
+            Some(r#"{"ExternalSorter":900,"iceberg-scan-decode":100}"#)
+        );
+        // Below the mark nothing moves: the table is a snapshot OF the peak.
+        s0.shrink(600);
+        scan.try_grow(50).unwrap();
+        assert_eq!(tracker.peak(), 1000);
+        assert_eq!(
+            tracker.peak_consumers_json().as_deref(),
+            Some(r#"{"ExternalSorter":900,"iceberg-scan-decode":100}"#)
+        );
+        // A new mark re-takes it — a released holder is gone from it.
+        scan.try_grow(900).unwrap(); // 300 + 1050 = 1350
+        assert_eq!(tracker.peak(), 1350);
+        assert_eq!(
+            tracker.peak_consumers_json().as_deref(),
+            Some(r#"{"iceberg-scan-decode":1050,"ExternalSorter":300}"#)
+        );
+    }
+
+    #[test]
+    fn a_dropped_reservation_leaves_the_ledger() {
+        let inner: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let tracker = Arc::new(PeakTrackingPool::with_consumers(inner));
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&tracker) as Arc<dyn MemoryPool>;
+        {
+            let gone = MemoryConsumer::new("HashJoinInput[0]").register(&pool);
+            gone.try_grow(500).unwrap();
+        } // dropped: frees through shrink
+        let stays = MemoryConsumer::new("mor-window-held").register(&pool);
+        stays.try_grow(700).unwrap();
+        assert_eq!(tracker.peak(), 700);
+        assert_eq!(
+            tracker.peak_consumers_json().as_deref(),
+            Some(r#"{"mor-window-held":700}"#)
+        );
+    }
+
+    #[test]
+    fn without_the_ledger_the_peak_is_still_tracked_and_no_holders_are_named() {
+        let inner: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let tracker = Arc::new(PeakTrackingPool::new(inner));
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&tracker) as Arc<dyn MemoryPool>;
+        let a = MemoryConsumer::new("ExternalSorter[0]").register(&pool);
+        let b = MemoryConsumer::new("iceberg-scan-decode").register(&pool);
+        a.try_grow(600).unwrap();
+        b.try_grow(100).unwrap();
+        a.shrink(600);
+        assert_eq!(tracker.peak(), 700);
+        assert_eq!(tracker.peak_consumers_json(), None);
+    }
+
+    #[test]
+    fn the_switch_reads_only_an_explicit_yes() {
+        for yes in ["1", "true", "TRUE", " on ", "Yes"] {
+            assert!(peak_consumers_enabled(Some(yes)), "{yes:?}");
+        }
+        for no in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("2"),
+        ] {
+            assert!(!peak_consumers_enabled(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_trailing_partition_index_is_folded() {
+        assert_eq!(consumer_family("ExternalSorter[12]"), "ExternalSorter");
+        assert_eq!(consumer_family("mor-window-held"), "mor-window-held");
+        assert_eq!(consumer_family("odd[name]"), "odd[name]");
+        assert_eq!(consumer_family("x[]"), "x[]");
+        assert_eq!(consumer_family("[3]"), "[3]");
+    }
 }
 
 #[cfg(test)]
