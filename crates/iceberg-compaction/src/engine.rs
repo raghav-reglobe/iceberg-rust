@@ -113,6 +113,11 @@ pub struct CompactOutcome {
     pub groups_planned: usize,
     /// Groups read, rewritten and included in the commit.
     pub groups_rewritten: usize,
+    /// Groups that ran but were left untouched: an empty read from a file
+    /// with no bound delete is a read-side anomaly, never a reason to remove
+    /// data. They count toward `complete` (re-running them changes nothing),
+    /// so a caller that wants to know reads this.
+    pub groups_skipped: usize,
     /// Input data files removed (rewritten).
     pub rewritten: usize,
     /// Output data files added.
@@ -166,6 +171,7 @@ pub async fn compact_table(
     // budget on the groups that matter; an unbounded pass rewrites the same set.
     let order = plan.execution_order(cfg.target_file_size_bytes);
     let mut groups_rewritten = 0usize;
+    let mut groups_skipped = 0usize;
     let mut handled = 0usize;
     let mut slowest_group = std::time::Duration::ZERO;
     for (gi, &idx) in order.iter().enumerate() {
@@ -212,6 +218,12 @@ pub async fn compact_table(
             // read-side anomaly — leave it untouched rather than risk
             // deleting data a broken read failed to surface.
             if !group.tasks.iter().all(|t| !t.deletes.is_empty()) {
+                groups_skipped += 1;
+                eprintln!(
+                    "compact-phase table={ident} phase=group-skipped group={}/{n_groups} files={} reason=empty-read-without-deletes",
+                    gi + 1,
+                    group.tasks.len()
+                );
                 continue;
             }
         }
@@ -239,6 +251,7 @@ pub async fn compact_table(
     let mut outcome = CompactOutcome {
         groups_planned: n_groups,
         groups_rewritten,
+        groups_skipped,
         complete: handled == n_groups,
         ..Default::default()
     };

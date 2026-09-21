@@ -58,8 +58,8 @@ fn split_fqn(fqn: &str) -> PyResult<(String, Vec<String>, String)> {
 /// `catalog.namespace.table`. The optional ints override the compaction config
 /// (target file size + the candidate / delete-pressure thresholds). Blocks until
 /// the rewrite commits; raises `ValueError` on failure. Returns the pass's
-/// counts (`groups_planned`, `groups_rewritten`, `rewritten`, `added`,
-/// `reabsorbed_deletes`, `complete`).
+/// counts (`groups_planned`, `groups_rewritten`, `groups_skipped`,
+/// `rewritten`, `added`, `reabsorbed_deletes`, `complete`).
 /// Positive-integer MiB env knob (unset / unparsable / 0 = None).
 fn env_mb(name: &str) -> Option<usize> {
     std::env::var(name)
@@ -91,12 +91,17 @@ fn compact(
     // ones once the next would cross it at the pass's own slowest group
     // pace, and COMMITS what it finished — the result's `complete` = 0 says
     // planned work remains. The first group always runs. See `Config::budget`.
-    cfg.budget = budget_s
-        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s.max(0.0)));
+    // Out-of-range seconds (infinity, 1e300) mean "no bound", never a panic.
+    let now = std::time::Instant::now();
+    cfg.budget = match budget_s {
+        Some(s) => iceberg_compaction::config::instant_after(now, s)
+            .map_err(|e| PyValueError::new_err(format!("budget_s: {e}")))?,
+        None => None,
+    };
     // Cooperative deadline (the merge doorway's `timeout_s` twin): read/
     // sort/write phases abort once it elapses; the commit, once entered,
     // always runs to completion. A timed-out pass commits NOTHING.
-    cfg.deadline = timeout_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    cfg.deadline = timeout_s.and_then(|s| now.checked_add(std::time::Duration::from_secs(s)));
     if let Some(v) = target_file_size_bytes {
         cfg.target_file_size_bytes = v;
     }
@@ -163,6 +168,7 @@ fn compact(
             Ok(HashMap::from([
                 ("groups_planned".to_string(), out.groups_planned as i64),
                 ("groups_rewritten".to_string(), out.groups_rewritten as i64),
+                ("groups_skipped".to_string(), out.groups_skipped as i64),
                 ("rewritten".to_string(), out.rewritten as i64),
                 ("added".to_string(), out.added as i64),
                 (

@@ -67,7 +67,26 @@ pub struct Config {
     /// valuable part of the plan. A table too large for one pass converges
     /// over several instead of never committing. `None` (default) = every
     /// planned group.
+    ///
+    /// The budget bounds when groups START, nothing else: the group in
+    /// flight at the stop and the commit both run past it. A caller that
+    /// also has a hard limit (`deadline`, or its own kill) must leave a
+    /// reserve between the two for one group plus the commit — a budget
+    /// equal to the deadline loses the whole pass to the deadline.
     pub budget: Option<std::time::Instant>,
+}
+
+/// The instant `secs` after `now`, for turning a caller's seconds into a
+/// [`Config::budget`] or [`Config::deadline`]. A negative value is already
+/// spent (`now`); a value too large to represent, including infinity, is no
+/// bound at all (`None`) rather than a panic. NaN is a caller bug.
+pub fn instant_after(now: std::time::Instant, secs: f64) -> Result<Option<std::time::Instant>> {
+    if secs.is_nan() {
+        bail!("a time bound in seconds must not be NaN");
+    }
+    Ok(std::time::Duration::try_from_secs_f64(secs.max(0.0))
+        .ok()
+        .and_then(|d| now.checked_add(d)))
 }
 
 impl Default for Config {
@@ -123,7 +142,24 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, instant_after};
+
+    #[test]
+    fn instant_after_never_panics_on_extreme_seconds() {
+        let now = std::time::Instant::now();
+        let secs = |s: f64| instant_after(now, s).unwrap();
+        assert_eq!(secs(0.0), Some(now));
+        assert_eq!(secs(-5.0), Some(now), "a negative bound is already spent");
+        assert_eq!(
+            secs(1.5),
+            Some(now + std::time::Duration::from_millis(1500))
+        );
+        // Unrepresentable = unbounded, never a panic.
+        assert_eq!(secs(f64::INFINITY), None);
+        assert_eq!(secs(1e300), None);
+        assert_eq!(secs(u64::MAX as f64), None);
+        assert!(instant_after(now, f64::NAN).is_err());
+    }
 
     #[test]
     fn default_matches_iceberg_go_ratios() {
