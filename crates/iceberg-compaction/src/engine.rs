@@ -104,6 +104,25 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
     Ok(out)
 }
 
+/// What a [`compact_table`] pass did. `complete == false` means the pass was
+/// budget-bounded ([`Config::budget`]) and committed only the groups it
+/// finished — the table still holds planned work for a later pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactOutcome {
+    /// Groups the planner produced for this pass.
+    pub groups_planned: usize,
+    /// Groups read, rewritten and included in the commit.
+    pub groups_rewritten: usize,
+    /// Input data files removed (rewritten).
+    pub rewritten: usize,
+    /// Output data files added.
+    pub added: usize,
+    /// Delete files reabsorbed alongside the rewrite.
+    pub reabsorbed_deletes: usize,
+    /// Every planned group was handled (rewritten or legitimately skipped).
+    pub complete: bool,
+}
+
 /// Compact one table end-to-end: load -> enumerate current data + delete files
 /// -> plan -> read+sort+write each group, then swap them all in via ONE commit.
 ///
@@ -113,7 +132,11 @@ pub async fn current_delete_files(table: &Table) -> Result<HashMap<String, DataF
 /// snapshot). Committing per group instead re-ran the manifest carry-forward over
 /// each prior snapshot, which duplicated data files. All reads are against the
 /// loaded snapshot, so the once-built `files`/`delete_files` maps stay valid.
-pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Config) -> Result<()> {
+pub async fn compact_table(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    cfg: &Config,
+) -> Result<CompactOutcome> {
     // Phase progress to stderr (Loki-visible): a hang self-reports by its
     // last phase line instead of an 8h stall-watchdog cycle, and the phase
     // it dies in scopes the diagnosis.
@@ -139,15 +162,39 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
     let mut all_added: Vec<DataFile> = Vec::new();
     let mut candidate_delete_paths: HashSet<String> = HashSet::new();
     let n_groups = plan.groups.len();
-    for (gi, group) in plan.groups.iter().enumerate() {
+    // Most read cost removed first (stable): a budget-bounded pass spends its
+    // budget on the groups that matter; an unbounded pass rewrites the same set.
+    let order = plan.execution_order(cfg.target_file_size_bytes);
+    let mut groups_rewritten = 0usize;
+    let mut handled = 0usize;
+    let mut slowest_group = std::time::Duration::ZERO;
+    for (gi, &idx) in order.iter().enumerate() {
+        let group = &plan.groups[idx];
         crate::rewrite::check_deadline(cfg, "between groups")?;
+        // The budget is checked only HERE, between groups: never START a group
+        // that, at this pass's own slowest measured pace, would cross it. The
+        // first group has no evidence and always runs (progress guarantee).
+        if let Some(budget) = cfg.budget
+            && gi > 0
+            && std::time::Instant::now() + slowest_group >= budget
+        {
+            eprintln!(
+                "compact-phase table={ident} phase=budget-stop groups_done={gi}/{n_groups} slowest_group_s={:.0} elapsed_s={:.0}",
+                slowest_group.as_secs_f64(),
+                t0.elapsed().as_secs_f64()
+            );
+            break;
+        }
         eprintln!(
             "compact-phase table={ident} phase=rewrite group={}/{n_groups} files={} elapsed_s={:.0}",
             gi + 1,
             group.tasks.len(),
             t0.elapsed().as_secs_f64()
         );
+        let g0 = std::time::Instant::now();
         let added = read_sort_write(&table, &run_reader, group, cfg).await?;
+        slowest_group = slowest_group.max(g0.elapsed());
+        handled += 1;
         if added.is_empty() {
             // The group produced no live rows. That is LEGITIMATE when every
             // row of every input file is masked by the deletes the scan bound
@@ -186,10 +233,17 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
             }
         }
         all_added.extend(added);
+        groups_rewritten += 1;
     }
 
+    let mut outcome = CompactOutcome {
+        groups_planned: n_groups,
+        groups_rewritten,
+        complete: handled == n_groups,
+        ..Default::default()
+    };
     if all_added.is_empty() && all_removed.is_empty() {
-        return Ok(()); // nothing to compact
+        return Ok(outcome); // nothing to compact
     }
 
     // A delete file is removed ONLY when every data file the scan bound it
@@ -218,10 +272,13 @@ pub async fn compact_table(catalog: &dyn Catalog, ident: &TableIdent, cfg: &Conf
         }
     }
 
+    outcome.rewritten = all_removed.len();
+    outcome.added = all_added.len();
+    outcome.reabsorbed_deletes = all_removed_deletes.len();
     phase("commit");
     commit_rewrite(&table, catalog, all_removed, all_removed_deletes, all_added).await?;
     phase("done");
-    Ok(())
+    Ok(outcome)
 }
 
 /// Outcome of a path-scoped rewrite ([`compact_files`]).

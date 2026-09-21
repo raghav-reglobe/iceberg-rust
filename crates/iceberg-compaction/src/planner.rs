@@ -40,9 +40,43 @@ pub struct Plan {
     pub delete_applicability: HashMap<String, HashSet<String>>,
 }
 
+impl Group {
+    /// Read cost this group's rewrite REMOVES, in objects a scan opens: the
+    /// delete files bound to its inputs (reabsorbed) plus the data files the
+    /// bin-pack folds away. A lone delete-free file scores 0 — rewriting it
+    /// changes nothing a reader sees.
+    pub fn objects_removed(&self, target_file_size_bytes: u64) -> usize {
+        objects_removed(
+            self.tasks.len(),
+            self.delete_file_count,
+            self.total_size_bytes,
+            target_file_size_bytes,
+        )
+    }
+}
+
+/// Pure scoring behind [`Group::objects_removed`] (unit-testable without
+/// constructing `FileScanTask`s).
+fn objects_removed(files: usize, deletes: usize, total_size_bytes: u64, target: u64) -> usize {
+    let est_outputs = total_size_bytes.div_ceil(target.max(1)).max(1) as usize;
+    deletes + files.saturating_sub(est_outputs)
+}
+
 impl Plan {
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
+    }
+
+    /// Group indices in EXECUTION order: most read cost removed first, plan
+    /// order among equals (stable). An unbounded pass rewrites the same set
+    /// either way; a budget-bounded pass spends its budget on the groups
+    /// that matter and leaves the no-op tail for last.
+    pub fn execution_order(&self, target_file_size_bytes: u64) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.groups.len()).collect();
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(self.groups[i].objects_removed(target_file_size_bytes))
+        });
+        order
     }
 
     /// Total input data files across all groups (what the rewrite will replace).
@@ -162,8 +196,36 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::{bin_pack, is_candidate, should_rewrite};
+    use super::{Group, Plan, bin_pack, is_candidate, objects_removed, should_rewrite};
     use crate::config::Config;
+
+    // --- execution order: most read cost removed first ---
+
+    #[test]
+    fn objects_removed_counts_reabsorbed_deletes_and_folded_files() {
+        let target = 128 * 1024 * 1024;
+        // 17 small files + 2 DVs folding into one output: 2 + 16
+        assert_eq!(objects_removed(17, 2, 100 * 1024 * 1024, target), 18);
+        // a lone delete-free undersized file: the rewrite is a no-op for readers
+        assert_eq!(objects_removed(1, 0, 10 * 1024 * 1024, target), 0);
+        // a lone delete-bearing file: its DV is reabsorbed
+        assert_eq!(objects_removed(1, 1, 10 * 1024 * 1024, target), 1);
+        // an oversized split never scores below zero
+        assert_eq!(objects_removed(1, 0, 10 * target, target), 0);
+    }
+
+    #[test]
+    fn execution_order_is_value_first_and_stable() {
+        let g = |deletes: usize| Group {
+            delete_file_count: deletes,
+            ..Default::default()
+        };
+        let plan = Plan {
+            groups: vec![g(0), g(3), g(0), g(7), g(3)],
+            ..Default::default()
+        };
+        assert_eq!(plan.execution_order(128 * 1024 * 1024), vec![3, 1, 4, 0, 2]);
+    }
 
     // --- is_candidate policy (mirrors iceberg-go isCandidate cases) ---
 

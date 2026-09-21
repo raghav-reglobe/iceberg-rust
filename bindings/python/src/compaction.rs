@@ -57,7 +57,9 @@ fn split_fqn(fqn: &str) -> PyResult<(String, Vec<String>, String)> {
 /// `warehouse`, `credential`, `oauth2-server-uri`, `scope`, ...); `fqn` is
 /// `catalog.namespace.table`. The optional ints override the compaction config
 /// (target file size + the candidate / delete-pressure thresholds). Blocks until
-/// the rewrite commits; raises `ValueError` on failure.
+/// the rewrite commits; raises `ValueError` on failure. Returns the pass's
+/// counts (`groups_planned`, `groups_rewritten`, `rewritten`, `added`,
+/// `reabsorbed_deletes`, `complete`).
 /// Positive-integer MiB env knob (unset / unparsable / 0 = None).
 fn env_mb(name: &str) -> Option<usize> {
     std::env::var(name)
@@ -67,7 +69,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -79,11 +81,18 @@ fn compact(
     sort_column: Option<String>,
     rewrite_all: Option<bool>,
     timeout_s: Option<u64>,
-) -> PyResult<()> {
+    budget_s: Option<f64>,
+) -> PyResult<HashMap<String, i64>> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
 
     let mut cfg = Config::default();
+    // Cooperative BUDGET (soft): between groups the pass stops starting new
+    // ones once the next would cross it at the pass's own slowest group
+    // pace, and COMMITS what it finished — the result's `complete` = 0 says
+    // planned work remains. The first group always runs. See `Config::budget`.
+    cfg.budget = budget_s
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s.max(0.0)));
     // Cooperative deadline (the merge doorway's `timeout_s` twin): read/
     // sort/write phases abort once it elapses; the commit, once entered,
     // always runs to completion. A timed-out pass commits NOTHING.
@@ -148,9 +157,20 @@ fn compact(
             let namespace =
                 NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
             let ident = TableIdent::new(namespace, table_name);
-            compact_table(&catalog, &ident, &cfg)
+            let out = compact_table(&catalog, &ident, &cfg)
                 .await
-                .map_err(|e| PyValueError::new_err(format!("compacting {fqn}: {e}")))
+                .map_err(|e| PyValueError::new_err(format!("compacting {fqn}: {e}")))?;
+            Ok(HashMap::from([
+                ("groups_planned".to_string(), out.groups_planned as i64),
+                ("groups_rewritten".to_string(), out.groups_rewritten as i64),
+                ("rewritten".to_string(), out.rewritten as i64),
+                ("added".to_string(), out.added as i64),
+                (
+                    "reabsorbed_deletes".to_string(),
+                    out.reabsorbed_deletes as i64,
+                ),
+                ("complete".to_string(), out.complete as i64),
+            ]))
         })
     })
 }

@@ -56,6 +56,18 @@ pub struct Config {
     /// commit in flight leaves the outcome unknown; the merge doorway's
     /// `timeout_s` doctrine). `None` (default) = unbounded.
     pub deadline: Option<std::time::Instant>,
+    /// Cooperative BUDGET — the soft twin of `deadline`. Checked only BETWEEN
+    /// groups: once a group has run, the pass refuses to START another one
+    /// that, at the slowest group pace this pass has measured, would cross the
+    /// budget — and COMMITS the groups it finished (one `RewriteFiles`, the
+    /// same partial-rewrite delete rule as always: a delete file is removed
+    /// only when every data file it applies to was rewritten). The first
+    /// group always runs, so every bounded pass makes progress; the groups
+    /// are ordered by the read cost they remove, so the progress is the most
+    /// valuable part of the plan. A table too large for one pass converges
+    /// over several instead of never committing. `None` (default) = every
+    /// planned group.
+    pub budget: Option<std::time::Instant>,
 }
 
 impl Default for Config {
@@ -73,6 +85,7 @@ impl Default for Config {
             sort_column: None,
             rewrite_all: false,
             deadline: None,
+            budget: None,
         }
     }
 }
