@@ -41,9 +41,9 @@ pub struct Config {
     /// identical, but query engines lose `typed_value` pruning on the
     /// rewritten files.
     pub shred_variants: bool,
-    /// Sort key for the rewrite (default `_valid_from`). Tables without the
-    /// column pass through unsorted. Table sort-order metadata is NOT read —
-    /// this field is the only override.
+    /// Sort key for the rewrite. `None` (the default) rewrites rows in read
+    /// order; a key the table does not have also passes through unsorted. The
+    /// caller names the key: table sort-order metadata is NOT read yet.
     pub sort_column: Option<String>,
     /// Plan EVERY live data file as a rewrite candidate, bypassing the
     /// size/delete candidacy policy (Spark `rewrite-all` parity). Grouping

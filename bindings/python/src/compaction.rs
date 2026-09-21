@@ -125,7 +125,7 @@ fn compact(
     if let Some(v) = shred_variants {
         cfg.shred_variants = v;
     }
-    // Rewrite sort key override (default `_valid_from`). See `Config::sort_column`.
+    // Rewrite sort key; None = rows keep their read order. See `Config::sort_column`.
     if sort_column.is_some() {
         cfg.sort_column = sort_column;
     }
