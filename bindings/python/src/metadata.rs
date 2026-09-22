@@ -611,6 +611,12 @@ struct StatsOut {
     delete_records: u64,
     manifests: usize,
     snapshots: usize,
+    /// Every snapshot's `timestamp-ms`, ascending.
+    snapshot_timestamps_ms: Vec<i64>,
+    /// Each manifest's on-disk length (bytes), manifest-list order.
+    manifest_lengths: Vec<i64>,
+    /// The table's `commit.manifest.target-size-bytes`, when set.
+    manifest_target_size_bytes: Option<i64>,
 }
 
 /// Manifest-LIST-level pressure counts for one table (no per-entry Avro
@@ -619,6 +625,16 @@ struct StatsOut {
 /// `delete_files` is the live DV/delete-file count (the dv-pressure signal);
 /// counts come from the manifest list, never the snapshot summary (summary
 /// totals are cosmetic carry-forwards on REPLACE).
+///
+/// The same call also returns the raw facts a caller needs to decide whether
+/// snapshot expiry or manifest consolidation would DO anything, taken from
+/// data this call already loads: `"snapshot_timestamps_ms"` (every snapshot's
+/// timestamp, ascending — the count older than an expiry floor is the number
+/// expiry can remove), `"manifest_lengths"` (each manifest's byte length —
+/// only manifests under the target size can be consolidated) and
+/// `"manifest_target_size_bytes"` (the table's `commit.manifest.target-size-bytes`,
+/// `None` when unset; the caller applies the format default). Policy — the
+/// floor, the retain count, the default target — stays with the caller.
 #[pyfunction]
 #[pyo3(signature = (catalog_props, fqn, timeout_s=None))]
 fn manifest_stats(
@@ -636,6 +652,13 @@ fn manifest_stats(
                 let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
                 let meta = table.metadata_ref();
                 let snapshots = meta.snapshots().len();
+                let mut snapshot_timestamps_ms: Vec<i64> =
+                    meta.snapshots().map(|s| s.timestamp_ms()).collect();
+                snapshot_timestamps_ms.sort_unstable();
+                let manifest_target_size_bytes = meta
+                    .properties()
+                    .get("commit.manifest.target-size-bytes")
+                    .and_then(|v| v.trim().parse::<i64>().ok());
                 let Some(current) = meta.current_snapshot() else {
                     return Ok::<_, PyErr>(StatsOut {
                         data_files: 0,
@@ -644,6 +667,9 @@ fn manifest_stats(
                         delete_records: 0,
                         manifests: 0,
                         snapshots,
+                        snapshot_timestamps_ms,
+                        manifest_lengths: Vec::new(),
+                        manifest_target_size_bytes,
                     });
                 };
                 let mlist = table
@@ -658,8 +684,12 @@ fn manifest_stats(
                     delete_records: 0,
                     manifests: mlist.entries().len(),
                     snapshots,
+                    snapshot_timestamps_ms,
+                    manifest_lengths: Vec::with_capacity(mlist.entries().len()),
+                    manifest_target_size_bytes,
                 };
                 for mf in mlist.entries() {
+                    s.manifest_lengths.push(mf.manifest_length);
                     let live_files = u64::from(mf.added_files_count.unwrap_or(0))
                         + u64::from(mf.existing_files_count.unwrap_or(0));
                     let live_rows =
@@ -686,6 +716,9 @@ fn manifest_stats(
     d.set_item("delete_records", out.delete_records)?;
     d.set_item("manifests", out.manifests)?;
     d.set_item("snapshots", out.snapshots)?;
+    d.set_item("snapshot_timestamps_ms", out.snapshot_timestamps_ms)?;
+    d.set_item("manifest_lengths", out.manifest_lengths)?;
+    d.set_item("manifest_target_size_bytes", out.manifest_target_size_bytes)?;
     Ok(d.into_any().unbind())
 }
 
