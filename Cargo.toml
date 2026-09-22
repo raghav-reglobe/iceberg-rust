@@ -174,6 +174,11 @@ zstd = "0.13.3"
 # datafusion crates resolve from the fork branch carrying the in-flight
 # SQL planner + TableProvider::merge_into hook (plus analyzer fixes).
 [patch.crates-io]
+# Shredding must be lossless: the released kernel rounds a variant decimal
+# into a typed_value of a smaller scale (see vendor/README.md). The copy
+# carries the exactness guard; its manifest keeps the registry dependencies,
+# so no other crate in the graph is duplicated.
+parquet-variant-compute = { path = "vendor/parquet-variant-compute" }
 datafusion = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }
 datafusion-cli = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }
 datafusion-ffi = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }

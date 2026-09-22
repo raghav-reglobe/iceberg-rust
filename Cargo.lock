@@ -5732,8 +5732,6 @@ dependencies = [
 [[package]]
 name = "parquet-variant-compute"
 version = "59.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ece7aa9410b47d8bf3e0bf77529287ed4ccdd2b12c20978f8e9a8f09a48712d"
 dependencies = [
  "arrow",
  "arrow-schema",

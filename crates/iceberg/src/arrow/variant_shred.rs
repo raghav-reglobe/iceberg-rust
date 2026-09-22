@@ -598,7 +598,7 @@ mod tests {
 
     use arrow_array::BinaryArray;
     use arrow_buffer::NullBuffer;
-    use parquet::variant::{Variant, VariantBuilder};
+    use parquet::variant::{Variant, VariantBuilder, VariantDecimal16};
 
     use super::*;
     use crate::spec::{NestedField, PrimitiveType, VariantType};
@@ -763,6 +763,87 @@ mod tests {
             .unwrap();
         assert_eq!(a_typed.value(0), 7);
         assert_eq!(a_typed.value(1), 9);
+    }
+
+    /// Shredding is LOSSLESS or it is not shredding: a value the typed_value
+    /// type cannot hold exactly — a decimal with more fractional digits than
+    /// the typed_value's scale — stays a variant `value` under the field and
+    /// comes back unchanged; it is never rounded into typed_value. Values
+    /// that do fit (same scale, or dropped digits all zero) shred as before.
+    #[test]
+    fn inexact_decimals_are_kept_as_values_never_rounded() {
+        use parquet::variant::{VariantDecimal4, VariantDecimal8};
+
+        fn doc(g: Variant<'_, '_>) -> (Vec<u8>, Vec<u8>) {
+            let mut builder = VariantBuilder::new();
+            let mut obj = builder.new_object();
+            obj.insert("g", g);
+            obj.finish();
+            builder.finish()
+        }
+        // The layout an earlier file derived: `g` as a scale-1 decimal.
+        let plain = DataType::Struct(Fields::from(vec![Field::new(
+            "g",
+            DataType::Decimal128(9, 1),
+            true,
+        )]));
+        let rows = vec![
+            Some(doc(VariantDecimal4::try_new(68, 2).unwrap().into())), // 0.68 -> does not fit
+            Some(doc(VariantDecimal4::try_new(7, 1).unwrap().into())),  // 0.7  -> fits
+            Some(doc(VariantDecimal4::try_new(70, 2).unwrap().into())), // 0.70 -> fits (exact)
+            Some(doc(VariantDecimal8::try_new(996, 3).unwrap().into())), // 0.996 -> does not fit
+            Some(doc(Variant::Double(0.68))),                           // double 0.68 -> does not fit
+            Some(doc(Variant::Int32(3))),                               // 3 -> 3.0 fits
+        ];
+        let arr = canonical_doc_array(&rows);
+        let variant = VariantArray::try_new(&arr).unwrap();
+        let shredded = shred_variant(&variant, &plain).unwrap();
+
+        // typed_value holds exactly the values that fit …
+        let root = ArrayRef::from(shredded.clone());
+        let g_node = root
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("g")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone();
+        let g_typed = g_node
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap()
+            .clone();
+        let typed: Vec<Option<i128>> = (0..rows.len())
+            .map(|i| g_typed.is_valid(i).then(|| g_typed.value(i)))
+            .collect();
+        assert_eq!(
+            typed,
+            vec![None, Some(7), Some(7), None, None, Some(30)],
+            "only exactly representable values may land in typed_value"
+        );
+
+        // … and every value comes back EXACTLY through the residual.
+        let unshredded = unshred_variant(&shredded).unwrap();
+        let expect_g = |i: usize, expected: Variant<'_, '_>| {
+            let v = unshredded.value(i);
+            let obj = v.as_object().expect("object");
+            assert_eq!(obj.get("g").expect("g present"), expected, "row {i}");
+        };
+        expect_g(0, Variant::from(VariantDecimal4::try_new(68, 2).unwrap()));
+        expect_g(3, Variant::from(VariantDecimal8::try_new(996, 3).unwrap()));
+        expect_g(4, Variant::Double(0.68));
+        // A value that shredded reads back at the typed scale (numerically equal).
+        expect_g(1, Variant::from(VariantDecimal16::try_new(7, 1).unwrap()));
     }
 
     /// `variant_column_count` counts only variant fields.
