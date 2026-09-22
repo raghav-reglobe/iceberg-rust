@@ -133,6 +133,10 @@ impl ManifestEntryContext {
             .with_start(0)
             .with_length(self.manifest_entry.file_size_in_bytes())
             .with_record_count(Some(self.manifest_entry.record_count()))
+            .with_column_sizes({
+                let sizes = self.manifest_entry.data_file().column_sizes();
+                (!sizes.is_empty()).then(|| sizes.clone())
+            })
             .with_data_file_path(self.manifest_entry.file_path().to_string())
             .with_data_file_format(self.manifest_entry.file_format())
             .with_schema(self.snapshot_schema)

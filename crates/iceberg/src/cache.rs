@@ -128,12 +128,69 @@ pub type ObjectBytesCacheRef = Arc<dyn ObjectBytesCache>;
 /// entirely (ranged reads go straight to storage), protecting the store
 /// from giant-file eviction storms. Data files are immutable by path — no
 /// invalidation.
+///
+/// Admission is per SCAN, not only per file: a scan that projects a small
+/// share of a file's bytes (the manifest's `column_sizes` say how much)
+/// gains little from the local copy but pays for the whole object over the
+/// wire and in cache churn, so with `min_projected_fraction` set such a
+/// scan reads its byte ranges directly instead — see [`Self::admits`].
 #[derive(Clone, Debug)]
 pub struct DataBytesCache {
     /// The shared, path-keyed bytes store (typically disk-backed).
     pub cache: ObjectBytesCacheRef,
     /// Files larger than this are never cached (read directly).
     pub max_file_bytes: u64,
+    /// A scan projecting less than this share of a file's bytes reads its
+    /// ranges directly instead of admitting the whole object. `0.0` (the
+    /// default) admits every file within `max_file_bytes`.
+    pub min_projected_fraction: f64,
+    /// Files at most this large are admitted whatever the projected share:
+    /// one GET is cheaper than several ranged reads.
+    pub small_file_bytes: u64,
+}
+
+impl DataBytesCache {
+    /// A cache admitting every file within `max_file_bytes`; the projected
+    /// share is not consulted.
+    pub fn new(cache: ObjectBytesCacheRef, max_file_bytes: u64) -> Self {
+        Self {
+            cache,
+            max_file_bytes,
+            min_projected_fraction: 0.0,
+            small_file_bytes: 0,
+        }
+    }
+
+    /// Admit a file only when the scan projects at least
+    /// `min_projected_fraction` of its bytes (clamped to `0.0..=1.0`; `0.0`
+    /// disables the check), files of at most `small_file_bytes` excepted.
+    pub fn with_admission(mut self, min_projected_fraction: f64, small_file_bytes: u64) -> Self {
+        self.min_projected_fraction = if min_projected_fraction.is_finite() {
+            min_projected_fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.small_file_bytes = small_file_bytes;
+        self
+    }
+
+    /// Whether a scan projecting `projected_share` of a `file_size`-byte
+    /// file (`None` = unknown) should read the WHOLE object through the
+    /// cache — or read its byte ranges straight from storage.
+    ///
+    /// Whole-file iff the file is within `max_file_bytes` and any of: the
+    /// share check is disabled, the file is at most `small_file_bytes`, the
+    /// share is unknown (the manifest recorded no column sizes), or the
+    /// share reaches `min_projected_fraction`.
+    pub fn admits(&self, file_size: u64, projected_share: Option<f64>) -> bool {
+        if file_size == 0 || file_size > self.max_file_bytes {
+            return false;
+        }
+        if self.min_projected_fraction <= 0.0 || file_size <= self.small_file_bytes {
+            return true;
+        }
+        projected_share.is_none_or(|share| share >= self.min_projected_fraction)
+    }
 }
 
 #[cfg(test)]
@@ -143,4 +200,66 @@ mod tests {
     struct _TestDynCompatibleForObjectCache(Arc<dyn ObjectCache<String, Arc<Manifest>>>);
     struct _TestDynCompatibleForObjectCacheProvider(ObjectCacheProvider);
     struct _TestDynCompatibleForObjectBytesCache(ObjectBytesCacheRef);
+
+    /// A store that holds nothing — admission is decided before it is touched.
+    #[derive(Debug)]
+    struct Empty;
+
+    #[async_trait]
+    impl ObjectBytesCache for Empty {
+        async fn get(&self, _path: &str) -> Option<Bytes> {
+            None
+        }
+        async fn set(&self, _path: &str, _bytes: Bytes) {}
+    }
+
+    fn cache(min_projected_fraction: f64, small_file_bytes: u64) -> DataBytesCache {
+        DataBytesCache::new(Arc::new(Empty), 1000).with_admission(min_projected_fraction, small_file_bytes)
+    }
+
+    #[test]
+    fn size_cap_applies_before_anything_else() {
+        let dc = cache(0.0, 0);
+        assert!(!dc.admits(0, None), "an unknown size is never admitted");
+        assert!(dc.admits(1000, None));
+        assert!(!dc.admits(1001, None), "above the cap: read directly");
+        assert!(!dc.admits(1001, Some(1.0)), "even a full projection");
+    }
+
+    #[test]
+    fn disabled_check_admits_every_file_within_the_cap() {
+        let dc = cache(0.0, 0);
+        assert!(dc.admits(500, Some(0.0)));
+        assert!(dc.admits(500, Some(0.01)));
+        assert!(dc.admits(500, None));
+    }
+
+    #[test]
+    fn share_below_the_fraction_reads_directly() {
+        let dc = cache(0.5, 0);
+        assert!(!dc.admits(500, Some(0.03)), "a narrow projection");
+        assert!(!dc.admits(500, Some(0.49)));
+        assert!(dc.admits(500, Some(0.5)), "the fraction itself admits");
+        assert!(dc.admits(500, Some(1.0)));
+    }
+
+    #[test]
+    fn unknown_share_keeps_the_whole_file_path() {
+        assert!(cache(0.5, 0).admits(500, None));
+    }
+
+    #[test]
+    fn small_files_are_admitted_regardless_of_share() {
+        let dc = cache(0.5, 64);
+        assert!(dc.admits(64, Some(0.01)));
+        assert!(!dc.admits(65, Some(0.01)));
+    }
+
+    #[test]
+    fn fraction_is_clamped_and_nan_disables() {
+        assert_eq!(cache(7.0, 0).min_projected_fraction, 1.0);
+        assert_eq!(cache(-1.0, 0).min_projected_fraction, 0.0);
+        assert_eq!(cache(f64::NAN, 0).min_projected_fraction, 0.0);
+        assert!(cache(f64::NAN, 0).admits(500, Some(0.01)));
+    }
 }

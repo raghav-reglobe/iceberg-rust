@@ -2591,10 +2591,10 @@ mod object_cache_sharing {
         let store = Arc::new(CountingBytesCache::default());
         let catalog: Arc<dyn Catalog> = Arc::new(
             MemoryCatalogBuilder::default()
-                .with_data_bytes_cache(DataBytesCache {
-                    cache: Arc::clone(&store) as ObjectBytesCacheRef,
-                    max_file_bytes: 256 * 1024 * 1024,
-                })
+                .with_data_bytes_cache(DataBytesCache::new(
+                    Arc::clone(&store) as ObjectBytesCacheRef,
+                    256 * 1024 * 1024,
+                ))
                 .load(
                     "memory",
                     HashMap::from([(
@@ -2738,10 +2738,10 @@ mod object_cache_sharing {
         let catalog: Arc<dyn Catalog> = Arc::new(
             MemoryCatalogBuilder::default()
                 .with_object_bytes_cache(manifest_store.clone() as ObjectBytesCacheRef)
-                .with_data_bytes_cache(DataBytesCache {
-                    cache: data_store.clone() as ObjectBytesCacheRef,
-                    max_file_bytes: 256 * 1024 * 1024,
-                })
+                .with_data_bytes_cache(DataBytesCache::new(
+                    data_store.clone() as ObjectBytesCacheRef,
+                    256 * 1024 * 1024,
+                ))
                 .load(
                     "memory",
                     HashMap::from([(

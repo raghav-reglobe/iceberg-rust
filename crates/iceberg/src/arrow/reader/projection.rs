@@ -2549,6 +2549,7 @@ message schema {
             vec![Ok(FileScanTask {
                 row_selection_positions: None,
                 key_metadata: None,
+                column_sizes: None,
                 file_size_in_bytes: std::fs::metadata(path).unwrap().len(),
                 start: 0,
                 length: 0,

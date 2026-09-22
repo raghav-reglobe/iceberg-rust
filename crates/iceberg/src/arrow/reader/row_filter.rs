@@ -1277,6 +1277,7 @@ mod tests {
             name_mapping: None,
             case_sensitive: false,
             key_metadata: None,
+            column_sizes: None,
         };
 
         let stream = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1381,6 +1382,7 @@ mod tests {
             name_mapping: None,
             case_sensitive: false,
             key_metadata: None,
+            column_sizes: None,
         };
 
         let stream_sub2 =
@@ -1644,38 +1646,37 @@ mod row_position_range_tests {
     /// The whole-file data cache under BYTE-RANGE tasks (the late-mat fetch
     /// shape): ONE whole-file fetch serves every ranged read, and the
     /// batches are identical to direct reads.
+    /// A path-keyed in-memory bytes store that counts hits and sets.
+    #[derive(Debug, Default)]
+    struct CountingBytesCache {
+        map: std::sync::Mutex<HashMap<String, bytes::Bytes>>,
+        hits: std::sync::atomic::AtomicUsize,
+        sets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cache::ObjectBytesCache for CountingBytesCache {
+        async fn get(&self, path: &str) -> Option<bytes::Bytes> {
+            let out = self.map.lock().unwrap().get(path).cloned();
+            if out.is_some() {
+                self.hits
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            out
+        }
+
+        async fn set(&self, path: &str, bytes: bytes::Bytes) {
+            self.sets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.map.lock().unwrap().insert(path.to_string(), bytes);
+        }
+    }
+
     #[tokio::test]
     async fn ranged_reads_through_data_cache_match_direct_reads() {
-        use std::collections::HashMap as Map;
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::Ordering;
 
-        use bytes::Bytes;
-
-        use crate::cache::{DataBytesCache, ObjectBytesCache};
-
-        #[derive(Debug, Default)]
-        struct CountingBytesCache {
-            map: Mutex<Map<String, Bytes>>,
-            hits: AtomicUsize,
-            sets: AtomicUsize,
-        }
-
-        #[async_trait::async_trait]
-        impl ObjectBytesCache for CountingBytesCache {
-            async fn get(&self, path: &str) -> Option<Bytes> {
-                let out = self.map.lock().unwrap().get(path).cloned();
-                if out.is_some() {
-                    self.hits.fetch_add(1, Ordering::SeqCst);
-                }
-                out
-            }
-
-            async fn set(&self, path: &str, bytes: Bytes) {
-                self.sets.fetch_add(1, Ordering::SeqCst);
-                self.map.lock().unwrap().insert(path.to_string(), bytes);
-            }
-        }
+        use crate::cache::DataBytesCache;
 
         let tmp_dir = TempDir::new().unwrap();
         let (file_path, meta, schema) = multi_row_group_file(&tmp_dir);
@@ -1733,10 +1734,7 @@ mod row_position_range_tests {
         let cached = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
             // Serialize the two tasks so the fetch/hit accounting is exact.
             .with_data_file_concurrency_limit(1)
-            .with_data_bytes_cache(DataBytesCache {
-                cache: store.clone(),
-                max_file_bytes: 64 * 1024 * 1024,
-            })
+            .with_data_bytes_cache(DataBytesCache::new(store.clone(), 64 * 1024 * 1024))
             .build();
         let cached_rows = collect_rows(
             cached
@@ -1763,10 +1761,8 @@ mod row_position_range_tests {
         // A file above the size cap BYPASSES the cache entirely.
         let store2 = Arc::new(CountingBytesCache::default());
         let capped = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_data_bytes_cache(DataBytesCache {
-                cache: store2.clone(),
-                max_file_bytes: 16, // smaller than the file
-            })
+            // A cap smaller than the file.
+            .with_data_bytes_cache(DataBytesCache::new(store2.clone(), 16))
             .build();
         let capped_rows = collect_rows(
             capped
@@ -1784,5 +1780,111 @@ mod row_position_range_tests {
             "no caching above the cap"
         );
         assert_eq!(store2.hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Per-scan admission to the whole-file cache: a projection that reads
+    /// little of the file (per the manifest's column sizes) takes the
+    /// ranged path — no whole-file fetch, nothing cached — while a wide
+    /// projection, a file with no recorded sizes, a small file, and a cache
+    /// with the check disabled all keep the whole-file path. Rows are
+    /// identical either way.
+    #[tokio::test]
+    async fn data_cache_admission_follows_the_projected_share() {
+        use std::sync::atomic::Ordering;
+
+        use crate::cache::DataBytesCache;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let (file_path, _, _) = multi_row_group_file(&tmp_dir);
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        // The table schema also names a wide column this file never wrote;
+        // the manifest sizes place most of the file's bytes on it.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "payload", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let sizes = |id: u64, payload: u64| Some(HashMap::from([(1, id), (2, payload)]));
+        let tasks = |column_sizes: Option<HashMap<i32, u64>>| -> Vec<crate::Result<FileScanTask>> {
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(file_size)
+                .with_start(0)
+                .with_length(file_size)
+                .with_data_file_path(file_path.clone())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1])
+                .with_column_sizes(column_sizes)
+                .with_case_sensitive(false)
+                .build())]
+        };
+        let ids = |batches: Vec<RecordBatch>| -> Vec<i32> {
+            let mut out: Vec<i32> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let read = |cache: Option<DataBytesCache>, tasks: Vec<crate::Result<FileScanTask>>| async {
+            let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current());
+            if let Some(cache) = cache {
+                builder = builder.with_data_bytes_cache(cache);
+            }
+            ids(builder
+                .build()
+                .read(Box::pin(futures::stream::iter(tasks)) as FileScanTaskStream)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap())
+        };
+        let direct = read(None, tasks(None)).await;
+        assert_eq!(direct, (0..300).collect::<Vec<i32>>());
+
+        let cache = |store: &Arc<CountingBytesCache>, fraction: f64, small: u64| {
+            DataBytesCache::new(store.clone(), 64 * 1024 * 1024).with_admission(fraction, small)
+        };
+
+        // A narrow projection (1% of the file) reads its ranges directly.
+        let store = Arc::new(CountingBytesCache::default());
+        assert_eq!(read(Some(cache(&store, 0.5, 0)), tasks(sizes(10, 990))).await, direct);
+        assert_eq!(store.sets.load(Ordering::SeqCst), 0, "no whole-file fetch");
+        assert_eq!(store.hits.load(Ordering::SeqCst), 0);
+
+        // A wide projection (99%) takes the whole-file path.
+        let store = Arc::new(CountingBytesCache::default());
+        assert_eq!(read(Some(cache(&store, 0.5, 0)), tasks(sizes(990, 10))).await, direct);
+        assert_eq!(store.sets.load(Ordering::SeqCst), 1);
+
+        // No recorded sizes: the share is unknown — whole-file, as before.
+        let store = Arc::new(CountingBytesCache::default());
+        assert_eq!(read(Some(cache(&store, 0.5, 0)), tasks(None)).await, direct);
+        assert_eq!(store.sets.load(Ordering::SeqCst), 1);
+
+        // A small file is admitted whatever its share.
+        let store = Arc::new(CountingBytesCache::default());
+        assert_eq!(
+            read(Some(cache(&store, 0.5, file_size)), tasks(sizes(10, 990))).await,
+            direct
+        );
+        assert_eq!(store.sets.load(Ordering::SeqCst), 1);
+
+        // The check disabled (fraction 0): every file within the cap.
+        let store = Arc::new(CountingBytesCache::default());
+        assert_eq!(read(Some(cache(&store, 0.0, 0)), tasks(sizes(10, 990))).await, direct);
+        assert_eq!(store.sets.load(Ordering::SeqCst), 1);
     }
 }

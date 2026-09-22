@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -24,8 +25,8 @@ use typed_builder::TypedBuilder;
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
-    SchemaRef, Struct,
+    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, NestedField, PartitionSpec,
+    Schema, SchemaRef, Struct, Type,
 };
 
 /// A stream of [`FileScanTask`].
@@ -66,6 +67,15 @@ pub struct FileScanTask {
     /// reading the entire data file.
     #[builder(default)]
     pub record_count: Option<u64>,
+
+    /// Per-field compressed sizes the manifest recorded for the file
+    /// (`column_sizes`), keyed by field id; `None` when the writer recorded
+    /// none. Lets the reader estimate how much of the file a projection
+    /// reads before opening it — see [`Self::projected_byte_share`].
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub column_sizes: Option<HashMap<i32, u64>>,
 
     /// The data file path corresponding to the task.
     pub data_file_path: String,
@@ -172,6 +182,62 @@ impl FileScanTask {
     pub fn schema_ref(&self) -> SchemaRef {
         self.schema.clone()
     }
+
+    /// The share of the file's bytes this task's projection will read,
+    /// estimated from the manifest's per-field `column_sizes`: each
+    /// projected field contributes its recorded size plus that of every
+    /// field nested beneath it (a struct rolls up its leaves; a list its
+    /// element; a map its key and value).
+    ///
+    /// A variant column's sub-columns carry no field ids of their own, so a
+    /// writer may record no size for the column at all — the file's bytes
+    /// the manifest leaves unrecorded are then exactly those. A projected
+    /// variant with no recorded size is therefore assumed to own the
+    /// unrecorded remainder, erring toward "reads a lot". Field ids the
+    /// schema does not know (reader-added metadata columns) contribute
+    /// nothing. `None` when no sizes were recorded or the file size is
+    /// unknown.
+    pub fn projected_byte_share(&self) -> Option<f64> {
+        let sizes = self.column_sizes.as_ref().filter(|s| !s.is_empty())?;
+        if self.file_size_in_bytes == 0 {
+            return None;
+        }
+        let recorded: u64 = sizes.values().sum();
+        let unrecorded = self.file_size_in_bytes.saturating_sub(recorded);
+        let mut projected: u64 = 0;
+        let mut owns_unrecorded = false;
+        let mut ids = Vec::new();
+        for id in &self.project_field_ids {
+            let Some(field) = self.schema.field_by_id(*id) else {
+                continue;
+            };
+            ids.clear();
+            collect_field_ids(field, &mut ids);
+            let bytes: u64 = ids.iter().filter_map(|i| sizes.get(i)).sum();
+            projected += bytes;
+            if field.field_type.is_variant() && !ids.iter().any(|i| sizes.contains_key(i)) {
+                owns_unrecorded = true;
+            }
+        }
+        if owns_unrecorded {
+            projected += unrecorded;
+        }
+        Some(projected.min(self.file_size_in_bytes) as f64 / self.file_size_in_bytes as f64)
+    }
+}
+
+/// `field`'s id followed by the ids of every field nested beneath it.
+fn collect_field_ids(field: &NestedField, out: &mut Vec<i32>) {
+    out.push(field.id);
+    match field.field_type.as_ref() {
+        Type::Struct(s) => s.fields().iter().for_each(|f| collect_field_ids(f, out)),
+        Type::List(l) => collect_field_ids(&l.element_field, out),
+        Type::Map(m) => {
+            collect_field_ids(&m.key_field, out);
+            collect_field_ids(&m.value_field, out);
+        }
+        Type::Primitive(_) | Type::Variant(_) => {}
+    }
 }
 
 #[derive(Debug)]
@@ -252,4 +318,135 @@ pub struct FileScanTaskDeleteFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub key_metadata: Option<Box<[u8]>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{ListType, MapType, PrimitiveType, StructType, VariantType};
+
+    fn schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        2,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::required(3, "a", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                            NestedField::optional(4, "b", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        5,
+                        "tags",
+                        Type::List(ListType::new(
+                            NestedField::list_element(6, Type::Primitive(PrimitiveType::String), true)
+                                .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        7,
+                        "m",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(8, Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::map_value_element(
+                                9,
+                                Type::Primitive(PrimitiveType::Long),
+                                true,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(10, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn task(
+        file_size: u64,
+        project: Vec<i32>,
+        column_sizes: Option<HashMap<i32, u64>>,
+    ) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(file_size)
+            .with_start(0)
+            .with_length(file_size)
+            .with_data_file_path("f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema())
+            .with_project_field_ids(project)
+            .with_column_sizes(column_sizes)
+            .with_case_sensitive(false)
+            .build()
+    }
+
+    /// Leaves only: the variant column (10) has no entry — its bytes are
+    /// the 500 the file holds beyond the 500 recorded.
+    fn sizes() -> HashMap<i32, u64> {
+        HashMap::from([(1, 100), (3, 150), (4, 50), (6, 100), (8, 40), (9, 60)])
+    }
+
+    fn share(project: Vec<i32>) -> f64 {
+        task(1000, project, Some(sizes())).projected_byte_share().unwrap()
+    }
+
+    #[test]
+    fn primitive_is_its_own_recorded_size() {
+        assert_eq!(share(vec![1]), 0.1);
+    }
+
+    #[test]
+    fn nested_fields_roll_up_to_the_projected_field() {
+        assert_eq!(share(vec![2]), 0.2, "struct = its leaves");
+        assert_eq!(share(vec![3]), 0.15, "a nested leaf projected directly");
+        assert_eq!(share(vec![5]), 0.1, "list = its element");
+        assert_eq!(share(vec![7]), 0.1, "map = key + value");
+    }
+
+    #[test]
+    fn variant_without_a_recorded_size_owns_the_unrecorded_bytes() {
+        assert_eq!(share(vec![10]), 0.5);
+        assert_eq!(share(vec![1, 10]), 0.6);
+        assert_eq!(share(vec![1, 2, 5, 7, 10]), 1.0, "the full width");
+    }
+
+    #[test]
+    fn variant_with_a_recorded_size_is_counted_like_any_field() {
+        let mut sizes = sizes();
+        sizes.insert(10, 480);
+        let t = task(1000, vec![10], Some(sizes));
+        assert_eq!(t.projected_byte_share(), Some(0.48));
+    }
+
+    #[test]
+    fn unknown_field_ids_contribute_nothing() {
+        assert_eq!(share(vec![i32::MAX - 2]), 0.0);
+        assert_eq!(share(vec![1, i32::MAX - 2]), 0.1);
+    }
+
+    #[test]
+    fn share_never_exceeds_one() {
+        let t = task(300, vec![1, 2, 5, 7], Some(sizes()));
+        assert_eq!(t.projected_byte_share(), Some(1.0));
+    }
+
+    #[test]
+    fn no_sizes_or_no_file_size_means_unknown() {
+        assert_eq!(task(1000, vec![1], None).projected_byte_share(), None);
+        assert_eq!(
+            task(1000, vec![1], Some(HashMap::new())).projected_byte_share(),
+            None
+        );
+        assert_eq!(task(0, vec![1], Some(sizes())).projected_byte_share(), None);
+    }
 }

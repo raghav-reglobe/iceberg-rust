@@ -50,6 +50,15 @@ fn env_mb(name: &str, default_mb: u64) -> u64 {
         .unwrap_or(default_mb)
 }
 
+/// A fractional knob; unset, unparsable or non-finite → `default`.
+fn env_fraction(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
 /// The disk-cache root, when configured. NOTE: foyer's disk engine takes NO
 /// cross-process lock — the directory must be PRIVATE to this process (in
 /// K8s: a per-pod path, e.g. hostPath + subPathExpr on the pod name), never
@@ -145,6 +154,15 @@ pub fn runtime() -> Handle {
 /// `ICEBERG_CACHE_MAX_FILE_MB` (default 256) caps the per-file size: larger
 /// files bypass the cache (and set the disk engine's block size, which an
 /// entry must fit in). When OFF, the read path is byte-identical to today.
+///
+/// Admission is also per SCAN (`DataBytesCache::with_admission`):
+/// `ICEBERG_DATA_CACHE_MIN_PROJECTED_FRAC` (default 0 = every file within
+/// the cap is admitted — the behaviour before the knob existed) makes a scan
+/// that projects less than that share of a file's bytes, per the manifest's
+/// column sizes, read its byte ranges directly instead of fetching the whole
+/// object; `ICEBERG_DATA_CACHE_SMALL_FILE_MB` (default 8, `0` = no
+/// exemption) admits small files regardless — one GET beats several ranged
+/// reads.
 static DATA_CACHE: tokio::sync::OnceCell<Option<DataBytesCache>> =
     tokio::sync::OnceCell::const_new();
 
@@ -155,13 +173,26 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
                 .map(|_| env_mb("ICEBERG_DATA_CACHE_MB", 0))
                 .unwrap_or(0);
             let max_file_bytes = env_mb("ICEBERG_CACHE_MAX_FILE_MB", 256) * 1024 * 1024;
+            let min_projected_fraction =
+                env_fraction("ICEBERG_DATA_CACHE_MIN_PROJECTED_FRAC", 0.0);
+            // `0` switches the small-file exemption off (unlike `env_mb`,
+            // where 0 means "unset").
+            let small_file_bytes = std::env::var("ICEBERG_DATA_CACHE_SMALL_FILE_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(8)
+                * 1024
+                * 1024;
+            let data_cache = |cache: ObjectBytesCacheRef| {
+                DataBytesCache::new(cache, max_file_bytes)
+                    .with_admission(min_projected_fraction, small_file_bytes)
+            };
             if disk_mb == 0 {
                 // No pod-local data cache — but a configured L3 endpoint
                 // still gives whole-file caching through the shared tier
                 // alone (the daemon absorbs the scan's ranged GETs).
-                return l3_client().map(|l3| DataBytesCache {
-                    cache: Arc::new(TieredBytesCache::new(None, l3)) as ObjectBytesCacheRef,
-                    max_file_bytes,
+                return l3_client().map(|l3| {
+                    data_cache(Arc::new(TieredBytesCache::new(None, l3)) as ObjectBytesCacheRef)
                 });
             }
             let dir = cache_dir()?;
@@ -193,10 +224,9 @@ pub async fn global_data_cache() -> Option<DataBytesCache> {
                 .with_disk_block_bytes((max_file_bytes + 16 * 1024 * 1024) as usize)
                 .with_eviction_policy(policy);
             match builder.build().await {
-                Ok(cache) => Some(DataBytesCache {
-                    cache: maybe_tier(Arc::new(cache) as ObjectBytesCacheRef),
-                    max_file_bytes,
-                }),
+                Ok(cache) => Some(data_cache(maybe_tier(
+                    Arc::new(cache) as ObjectBytesCacheRef
+                ))),
                 Err(e) => {
                     // The cache must never block the platform.
                     eprintln!("iceberg data cache: disabled ({e})");

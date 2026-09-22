@@ -39,6 +39,14 @@ fn _log_cache_stats() {
     runtime::log_cache_stats_at_exit();
 }
 
+/// The process-wide cache counters as one JSON object (`manifest` and
+/// `data` tiers, each `hits/misses/inserts/evictions/...`), or `None` when
+/// no cache is configured. Cumulative since process start.
+#[pyfunction]
+fn cache_stats() -> Option<String> {
+    runtime::cache_stats_json()
+}
+
 #[pymodule]
 fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Final cache-effectiveness line in every run pod's logs.
@@ -46,6 +54,7 @@ fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
         let hook = wrap_pyfunction!(_log_cache_stats, m)?;
         let _ = atexit.call_method1("register", (hook,));
     }
+    m.add_function(wrap_pyfunction!(cache_stats, m)?)?;
     datafusion_table_provider::register_module(py, m)?;
     transform::register_module(py, m)?;
     manifest::register_module(py, m)?;

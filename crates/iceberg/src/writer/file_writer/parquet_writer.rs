@@ -375,6 +375,28 @@ fn stamp_variant_extensions(
     )))
 }
 
+/// The field id of the variant column enclosing a parquet leaf path that
+/// carries no field id of its own (`v.metadata`, `v.value`, a shredded
+/// `v.typed_value.…` leaf) — the nearest indexed ancestor, when it is a
+/// variant. `None` for any other unindexed path.
+fn enclosing_variant_field_id(
+    index: &IndexByParquetPathName,
+    schema: &Schema,
+    leaf_path: &str,
+) -> Option<i32> {
+    let mut path = leaf_path;
+    while let Some(dot) = path.rfind('.') {
+        path = &path[..dot];
+        if let Some(&field_id) = index.get(path) {
+            return schema
+                .field_by_id(field_id)
+                .filter(|f| f.field_type.is_variant())
+                .map(|_| field_id);
+        }
+    }
+    None
+}
+
 /// Rewrite the writer's arrow schema so the named variant columns use their
 /// SHREDDED struct type (`{metadata, value, typed_value: ...}`) instead of the
 /// canonical `{metadata, value}` mapping — the incoming batches must carry
@@ -629,13 +651,23 @@ impl ParquetWriter {
             let mut per_col_size: HashMap<i32, u64> = HashMap::new();
             let mut per_col_val_num: HashMap<i32, u64> = HashMap::new();
             let mut per_col_null_val_num: HashMap<i32, u64> = HashMap::new();
-            let mut min_max_agg = MinMaxColAggregator::new(schema);
+            let mut min_max_agg = MinMaxColAggregator::new(Arc::clone(&schema));
 
             for row_group in metadata.row_groups() {
                 for column_chunk_metadata in row_group.columns() {
                     let parquet_path = column_chunk_metadata.column_descr().path().string();
 
                     let Some(&field_id) = index_by_parquet_path.get(&parquet_path) else {
+                        // A chunk under a variant column (`metadata`, `value`,
+                        // the shredded `typed_value` leaves) has no field id
+                        // of its own; its bytes are the variant column's.
+                        // Only the size is additive across leaves.
+                        if let Some(variant_id) =
+                            enclosing_variant_field_id(&index_by_parquet_path, &schema, &parquet_path)
+                        {
+                            *per_col_size.entry(variant_id).or_insert(0) +=
+                                column_chunk_metadata.compressed_size() as u64;
+                        }
                         continue;
                     };
 
@@ -2652,6 +2684,91 @@ mod tests {
         assert_eq!(cdc.min_chunk_size, 4096);
         assert_eq!(cdc.max_chunk_size, 8192);
         assert_eq!(cdc.norm_level, 2);
+    }
+
+    /// A variant column's parquet leaves (`metadata`, `value`) carry no
+    /// field ids; their compressed bytes still count toward the variant's
+    /// `column_sizes` entry, so the metric covers the file — a reader's
+    /// per-column estimate of what a projection reads stays truthful.
+    #[tokio::test]
+    async fn test_variant_leaf_bytes_roll_up_into_the_variant_column_size() {
+        use parquet::file::reader::FileReader;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "doc", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let doc = StructArray::new(
+            Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, false),
+            ]),
+            vec![
+                Arc::new(arrow_array::BinaryArray::from_iter_values([
+                    vec![0x11u8, 0x00, 0x00],
+                    vec![0x11u8, 0x00, 0x00],
+                ])) as ArrayRef,
+                Arc::new(arrow_array::BinaryArray::from_iter_values([
+                    vec![0x0cu8, 0x2a],
+                    vec![0x0cu8, 0x2b],
+                ])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(doc),
+        ])
+        .unwrap();
+
+        let path = format!("{}/variant_sizes.parquet", temp_dir.path().to_str().unwrap());
+        let mut writer = ParquetWriterBuilder::new(WriterProperties::default(), schema)
+            .build(file_io.new_output(&path).unwrap())
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let data_file = writer
+            .close()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let footer = parquet::file::reader::SerializedFileReader::new(
+            std::fs::File::open(&path).unwrap(),
+        )
+        .unwrap()
+        .metadata()
+        .clone();
+        let bytes_under = |prefix: &str| -> u64 {
+            footer
+                .row_groups()
+                .iter()
+                .flat_map(|rg| rg.columns())
+                .filter(|c| c.column_descr().path().string().starts_with(prefix))
+                .map(|c| c.compressed_size() as u64)
+                .sum()
+        };
+        let variant_bytes = bytes_under("doc.");
+        assert!(variant_bytes > 0, "the variant leaves hold bytes");
+        assert_eq!(data_file.column_sizes()[&2], variant_bytes);
+        assert_eq!(data_file.column_sizes()[&1], bytes_under("id"));
+        assert!(
+            !data_file.value_counts().contains_key(&2),
+            "leaf value counts are not a column's row count — not rolled up"
+        );
     }
 
     #[tokio::test]

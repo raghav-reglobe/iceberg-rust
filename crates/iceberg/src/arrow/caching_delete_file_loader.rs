@@ -1737,6 +1737,7 @@ mod tests {
         let file_scan_task = FileScanTask {
             row_selection_positions: None,
             key_metadata: None,
+            column_sizes: None,
             file_size_in_bytes: 0,
             start: 0,
             length: 0,

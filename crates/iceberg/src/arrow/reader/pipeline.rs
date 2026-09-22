@@ -222,6 +222,14 @@ impl FileScanTaskReader {
             .delete_file_loader
             .load_deletes(&task.deletes, Arc::clone(&task.schema));
 
+        // Whole-object admission is per scan: a projection that reads
+        // little of the file (per the manifest's column sizes) takes the
+        // ranged path instead of pulling the whole object through the cache.
+        let data_bytes_cache = self
+            .data_bytes_cache
+            .as_ref()
+            .filter(|dc| dc.admits(task.file_size_in_bytes, task.projected_byte_share()));
+
         // Open the Parquet file once, loading its metadata
         let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
             &task.data_file_path,
@@ -229,7 +237,7 @@ impl FileScanTaskReader {
             task.file_size_in_bytes,
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
-            self.data_bytes_cache.as_ref(),
+            data_bytes_cache,
             task.key_metadata.as_deref(),
         )
         .await?;
@@ -893,7 +901,8 @@ impl ArrowReader {
     /// on first touch) and every ranged read — footer, column chunks,
     /// row-group byte ranges — is served from the local copy. Larger files
     /// (or no cache) read directly from storage, byte-identical to the
-    /// uncached path.
+    /// uncached path. Callers decide per scan whether to pass the cache at
+    /// all ([`DataBytesCache::admits`]).
     pub(crate) async fn open_parquet_file(
         data_file_path: &str,
         file_io: &FileIO,
