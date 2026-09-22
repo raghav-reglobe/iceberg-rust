@@ -615,6 +615,14 @@ struct StatsOut {
     snapshot_timestamps_ms: Vec<i64>,
     /// Each manifest's on-disk length (bytes), manifest-list order.
     manifest_lengths: Vec<i64>,
+    /// Each manifest's content, `"data"` / `"deletes"`, manifest-list order.
+    manifest_contents: Vec<&'static str>,
+    /// Each manifest's partition spec id, manifest-list order.
+    manifest_spec_ids: Vec<i32>,
+    /// Each manifest's live entries (ADDED + EXISTING), manifest-list order.
+    manifest_alive_files: Vec<u64>,
+    /// The table's default partition spec id.
+    default_spec_id: i32,
     /// The table's `commit.manifest.target-size-bytes`, when set.
     manifest_target_size_bytes: Option<i64>,
 }
@@ -630,8 +638,12 @@ struct StatsOut {
 /// snapshot expiry or manifest consolidation would DO anything, taken from
 /// data this call already loads: `"snapshot_timestamps_ms"` (every snapshot's
 /// timestamp, ascending — the count older than an expiry floor is the number
-/// expiry can remove), `"manifest_lengths"` (each manifest's byte length —
-/// only manifests under the target size can be consolidated) and
+/// expiry can remove); per manifest in manifest-list order,
+/// `"manifest_lengths"` (bytes), `"manifest_contents"` (`"data"` /
+/// `"deletes"`), `"manifest_spec_ids"` and `"manifest_alive_files"`
+/// (ADDED + EXISTING entries) — a manifest rewrite consolidates only ALIVE
+/// `data` manifests on the `"default_spec_id"`, and only their lengths decide
+/// whether fewer target-sized manifests come out; and
 /// `"manifest_target_size_bytes"` (the table's `commit.manifest.target-size-bytes`,
 /// `None` when unset; the caller applies the format default). Policy — the
 /// floor, the retain count, the default target — stays with the caller.
@@ -659,6 +671,7 @@ fn manifest_stats(
                     .properties()
                     .get("commit.manifest.target-size-bytes")
                     .and_then(|v| v.trim().parse::<i64>().ok());
+                let default_spec_id = meta.default_partition_spec_id();
                 let Some(current) = meta.current_snapshot() else {
                     return Ok::<_, PyErr>(StatsOut {
                         data_files: 0,
@@ -669,6 +682,10 @@ fn manifest_stats(
                         snapshots,
                         snapshot_timestamps_ms,
                         manifest_lengths: Vec::new(),
+                        manifest_contents: Vec::new(),
+                        manifest_spec_ids: Vec::new(),
+                        manifest_alive_files: Vec::new(),
+                        default_spec_id,
                         manifest_target_size_bytes,
                     });
                 };
@@ -686,12 +703,22 @@ fn manifest_stats(
                     snapshots,
                     snapshot_timestamps_ms,
                     manifest_lengths: Vec::with_capacity(mlist.entries().len()),
+                    manifest_contents: Vec::with_capacity(mlist.entries().len()),
+                    manifest_spec_ids: Vec::with_capacity(mlist.entries().len()),
+                    manifest_alive_files: Vec::with_capacity(mlist.entries().len()),
+                    default_spec_id,
                     manifest_target_size_bytes,
                 };
                 for mf in mlist.entries() {
-                    s.manifest_lengths.push(mf.manifest_length);
                     let live_files = u64::from(mf.added_files_count.unwrap_or(0))
                         + u64::from(mf.existing_files_count.unwrap_or(0));
+                    s.manifest_lengths.push(mf.manifest_length);
+                    s.manifest_contents.push(match mf.content {
+                        ManifestContentType::Data => "data",
+                        ManifestContentType::Deletes => "deletes",
+                    });
+                    s.manifest_spec_ids.push(mf.partition_spec_id);
+                    s.manifest_alive_files.push(live_files);
                     let live_rows =
                         mf.added_rows_count.unwrap_or(0) + mf.existing_rows_count.unwrap_or(0);
                     match mf.content {
@@ -718,6 +745,10 @@ fn manifest_stats(
     d.set_item("snapshots", out.snapshots)?;
     d.set_item("snapshot_timestamps_ms", out.snapshot_timestamps_ms)?;
     d.set_item("manifest_lengths", out.manifest_lengths)?;
+    d.set_item("manifest_contents", out.manifest_contents)?;
+    d.set_item("manifest_spec_ids", out.manifest_spec_ids)?;
+    d.set_item("manifest_alive_files", out.manifest_alive_files)?;
+    d.set_item("default_spec_id", out.default_spec_id)?;
     d.set_item("manifest_target_size_bytes", out.manifest_target_size_bytes)?;
     Ok(d.into_any().unbind())
 }
