@@ -44,12 +44,15 @@ iceberg-cache-foyer = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-compaction = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-all"] }
 parquet = { workspace = true, features = ["variant_experimental"] }
 pyo3 = { workspace = true, features = ["abi3-py310"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

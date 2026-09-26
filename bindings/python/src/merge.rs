@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::{DataType, Fields, TimeUnit};
 use datafusion::common::resources_datafusion_err;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{
@@ -1272,6 +1274,572 @@ fn sql_collect_ipc(
     Ok(pyo3::types::PyBytes::new(py, &buf).unbind())
 }
 
+
+// ── Doris stream load, in rust (2026-09-26, operator direction "fix for long
+// term use rust") ─────────────────────────────────────────────────────────────
+//
+// The Doris SCD4 copy's window used to turn every bronze file into Python
+// row objects (Arrow -> dicts -> JSON lines) before PUTting them to the BE.
+// A single-row-group file arrives as ONE ~700K-row batch, so that was the
+// whole file in Python again (6-8 GB in an 8Gi pod; OOM at file 13/224 of
+// orders) at ~7.5K rows/s on one core. Here the SELECT's record-batch STREAM
+// is consumed batch by batch, rows are encoded as line-delimited JSON in
+// rust, each chunk is PUT to `_stream_load`, and Python is called back TWICE
+// per chunk ("before": it TRUNCATEs the stage tables; "after": it runs the
+// routing transaction + ledger + checkpoint) with the chunk's sorted distinct
+// pk tuples. Python holds zero row objects. Strictly sequential: the next
+// chunk is PUT only after the previous "after" returned (the stage tables are
+// per chunk). Formats are fixed by the SELECT projection (timestamps as text,
+// decimals as fixed-scale text, binary as base64); VARIANT text is embedded
+// RAW when it parses as JSON, else escaped as a string (today's json.loads
+// `except ValueError: pass` semantics). Credentials live in `load` only —
+// never in a label, a log line or an error.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColEnc {
+    Null,
+    Bool,
+    Int,
+    UInt,
+    Float,
+    Str,
+    Variant,
+    Timestamp,
+    Date32,
+    Decimal,
+    Binary,
+}
+
+fn col_encoder(dt: &DataType, is_variant: bool) -> PyResult<ColEnc> {
+    use DataType as T;
+    Ok(match dt {
+        T::Null => ColEnc::Null,
+        T::Boolean => ColEnc::Bool,
+        T::Int8 | T::Int16 | T::Int32 | T::Int64 => ColEnc::Int,
+        T::UInt8 | T::UInt16 | T::UInt32 | T::UInt64 => ColEnc::UInt,
+        T::Float16 | T::Float32 | T::Float64 => ColEnc::Float,
+        T::Utf8 | T::LargeUtf8 | T::Utf8View => {
+            if is_variant {
+                ColEnc::Variant
+            } else {
+                ColEnc::Str
+            }
+        }
+        T::Timestamp(_, _) => ColEnc::Timestamp,
+        T::Date32 => ColEnc::Date32,
+        T::Decimal128(_, _) | T::Decimal256(_, _) => ColEnc::Decimal,
+        T::Binary | T::LargeBinary | T::BinaryView | T::FixedSizeBinary(_) => ColEnc::Binary,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "stream_load_file: column type {other} has no JSON encoding — cast it in the SELECT"
+            )))
+        }
+    })
+}
+
+fn json_str(out: &mut Vec<u8>, s: &str) {
+    // serde_json escapes exactly like Python's json.dumps(ensure_ascii=False)
+    // for the characters Doris cares about (quotes, backslashes, control chars).
+    serde_json::to_writer(&mut *out, s).expect("string serialization is infallible");
+}
+
+fn timestamp_text(v: i64, unit: &TimeUnit) -> Option<String> {
+    use TimeUnit as U;
+    let (secs, micros) = match unit {
+        U::Second => (v, 0i64),
+        U::Millisecond => (v.div_euclid(1_000), v.rem_euclid(1_000) * 1_000),
+        U::Microsecond => (v.div_euclid(1_000_000), v.rem_euclid(1_000_000)),
+        U::Nanosecond => (v.div_euclid(1_000_000_000), v.rem_euclid(1_000_000_000) / 1_000),
+    };
+    let dt = chrono::DateTime::from_timestamp(secs, (micros * 1_000) as u32)?.naive_utc();
+    // Python's isoformat(sep=" "): no fraction when it is zero, six digits otherwise.
+    Some(if micros == 0 {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        format!("{}.{:06}", dt.format("%Y-%m-%d %H:%M:%S"), micros)
+    })
+}
+
+/// Encode row `i` of `batch` as one JSON object line into `out`; returns the
+/// pk tuple (as JSON-encoded scalars, for the distinct set) or None when a pk
+/// component is null.
+fn encode_row(
+    batch: &RecordBatch,
+    i: usize,
+    keys: &[Vec<u8>],
+    encs: &[ColEnc],
+    pk_idx: &[usize],
+    out: &mut Vec<u8>,
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    use datafusion::arrow::array::*;
+    use DataType as T;
+    use datafusion::arrow::datatypes::DecimalType as _;
+    use datafusion::arrow::datatypes::{
+        Date32Type, Decimal128Type, Decimal256Type, Float16Type, Float32Type, Float64Type, Int16Type,
+        Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+        TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
+    use std::io::Write;
+    out.push(b'{');
+    let mut pk: Vec<Vec<u8>> = Vec::with_capacity(pk_idx.len());
+    let mut pk_null = false;
+    for (c, col) in batch.columns().iter().enumerate() {
+        if c > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&keys[c]);
+        let start = out.len();
+        if col.is_null(i) {
+            out.extend_from_slice(b"null");
+        } else {
+            match encs[c] {
+                ColEnc::Null => out.extend_from_slice(b"null"),
+                ColEnc::Bool => {
+                    let a = col.as_boolean();
+                    out.extend_from_slice(if a.value(i) { b"true" } else { b"false" });
+                }
+                ColEnc::Int => {
+                    let v: i64 = match col.data_type() {
+                        T::Int8 => col.as_primitive::<Int8Type>().value(i) as i64,
+                        T::Int16 => col.as_primitive::<Int16Type>().value(i) as i64,
+                        T::Int32 => col.as_primitive::<Int32Type>().value(i) as i64,
+                        _ => col.as_primitive::<Int64Type>().value(i),
+                    };
+                    write!(out, "{v}").expect("vec write");
+                }
+                ColEnc::UInt => {
+                    let v: u64 = match col.data_type() {
+                        T::UInt8 => col.as_primitive::<UInt8Type>().value(i) as u64,
+                        T::UInt16 => col.as_primitive::<UInt16Type>().value(i) as u64,
+                        T::UInt32 => col.as_primitive::<UInt32Type>().value(i) as u64,
+                        _ => col.as_primitive::<UInt64Type>().value(i),
+                    };
+                    write!(out, "{v}").expect("vec write");
+                }
+                ColEnc::Float => {
+                    let v: f64 = match col.data_type() {
+                        T::Float32 => col.as_primitive::<Float32Type>().value(i) as f64,
+                        T::Float16 => col.as_primitive::<Float16Type>().value(i).to_f64(),
+                        _ => col.as_primitive::<Float64Type>().value(i),
+                    };
+                    if v.is_finite() {
+                        serde_json::to_writer(&mut *out, &v).expect("vec write");
+                    } else {
+                        out.extend_from_slice(b"null");
+                    }
+                }
+                ColEnc::Str | ColEnc::Variant => {
+                    let s: &str = match col.data_type() {
+                        T::Utf8 => col.as_string::<i32>().value(i),
+                        T::LargeUtf8 => col.as_string::<i64>().value(i),
+                        _ => col.as_string_view().value(i),
+                    };
+                    if encs[c] == ColEnc::Variant
+                        && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+                    {
+                        out.extend_from_slice(s.as_bytes()); // valid JSON: embed raw
+                    } else {
+                        json_str(out, s);
+                    }
+                }
+                ColEnc::Timestamp => {
+                    let T::Timestamp(unit, _) = col.data_type() else { unreachable!() };
+                    let v: i64 = match unit {
+                        TimeUnit::Second => {
+                            col.as_primitive::<TimestampSecondType>().value(i)
+                        }
+                        TimeUnit::Millisecond => {
+                            col.as_primitive::<TimestampMillisecondType>().value(i)
+                        }
+                        TimeUnit::Microsecond => {
+                            col.as_primitive::<TimestampMicrosecondType>().value(i)
+                        }
+                        TimeUnit::Nanosecond => {
+                            col.as_primitive::<TimestampNanosecondType>().value(i)
+                        }
+                    };
+                    match timestamp_text(v, unit) {
+                        Some(t) => json_str(out, &t),
+                        None => out.extend_from_slice(b"null"),
+                    }
+                }
+                ColEnc::Date32 => {
+                    let d = col.as_primitive::<Date32Type>().value(i);
+                    match chrono::DateTime::from_timestamp(d as i64 * 86_400, 0) {
+                        Some(dt) => json_str(out, &dt.naive_utc().date().format("%Y-%m-%d").to_string()),
+                        None => out.extend_from_slice(b"null"),
+                    }
+                }
+                ColEnc::Decimal => {
+                    // fixed-scale text, never scientific (Python's str(Decimal) can emit 1E+2)
+                    let txt = match col.data_type() {
+                        T::Decimal128(p, sc) => {
+                            let a = col.as_primitive::<Decimal128Type>();
+                            Decimal128Type::format_decimal(a.value(i), *p, *sc)
+                        }
+                        T::Decimal256(p, sc) => {
+                            let a = col.as_primitive::<Decimal256Type>();
+                            Decimal256Type::format_decimal(a.value(i), *p, *sc)
+                        }
+                        _ => unreachable!(),
+                    };
+                    json_str(out, &txt);
+                }
+                ColEnc::Binary => {
+                    use base64::Engine as _;
+                    let bytes: &[u8] = match col.data_type() {
+                        T::Binary => col.as_binary::<i32>().value(i),
+                        T::LargeBinary => col.as_binary::<i64>().value(i),
+                        T::BinaryView => col.as_binary_view().value(i),
+                        _ => col.as_fixed_size_binary().value(i),
+                    };
+                    json_str(out, &base64::engine::general_purpose::STANDARD.encode(bytes));
+                }
+            }
+        }
+        if let Some(k) = pk_idx.iter().position(|&x| x == c) {
+            if col.is_null(i) {
+                pk_null = true;
+            }
+            let _ = k;
+            pk.push(out[start..].to_vec());
+        }
+    }
+    out.push(b'}');
+    out.push(b'\n');
+    Ok(if pk_null { None } else { Some(pk) })
+}
+
+fn pk_tuples_py(py: Python<'_>, set: &std::collections::BTreeSet<Vec<Vec<u8>>>) -> PyResult<Py<PyAny>> {
+    // JSON-encoded scalars -> Python ints / strings (pk columns are ints or strings)
+    let out = pyo3::types::PyList::empty(py);
+    for tup in set {
+        let t = pyo3::types::PyList::empty(py);
+        for v in tup {
+            let txt = std::str::from_utf8(v).unwrap_or("");
+            if let Ok(n) = txt.parse::<i64>() {
+                t.append(n)?;
+            } else if txt.starts_with('"') {
+                let s: String = serde_json::from_str(txt).unwrap_or_default();
+                t.append(s)?;
+            } else {
+                t.append(txt)?;
+            }
+        }
+        out.append(pyo3::types::PyTuple::new(py, t.iter())?)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+struct LoadTarget {
+    url: String,
+    user: String,
+    password: String,
+    timeout_s: u64,
+    headers: Vec<(String, String)>,
+}
+
+fn build_load_target(load: &HashMap<String, String>, headers: &HashMap<String, String>) -> PyResult<LoadTarget> {
+    let get = |k: &str| load.get(k).cloned().ok_or_else(|| PyValueError::new_err(format!("load[{k}] missing")));
+    Ok(LoadTarget {
+        url: get("url")?,
+        user: get("user")?,
+        password: get("password")?,
+        timeout_s: load.get("timeout_s").and_then(|v| v.parse().ok()).unwrap_or(600),
+        headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+    })
+}
+
+async fn put_chunk(
+    client: &reqwest::Client,
+    target: &LoadTarget,
+    label: &str,
+    body: bytes::Bytes,
+) -> PyResult<serde_json::Value> {
+    let mut req = client
+        .put(&target.url)
+        .basic_auth(&target.user, Some(&target.password))
+        .header("Expect", "100-continue")
+        .header("label", label)
+        .timeout(std::time::Duration::from_secs(target.timeout_s));
+    for (k, v) in &target.headers {
+        if k.eq_ignore_ascii_case("label") {
+            continue;
+        }
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.body(body).send().await.map_err(|e| {
+        // never echo the URL's credentials; the url carries none, but be strict
+        PyValueError::new_err(format!("stream load PUT failed for label {label}: {}", e.without_url()))
+    })?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(serde_json::json!({
+            "Status": "NO_JSON", "HttpStatus": status.as_u16(),
+            "Message": text.chars().take(300).collect::<String>()
+        })),
+    }
+}
+
+fn retry_suffix() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut h);
+    std::process::id().hash(&mut h);
+    format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
+}
+
+/// One chunk: "before" callback -> PUT (retry once on a reused label) ->
+/// "after" callback. Returns the "after" callback's verdict (False = stop).
+#[allow(clippy::too_many_arguments)]
+async fn flush_chunk(
+    body: Vec<u8>,
+    pk_set: std::collections::BTreeSet<Vec<Vec<u8>>>,
+    n_rows: usize,
+    chunk_ix: usize,
+    client: &reqwest::Client,
+    target: &LoadTarget,
+    on_chunk: &Py<PyAny>,
+    label_prefix: &str,
+    label_suffix: &str,
+) -> PyResult<bool> {
+    let label = format!("{label_prefix}{chunk_ix}{label_suffix}");
+    let bytes = bytes::Bytes::from(body);
+    let go = Python::attach(|py| -> PyResult<bool> {
+        let tuples = pk_tuples_py(py, &pk_set)?;
+        on_chunk
+            .call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples))?
+            .extract::<bool>(py)
+    })?;
+    if !go {
+        return Ok(false);
+    }
+    let mut final_label = label.clone();
+    let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+    if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
+        final_label = format!("{label}-r{}", retry_suffix());
+        reply = put_chunk(client, target, &final_label, bytes).await?;
+    }
+    let reply_txt = serde_json::to_string(&reply).unwrap_or_default();
+    Python::attach(|py| -> PyResult<bool> {
+        let tuples = pk_tuples_py(py, &pk_set)?;
+        on_chunk
+            .call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples))?
+            .extract::<bool>(py)
+    })
+}
+
+/// Stream-load ONE bronze file's rows into Doris, chunk by chunk, calling
+/// Python back before ("before": stage TRUNCATE) and after ("after": routing
+/// txn + ledger + checkpoint) every chunk. Returns {"chunks", "rows"}.
+///
+/// `on_chunk(phase, chunk_ix, label, reply_json_or_None, rows, pk_tuples_or_None) -> bool`
+/// — a False return stops the file after the current chunk (deadline / budget).
+/// The reply is the BE's JSON as TEXT (Python json.loads it); a non-Success
+/// reply is still delivered — the executor decides. `Label Already Exists` is
+/// retried once with `-r<8hex>` and the final label reported.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql, scan_files, load, headers, chunk_rows, pk_cols, variant_cols, label_prefix, label_suffix, on_chunk, scoped_tables=None, local_tables=None))]
+#[allow(clippy::too_many_arguments)]
+fn stream_load_file(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
+    load: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    chunk_rows: usize,
+    pk_cols: Vec<String>,
+    variant_cols: Vec<String>,
+    label_prefix: String,
+    label_suffix: String,
+    on_chunk: Py<PyAny>,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
+) -> PyResult<Py<PyAny>> {
+    use datafusion::logical_expr::LogicalPlan;
+    use futures::StreamExt;
+
+    let scan_files = parse_scan_files(scan_files)?;
+    let scoped_tables = parse_scoped_tables(scoped_tables)?;
+    let local_tables = local_tables.unwrap_or_default();
+    let target = build_load_target(&load, &headers)?;
+    let chunk_rows = chunk_rows.max(1);
+
+    let (chunks, rows): (usize, usize) = py.detach(|| {
+        runtime().block_on(async move {
+            let (ctx, _pool) =
+                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None).await?;
+            let df = ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("planning query: {e}")))?;
+            if matches!(df.logical_plan(), LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Copy(_)) {
+                return Err(PyValueError::new_err("stream_load_file is read-only on the lakehouse side"));
+            }
+            let schema = Arc::new(df.schema().as_arrow().clone());
+            let keys: Vec<Vec<u8>> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let mut k = Vec::new();
+                    json_str(&mut k, f.name());
+                    k.push(b':');
+                    k
+                })
+                .collect();
+            let encs: Vec<ColEnc> = schema
+                .fields()
+                .iter()
+                .map(|f| col_encoder(f.data_type(), variant_cols.iter().any(|v| v == f.name())))
+                .collect::<PyResult<_>>()?;
+            let pk_idx: Vec<usize> = pk_cols
+                .iter()
+                .map(|c| {
+                    schema.index_of(c).map_err(|_| {
+                        PyValueError::new_err(format!("pk column `{c}` is not in the SELECT projection"))
+                    })
+                })
+                .collect::<PyResult<_>>()?;
+            let mut stream = df
+                .execute_stream()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("executing query: {e}")))?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(3)) // FE 307 -> BE, body replayed (bounded Vec)
+                .build()
+                .map_err(|e| PyValueError::new_err(format!("http client: {e}")))?;
+
+            let mut body: Vec<u8> = Vec::with_capacity(chunk_rows * 256);
+            let mut pks: std::collections::BTreeSet<Vec<Vec<u8>>> = Default::default();
+            let mut n_rows = 0usize;
+            let mut chunk_ix = 0usize;
+            let mut total_rows = 0usize;
+            let mut stop = false;
+
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(|e| PyValueError::new_err(format!("reading batch: {e}")))?;
+                for i in 0..batch.num_rows() {
+                    if let Some(pk) = encode_row(&batch, i, &keys, &encs, &pk_idx, &mut body)? {
+                        pks.insert(pk);
+                    }
+                    n_rows += 1;
+                    if n_rows >= chunk_rows {
+                        let go = flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
+                                             &client, &target, &on_chunk, &label_prefix, &label_suffix).await?;
+                        total_rows += n_rows;
+                        n_rows = 0;
+                        chunk_ix += 1;
+                        if !go {
+                            stop = true;
+                            break;
+                        }
+                    }
+                }
+                if stop {
+                    break;
+                }
+            }
+            if !stop && n_rows > 0 {
+                flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
+                            &client, &target, &on_chunk, &label_prefix, &label_suffix).await?;
+                total_rows += n_rows;
+                chunk_ix += 1;
+            }
+            Ok((chunk_ix, total_rows))
+        })
+    })?;
+    Python::attach(|py| {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("chunks", chunks)?;
+        d.set_item("rows", rows)?;
+        Ok(d.into_any().unbind())
+    })
+}
+
+#[cfg(test)]
+mod stream_load_encoder_tests {
+    use super::*;
+    use datafusion::arrow::array::*;
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    fn enc_batch(batch: &RecordBatch, variant: &[&str], pk: &[&str]) -> (Vec<String>, Vec<Option<Vec<Vec<u8>>>>) {
+        let schema = batch.schema();
+        let keys: Vec<Vec<u8>> = schema.fields().iter().map(|f| { let mut k = Vec::new(); json_str(&mut k, f.name()); k.push(b':'); k }).collect();
+        let encs: Vec<ColEnc> = schema.fields().iter().map(|f| col_encoder(f.data_type(), variant.contains(&f.name().as_str())).unwrap()).collect();
+        let pk_idx: Vec<usize> = pk.iter().map(|c| schema.index_of(c).unwrap()).collect();
+        let mut lines = Vec::new(); let mut pks = Vec::new();
+        for i in 0..batch.num_rows() {
+            let mut out = Vec::new();
+            pks.push(encode_row(batch, i, &keys, &encs, &pk_idx, &mut out).unwrap());
+            lines.push(String::from_utf8(out).unwrap());
+        }
+        (lines, pks)
+    }
+
+    #[test]
+    fn encodes_scalars_variant_timestamp_decimal_binary_like_the_python_path() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("doc", DataType::Utf8, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("amt", DataType::Decimal128(10, 2), true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("raw", DataType::Binary, true),
+        ]));
+        let ts0 = 1_758_880_800_000_000i64; // 2025-09-26 10:00:00 UTC
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![7, 8, 9])),
+            Arc::new(StringArray::from(vec![Some("a\"b"), None, Some("plain")])),
+            Arc::new(StringArray::from(vec![Some(r#"{"k":[1,2.50]}"#), Some("not json {"), None])),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(ts0), Some(ts0 + 123_456), None])),
+            Arc::new(Decimal128Array::from(vec![Some(12345i128), Some(100i128), None]).with_precision_and_scale(10, 2).unwrap()),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(BinaryArray::from(vec![Some(b"\x01\x02".as_ref()), None, None])),
+        ]).unwrap();
+        let (lines, pks) = enc_batch(&batch, &["doc"], &["id"]);
+        assert_eq!(lines[0], "{\"id\":7,\"name\":\"a\\\"b\",\"doc\":{\"k\":[1,2.50]},\"ts\":\"2025-09-26 10:00:00\",\"amt\":\"123.45\",\"flag\":true,\"raw\":\"AQI=\"}\n");
+        // malformed VARIANT text is ESCAPED as a string (today's json.loads except-pass), never embedded raw
+        assert_eq!(lines[1], "{\"id\":8,\"name\":null,\"doc\":\"not json {\",\"ts\":\"2025-09-26 10:00:00.123456\",\"amt\":\"1.00\",\"flag\":false,\"raw\":null}\n");
+        assert_eq!(lines[2], "{\"id\":9,\"name\":\"plain\",\"doc\":null,\"ts\":null,\"amt\":null,\"flag\":null,\"raw\":null}\n");
+        assert_eq!(pks[0].as_ref().unwrap(), &vec![b"7".to_vec()]);
+        for l in &lines { serde_json::from_str::<serde_json::Value>(l.trim()).expect("every line is valid JSON"); }
+    }
+
+    #[test]
+    fn null_pk_component_yields_no_tuple_and_unsupported_type_is_loud() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("v", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, Some(1)])), Arc::new(StringArray::from(vec![Some("x"), Some("y")]))]).unwrap();
+        let (_, pks) = enc_batch(&batch, &[], &["id"]);
+        assert!(pks[0].is_none() && pks[1].is_some());
+        assert!(col_encoder(&DataType::Struct(Fields::empty()), false).is_err());
+    }
+
+    #[test]
+    fn nan_and_infinite_floats_encode_as_null_never_a_bare_token() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("x", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(f64::INFINITY), None])),
+        ]).unwrap();
+        let (lines, _) = enc_batch(&batch, &[], &["id"]);
+        assert_eq!(lines, vec![
+            "{\"id\":1,\"x\":1.5}\n", "{\"id\":2,\"x\":null}\n", "{\"id\":3,\"x\":null}\n", "{\"id\":4,\"x\":null}\n",
+        ]);
+    }
+
+    #[test]
+    fn timestamp_text_matches_isoformat_sep_space() {
+        assert_eq!(timestamp_text(0, &TimeUnit::Second).unwrap(), "1970-01-01 00:00:00");
+        assert_eq!(timestamp_text(1_500, &TimeUnit::Millisecond).unwrap(), "1970-01-01 00:00:01.500000");
+        assert_eq!(timestamp_text(-1, &TimeUnit::Microsecond).unwrap(), "1969-12-31 23:59:59.999999");
+    }
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "merge")?;
     this.add_function(wrap_pyfunction!(merge_into, &this)?)?;
@@ -1279,6 +1847,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(dry_run_inspect, &this)?)?;
     this.add_function(wrap_pyfunction!(sql_collect, &this)?)?;
     this.add_function(wrap_pyfunction!(sql_collect_ipc, &this)?)?;
+    this.add_function(wrap_pyfunction!(stream_load_file, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
