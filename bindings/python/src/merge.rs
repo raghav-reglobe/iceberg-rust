@@ -1537,6 +1537,12 @@ struct LoadTarget {
     password: String,
     timeout_s: u64,
     headers: Vec<(String, String)>,
+    /// appended to `{label_prefix}{chunk_ix}` — per target, so two tables fed
+    /// from ONE encode carry distinct labels (`-h-<run>` / `-c-<run>`)
+    label_suffix: String,
+    /// the executor's name for the target (`"h"` / `"c"`); the multi-target
+    /// callback receives it as its 7th argument
+    tag: String,
 }
 
 fn build_load_target(load: &HashMap<String, String>, headers: &HashMap<String, String>) -> PyResult<LoadTarget> {
@@ -1547,7 +1553,39 @@ fn build_load_target(load: &HashMap<String, String>, headers: &HashMap<String, S
         password: get("password")?,
         timeout_s: load.get("timeout_s").and_then(|v| v.parse().ok()).unwrap_or(600),
         headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        label_suffix: load.get("label_suffix").cloned().unwrap_or_default(),
+        tag: load.get("tag").cloned().unwrap_or_default(),
     })
+}
+
+/// The multi-target form: `[(load, headers), ...]` — each `load` carries
+/// url/user/password/timeout_s plus its own `label_suffix` and `tag`. Every
+/// target gets the SAME encoded chunk (the SELECT's full projection; a
+/// target's `columns` header picks its subset), so one bronze read and one
+/// encode feed N tables.
+fn build_load_targets(
+    targets: &[(HashMap<String, String>, HashMap<String, String>)],
+) -> PyResult<Vec<LoadTarget>> {
+    if targets.is_empty() {
+        return Err(PyValueError::new_err("stream_load_file_multi: targets is empty"));
+    }
+    let out: Vec<LoadTarget> =
+        targets.iter().map(|(load, headers)| build_load_target(load, headers)).collect::<PyResult<_>>()?;
+    let mut seen = std::collections::HashSet::new();
+    for t in &out {
+        if !seen.insert(t.label_suffix.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "stream_load_file_multi: duplicate label_suffix `{}` — every target needs its own label",
+                t.label_suffix
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// `{label_prefix}{chunk_ix}{target.label_suffix}` — one label per (chunk, target).
+fn chunk_label(label_prefix: &str, chunk_ix: usize, target: &LoadTarget) -> String {
+    format!("{label_prefix}{chunk_ix}{}", target.label_suffix)
 }
 
 async fn put_chunk(
@@ -1591,8 +1629,14 @@ fn retry_suffix() -> String {
     format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 }
 
-/// One chunk: "before" callback -> PUT (retry once on a reused label) ->
-/// "after" callback. Returns the "after" callback's verdict (False = stop).
+/// One chunk, every target in order: "before" callback -> PUT (retry once
+/// on a reused label) -> "after" callback. The encoded body is shared (one
+/// encode, N PUTs). Returns the last "after" verdict (False = stop the file);
+/// a False "before" stops before that target's PUT.
+///
+/// `multi` selects the callback arity: the legacy single-target form calls
+/// `on_chunk(phase, ix, label, reply, rows, pks)`; the multi form appends the
+/// target's `tag` as a 7th argument.
 #[allow(clippy::too_many_arguments)]
 async fn flush_chunk(
     body: Vec<u8>,
@@ -1600,35 +1644,47 @@ async fn flush_chunk(
     n_rows: usize,
     chunk_ix: usize,
     client: &reqwest::Client,
-    target: &LoadTarget,
+    targets: &[LoadTarget],
     on_chunk: &Py<PyAny>,
     label_prefix: &str,
-    label_suffix: &str,
+    multi: bool,
 ) -> PyResult<bool> {
-    let label = format!("{label_prefix}{chunk_ix}{label_suffix}");
     let bytes = bytes::Bytes::from(body);
-    let go = Python::attach(|py| -> PyResult<bool> {
-        let tuples = pk_tuples_py(py, &pk_set)?;
-        on_chunk
-            .call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples))?
-            .extract::<bool>(py)
-    })?;
-    if !go {
-        return Ok(false);
+    for target in targets {
+        let label = chunk_label(label_prefix, chunk_ix, target);
+        let go = Python::attach(|py| -> PyResult<bool> {
+            let tuples = pk_tuples_py(py, &pk_set)?;
+            let r = if multi {
+                on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples, target.tag.as_str()))?
+            } else {
+                on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples))?
+            };
+            r.extract::<bool>(py)
+        })?;
+        if !go {
+            return Ok(false);
+        }
+        let mut final_label = label.clone();
+        let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+        if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
+            final_label = format!("{label}-r{}", retry_suffix());
+            reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+        }
+        let reply_txt = serde_json::to_string(&reply).unwrap_or_default();
+        let go = Python::attach(|py| -> PyResult<bool> {
+            let tuples = pk_tuples_py(py, &pk_set)?;
+            let r = if multi {
+                on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples, target.tag.as_str()))?
+            } else {
+                on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples))?
+            };
+            r.extract::<bool>(py)
+        })?;
+        if !go {
+            return Ok(false);
+        }
     }
-    let mut final_label = label.clone();
-    let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
-    if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
-        final_label = format!("{label}-r{}", retry_suffix());
-        reply = put_chunk(client, target, &final_label, bytes).await?;
-    }
-    let reply_txt = serde_json::to_string(&reply).unwrap_or_default();
-    Python::attach(|py| -> PyResult<bool> {
-        let tuples = pk_tuples_py(py, &pk_set)?;
-        on_chunk
-            .call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples))?
-            .extract::<bool>(py)
-    })
+    Ok(true)
 }
 
 /// Stream-load ONE bronze file's rows into Doris, chunk by chunk, calling
@@ -1659,13 +1715,68 @@ fn stream_load_file(
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
 ) -> PyResult<Py<PyAny>> {
+    let mut load = load;
+    load.insert("label_suffix".to_string(), label_suffix);
+    let targets = vec![build_load_target(&load, &headers)?];
+    stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
+                     on_chunk, scoped_tables, local_tables, false)
+}
+
+/// The multi-target form of `stream_load_file`: ONE bronze read and ONE
+/// encode per chunk, then one PUT per target (in list order) — the SCD4 v2
+/// executor's hist + cur tables from a single scan. `targets` is a list of
+/// `(load, headers)` pairs; each `load` carries `url`, `user`, `password`,
+/// `timeout_s`, its own `label_suffix` (distinct per target) and `tag`.
+///
+/// `on_chunk(phase, chunk_ix, label, reply_json_or_None, rows, pk_tuples_or_None, tag) -> bool`
+/// fires before and after EVERY (chunk, target) PUT; False stops the file.
+/// Pass `pk_cols=[]` when the executor needs no keys (v2 has no routing) —
+/// the pk tuple set is then empty and costs nothing.
+#[pyfunction]
+#[pyo3(signature = (catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix, on_chunk, scoped_tables=None, local_tables=None))]
+#[allow(clippy::too_many_arguments)]
+fn stream_load_file_multi(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
+    targets: Vec<(HashMap<String, String>, HashMap<String, String>)>,
+    chunk_rows: usize,
+    pk_cols: Vec<String>,
+    variant_cols: Vec<String>,
+    label_prefix: String,
+    on_chunk: Py<PyAny>,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
+) -> PyResult<Py<PyAny>> {
+    let targets = build_load_targets(&targets)?;
+    stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
+                     on_chunk, scoped_tables, local_tables, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_load_impl(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    sql: String,
+    scan_files: Option<HashMap<String, Vec<String>>>,
+    targets: Vec<LoadTarget>,
+    chunk_rows: usize,
+    pk_cols: Vec<String>,
+    variant_cols: Vec<String>,
+    label_prefix: String,
+    on_chunk: Py<PyAny>,
+    scoped_tables: Option<HashMap<String, Vec<String>>>,
+    local_tables: Option<HashMap<String, String>>,
+    multi: bool,
+) -> PyResult<Py<PyAny>> {
     use datafusion::logical_expr::LogicalPlan;
     use futures::StreamExt;
 
     let scan_files = parse_scan_files(scan_files)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
     let local_tables = local_tables.unwrap_or_default();
-    let target = build_load_target(&load, &headers)?;
+    let n_targets = targets.len();
     let chunk_rows = chunk_rows.max(1);
 
     let (chunks, rows): (usize, usize) = py.detach(|| {
@@ -1728,7 +1839,7 @@ fn stream_load_file(
                     n_rows += 1;
                     if n_rows >= chunk_rows {
                         let go = flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
-                                             &client, &target, &on_chunk, &label_prefix, &label_suffix).await?;
+                                             &client, &targets, &on_chunk, &label_prefix, multi).await?;
                         total_rows += n_rows;
                         n_rows = 0;
                         chunk_ix += 1;
@@ -1744,7 +1855,7 @@ fn stream_load_file(
             }
             if !stop && n_rows > 0 {
                 flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
-                            &client, &target, &on_chunk, &label_prefix, &label_suffix).await?;
+                            &client, &targets, &on_chunk, &label_prefix, multi).await?;
                 total_rows += n_rows;
                 chunk_ix += 1;
             }
@@ -1755,6 +1866,7 @@ fn stream_load_file(
         let d = pyo3::types::PyDict::new(py);
         d.set_item("chunks", chunks)?;
         d.set_item("rows", rows)?;
+        d.set_item("targets", n_targets)?;
         Ok(d.into_any().unbind())
     })
 }
@@ -1833,6 +1945,38 @@ mod stream_load_encoder_tests {
     }
 
     #[test]
+    fn multi_targets_carry_their_own_label_suffix_and_tag_and_refuse_duplicates() {
+        let mk = |url: &str, suffix: &str, tag: &str| {
+            let mut load = HashMap::new();
+            load.insert("url".to_string(), url.to_string());
+            load.insert("user".to_string(), "u".to_string());
+            load.insert("password".to_string(), "p".to_string());
+            load.insert("label_suffix".to_string(), suffix.to_string());
+            load.insert("tag".to_string(), tag.to_string());
+            let mut headers = HashMap::new();
+            headers.insert("columns".to_string(), format!("cols-of-{tag}"));
+            (load, headers)
+        };
+        let targets = build_load_targets(&[mk("http://be/api/db/t__hist/_stream_load", "-h-run1", "h"),
+                                           mk("http://be/api/db/t__cur/_stream_load", "-c-run1", "c")]).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(chunk_label("orders-1-19839-c0-", 3, &targets[0]), "orders-1-19839-c0-3-h-run1");
+        assert_eq!(chunk_label("orders-1-19839-c0-", 3, &targets[1]), "orders-1-19839-c0-3-c-run1");
+        assert_eq!((targets[0].tag.as_str(), targets[1].tag.as_str()), ("h", "c"));
+        assert_eq!(targets[1].headers, vec![("columns".to_string(), "cols-of-c".to_string())]);
+        assert_eq!(targets[0].timeout_s, 600);
+        // the legacy single-target builder: no suffix/tag keys -> empty (the wrapper supplies the suffix)
+        let (load, headers) = mk("http://be/x", "", "");
+        let single = build_load_target(&load, &headers).unwrap();
+        assert_eq!(chunk_label("p-", 0, &single), "p-0");
+        // duplicate suffixes would collide on Doris labels -> refused; an empty list -> refused
+        assert!(build_load_targets(&[mk("http://a", "-x", "h"), mk("http://b", "-x", "c")]).is_err());
+        assert!(build_load_targets(&[]).is_err());
+        let mut missing = mk("http://a", "-h", "h"); missing.0.remove("url");
+        assert!(build_load_targets(&[missing]).is_err());
+    }
+
+    #[test]
     fn timestamp_text_matches_isoformat_sep_space() {
         assert_eq!(timestamp_text(0, &TimeUnit::Second).unwrap(), "1970-01-01 00:00:00");
         assert_eq!(timestamp_text(1_500, &TimeUnit::Millisecond).unwrap(), "1970-01-01 00:00:01.500000");
@@ -1848,6 +1992,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(sql_collect, &this)?)?;
     this.add_function(wrap_pyfunction!(sql_collect_ipc, &this)?)?;
     this.add_function(wrap_pyfunction!(stream_load_file, &this)?)?;
+    this.add_function(wrap_pyfunction!(stream_load_file_multi, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
