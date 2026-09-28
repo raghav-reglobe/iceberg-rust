@@ -1629,54 +1629,71 @@ fn retry_suffix() -> String {
     format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 }
 
-/// One chunk, every target in order: "before" callback -> PUT (retry once
-/// on a reused label) -> "after" callback. The encoded body is shared (one
+/// What an in-flight chunk task needs (owned, so the flush can run as a
+/// spawned task while the next chunk is being encoded).
+struct FlushCtx {
+    client: reqwest::Client,
+    targets: Arc<Vec<LoadTarget>>,
+    on_chunk: Py<PyAny>,
+    label_prefix: Arc<str>,
+    /// selects the callback arity: the legacy single-target form calls
+    /// `on_chunk(phase, ix, label, reply, rows, pks)`; the multi form appends
+    /// the target's `tag` as a 7th argument.
+    multi: bool,
+}
+
+/// One chunk: the "before" callbacks (sequential, target order) -> the
+/// targets' PUTs CONCURRENTLY (each with its one retry on a reused label; the
+/// loads commute, ordering between them is irrelevant) -> the "after"
+/// callbacks (sequential, target order). The encoded body is shared (one
 /// encode, N PUTs). Returns the last "after" verdict (False = stop the file);
-/// a False "before" stops before that target's PUT.
-///
-/// `multi` selects the callback arity: the legacy single-target form calls
-/// `on_chunk(phase, ix, label, reply, rows, pks)`; the multi form appends the
-/// target's `tag` as a 7th argument.
-#[allow(clippy::too_many_arguments)]
+/// a False "before" stops before any PUT of this chunk.
 async fn flush_chunk(
     body: Vec<u8>,
     pk_set: std::collections::BTreeSet<Vec<Vec<u8>>>,
     n_rows: usize,
     chunk_ix: usize,
-    client: &reqwest::Client,
-    targets: &[LoadTarget],
-    on_chunk: &Py<PyAny>,
-    label_prefix: &str,
-    multi: bool,
+    ctx: Arc<FlushCtx>,
 ) -> PyResult<bool> {
     let bytes = bytes::Bytes::from(body);
-    for target in targets {
-        let label = chunk_label(label_prefix, chunk_ix, target);
+    let mut labels: Vec<String> = Vec::with_capacity(ctx.targets.len());
+    for target in ctx.targets.iter() {
+        let label = chunk_label(&ctx.label_prefix, chunk_ix, target);
         let go = Python::attach(|py| -> PyResult<bool> {
             let tuples = pk_tuples_py(py, &pk_set)?;
-            let r = if multi {
-                on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples, target.tag.as_str()))?
+            let r = if ctx.multi {
+                ctx.on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples, target.tag.as_str()))?
             } else {
-                on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples))?
+                ctx.on_chunk.call1(py, ("before", chunk_ix, label.as_str(), py.None(), n_rows, tuples))?
             };
             r.extract::<bool>(py)
         })?;
         if !go {
             return Ok(false);
         }
-        let mut final_label = label.clone();
-        let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
-        if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
-            final_label = format!("{label}-r{}", retry_suffix());
-            reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+        labels.push(label);
+    }
+    let puts = ctx.targets.iter().zip(labels.iter()).map(|(target, label)| {
+        let bytes = bytes.clone();
+        let client = &ctx.client;
+        async move {
+            let mut final_label = label.clone();
+            let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+            if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
+                final_label = format!("{label}-r{}", retry_suffix());
+                reply = put_chunk(client, target, &final_label, bytes).await?;
+            }
+            Ok::<(String, String), PyErr>((final_label, serde_json::to_string(&reply).unwrap_or_default()))
         }
-        let reply_txt = serde_json::to_string(&reply).unwrap_or_default();
+    });
+    let replies = futures::future::try_join_all(puts).await?;
+    for (target, (final_label, reply_txt)) in ctx.targets.iter().zip(replies) {
         let go = Python::attach(|py| -> PyResult<bool> {
             let tuples = pk_tuples_py(py, &pk_set)?;
-            let r = if multi {
-                on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples, target.tag.as_str()))?
+            let r = if ctx.multi {
+                ctx.on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples, target.tag.as_str()))?
             } else {
-                on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples))?
+                ctx.on_chunk.call1(py, ("after", chunk_ix, final_label.as_str(), reply_txt.as_str(), n_rows, tuples))?
             };
             r.extract::<bool>(py)
         })?;
@@ -1687,7 +1704,15 @@ async fn flush_chunk(
     Ok(true)
 }
 
-/// Stream-load ONE bronze file's rows into Doris, chunk by chunk, calling
+/// Awaits the in-flight chunk task (the pipeline's depth is ONE chunk: the
+/// encode of chunk k+1 overlaps the PUTs of chunk k; peak memory stays at
+/// two chunk bodies).
+async fn await_flush(h: tokio::task::JoinHandle<PyResult<bool>>) -> PyResult<bool> {
+    h.await.map_err(|e| PyValueError::new_err(format!("chunk flush task: {e}")))?
+}
+
+/// Stream-load ONE bronze file's rows into Doris, chunk by chunk (one chunk
+/// in flight: the next chunk's encode overlaps this chunk's PUTs), calling
 /// Python back before ("before": stage TRUNCATE) and after ("after": routing
 /// txn + ledger + checkpoint) every chunk. Returns {"chunks", "rows"}.
 ///
@@ -1822,6 +1847,13 @@ fn stream_load_impl(
                 .redirect(reqwest::redirect::Policy::limited(3)) // FE 307 -> BE, body replayed (bounded Vec)
                 .build()
                 .map_err(|e| PyValueError::new_err(format!("http client: {e}")))?;
+            let ctx = Arc::new(FlushCtx {
+                client,
+                targets: Arc::new(targets),
+                on_chunk,
+                label_prefix: Arc::from(label_prefix.as_str()),
+                multi,
+            });
 
             let mut body: Vec<u8> = Vec::with_capacity(chunk_rows * 256);
             let mut pks: std::collections::BTreeSet<Vec<Vec<u8>>> = Default::default();
@@ -1829,6 +1861,10 @@ fn stream_load_impl(
             let mut chunk_ix = 0usize;
             let mut total_rows = 0usize;
             let mut stop = false;
+            // the pipeline: ONE chunk in flight; before spawning chunk k+1's
+            // flush the task for chunk k is awaited (its verdict may stop the
+            // file), so callbacks stay ordered chunk by chunk
+            let mut pending: Option<tokio::task::JoinHandle<PyResult<bool>>> = None;
 
             while let Some(batch) = stream.next().await {
                 let batch = batch.map_err(|e| PyValueError::new_err(format!("reading batch: {e}")))?;
@@ -1838,24 +1874,30 @@ fn stream_load_impl(
                     }
                     n_rows += 1;
                     if n_rows >= chunk_rows {
-                        let go = flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
-                                             &client, &targets, &on_chunk, &label_prefix, multi).await?;
+                        if let Some(h) = pending.take() {
+                            if !await_flush(h).await? {
+                                stop = true;
+                                break;
+                            }
+                        }
+                        pending = Some(tokio::spawn(flush_chunk(
+                            std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix, ctx.clone())));
                         total_rows += n_rows;
                         n_rows = 0;
                         chunk_ix += 1;
-                        if !go {
-                            stop = true;
-                            break;
-                        }
                     }
                 }
                 if stop {
                     break;
                 }
             }
+            if let Some(h) = pending.take() {
+                if !await_flush(h).await? {
+                    stop = true;
+                }
+            }
             if !stop && n_rows > 0 {
-                flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix,
-                            &client, &targets, &on_chunk, &label_prefix, multi).await?;
+                flush_chunk(std::mem::take(&mut body), std::mem::take(&mut pks), n_rows, chunk_ix, ctx.clone()).await?;
                 total_rows += n_rows;
                 chunk_ix += 1;
             }
