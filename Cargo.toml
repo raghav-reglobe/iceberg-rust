@@ -179,6 +179,11 @@ zstd = "0.13.3"
 # carries the exactness guard; its manifest keeps the registry dependencies,
 # so no other crate in the graph is duplicated.
 parquet-variant-compute = { path = "vendor/parquet-variant-compute" }
+# A shredded typed_value DECIMAL(1, s) must be INT32 (shredding spec: INT32 for
+# every precision <= 9); the released crate's `precision > 1` guard sent it to
+# INT64, which spec-enforcing readers (Doris file scanner v2) reject. One-line
+# fix in src/arrow/schema/mod.rs + a unit test; see vendor/README.md.
+parquet = { path = "vendor/parquet" }
 datafusion = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }
 datafusion-cli = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }
 datafusion-ffi = { git = "https://github.com/raghav-reglobe/datafusion", branch = "pulse-integration" }

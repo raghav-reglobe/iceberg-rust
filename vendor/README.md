@@ -22,3 +22,21 @@ stays a variant `value`. Plain casts (`variant_get`) keep rounding
 semantics. Tests: `shred_variant::tests::{inexact_decimals_are_not_shredded,
 plain_casts_still_round}`. Files touched: `src/type_conversion.rs`,
 `src/variant_to_arrow.rs`, `src/shred_variant.rs`.
+
+## parquet 59.0.0
+
+A shredded VARIANT decimal must land in the physical type the shredding spec
+prescribes: INT32 for every precision <= 9, INT64 up to 18, otherwise
+FIXED_LEN_BYTE_ARRAY. The released arrow-to-parquet schema mapping
+(`src/arrow/schema/mod.rs`, `arrow_to_parquet_type`) guarded INT32 with
+`precision > 1 && precision <= 9`, so a `DECIMAL(1, s)` typed_value - every
+`0.9`-shaped grade in the mongo quotes - was written as INT64. Readers that
+enforce the spec (Doris' native parquet reader, file scanner v2) reject such a
+file as corruption: `Parquet Variant DECIMAL precision 1 does not match
+physical type 2 (INT64)`. The patch drops the `> 1` guard (one line); the
+logical type keeps the declared precision and scale, so a spec-tolerant reader
+sees the same values. Test: `arrow::schema::tests::test_decimal_precision_one_is_int32`
+(run from this directory with `--features arrow`). Files touched:
+`src/arrow/schema/mod.rs`. Existing files written before the patch are NOT
+rewritten by it - the fix is for what the writers produce from here on.
+

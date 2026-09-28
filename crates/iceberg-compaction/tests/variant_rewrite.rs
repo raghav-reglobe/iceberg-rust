@@ -64,10 +64,11 @@ use iceberg_compaction::engine::compact_table;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::{LogicalType, Type as PhysicalType};
 use parquet::file::properties::WriterProperties;
 use parquet::variant::{
-    ShreddedSchemaBuilder, Variant, VariantArrayBuilder, VariantBuilder, shred_variant,
-    variant_to_json,
+    ShreddedSchemaBuilder, Variant, VariantArrayBuilder, VariantBuilder, VariantDecimal4,
+    shred_variant, variant_to_json,
 };
 use tempfile::TempDir;
 
@@ -864,4 +865,144 @@ async fn compaction_shred_write_preserves_array_shredding() {
 
     // Values still read back semantically equal through the fold.
     assert_eq!(live_docs_as_json(&table).await, expected_json);
+}
+
+// ---------------------------------------------------------------------------
+// Shredded DECIMAL leaves must use the physical type the shredding spec
+// prescribes (INT32 for precision <= 9). The released parquet crate sent a
+// precision-1 decimal to INT64 (`precision > 1` guard in arrow_to_parquet_type),
+// which spec-enforcing readers (Doris file scanner v2) reject as corruption.
+// The workspace carries a patched copy (vendor/parquet); this test pins the
+// behaviour on BOTH files a compaction touches: the input written through
+// ArrowWriter and the shred-preserving rewrite's output.
+// ---------------------------------------------------------------------------
+
+/// `{ "g": <decimal4 unscaled/scale> }` — the 0.9-shaped grade of the quotes.
+fn variant_decimal_object(unscaled: i32, scale: u8) -> VariantBytes {
+    let mut b = VariantBuilder::new();
+    let mut obj = b.new_object();
+    obj.insert("g", VariantDecimal4::try_new(unscaled, scale).unwrap());
+    obj.finish();
+    b.finish()
+}
+
+/// Like `shredded_batch`, shredded on `g: Decimal128(1, 1)` instead of `a: Int64`.
+fn shredded_decimal_batch(rows: &[(i32, Option<VariantBytes>)]) -> RecordBatch {
+    let ids = Int32Array::from(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+    let mut b = VariantArrayBuilder::new(rows.len());
+    for (_, v) in rows {
+        match v {
+            None => b.append_null(),
+            Some((m, val)) => b.append_variant(Variant::try_new(m, val).unwrap()),
+        }
+    }
+    let canonical = b.build();
+    let as_type = ShreddedSchemaBuilder::new()
+        .with_path("g", DataType::Decimal128(1, 1))
+        .unwrap()
+        .build();
+    let doc = ArrayRef::from(shred_variant(&canonical, &as_type).unwrap());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("doc", doc.data_type().clone(), true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(ids), doc]).unwrap()
+}
+
+/// Every DECIMAL leaf of a data file as (column path, parquet physical type).
+async fn decimal_leaf_physical_types(table: &Table, path: &str) -> Vec<(String, PhysicalType)> {
+    let bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    reader
+        .parquet_schema()
+        .columns()
+        .iter()
+        .filter(|c| matches!(c.logical_type_ref(), Some(LogicalType::Decimal(_))))
+        .map(|c| (c.path().string(), c.physical_type()))
+        .collect()
+}
+
+#[tokio::test]
+async fn shred_write_decimal_precision_one_leaf_is_int32() {
+    let warehouse = TempDir::new().unwrap();
+    let (catalog, ident, table) = setup_table(&warehouse).await;
+
+    // Two shredded files on `g: Decimal128(1, 1)`: 0.9 and 0.0 fit the typed
+    // leaf exactly; 0.68 does not (scale 2) and must stay in `value`; a string
+    // and a NULL slot ride along.
+    let rows1: Vec<(i32, Option<VariantBytes>)> = vec![
+        (1, Some(variant_decimal_object(9, 1))),
+        (2, Some(variant_decimal_object(68, 2))),
+        (3, None),
+    ];
+    let rows2: Vec<(i32, Option<VariantBytes>)> = vec![
+        (4, Some(variant_decimal_object(0, 1))),
+        (5, Some(variant_string("resides in value"))),
+    ];
+    let file1 = write_raw_data_file(&table, "g1", shredded_decimal_batch(&rows1)).await;
+    let file2 = write_raw_data_file(&table, "g2", shredded_decimal_batch(&rows2)).await;
+    let tx = Transaction::new(&table);
+    let table = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+    // INPUT files (ArrowWriter through the workspace's parquet crate): INT32.
+    let input_paths = live_data_file_paths(&table).await;
+    assert_eq!(input_paths.len(), 2);
+    for p in &input_paths {
+        let leaves = decimal_leaf_physical_types(&table, p).await;
+        assert!(
+            !leaves.is_empty(),
+            "input {p} must carry a shredded DECIMAL leaf"
+        );
+        for (col, phys) in leaves {
+            assert_eq!(phys, PhysicalType::INT32, "input leaf {col} must be INT32");
+        }
+    }
+
+    let mut seeded = rows1.clone();
+    seeded.extend(rows2.clone());
+    let expected_json = jsons_of(&seeded);
+    assert_eq!(live_docs_as_json(&table).await, expected_json);
+
+    let cfg = Config {
+        shred_variants: true,
+        ..aggressive_cfg()
+    };
+    compact_table(&catalog, &ident, &cfg).await.unwrap();
+    let table = catalog.load_table(&ident).await.unwrap();
+
+    // OUTPUT file (the shred-preserving rewrite): still shredded, still INT32.
+    let paths = live_data_file_paths(&table).await;
+    assert_eq!(paths.len(), 1);
+    let leaves = decimal_leaf_physical_types(&table, &paths[0]).await;
+    assert!(
+        !leaves.is_empty(),
+        "rewrite output must keep the shredded DECIMAL leaf"
+    );
+    for (col, phys) in leaves {
+        assert_eq!(phys, PhysicalType::INT32, "output leaf {col} must be INT32");
+    }
+    assert_eq!(
+        live_docs_as_json(&table).await,
+        expected_json,
+        "values must survive the shred-preserving rewrite"
+    );
 }
