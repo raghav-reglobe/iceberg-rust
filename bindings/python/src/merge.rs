@@ -131,6 +131,34 @@ fn parse_scan_files(scan_files: Option<HashMap<String, Vec<String>>>) -> PyResul
     Ok(out)
 }
 
+/// `snapshot_ids` keys are `catalog.namespace.table` like `scan_files`; the
+/// value is the Iceberg snapshot id every scan of that table reads (time
+/// travel for externally pinned reads: a twin build or a referee load names
+/// the exact snapshot it was planned against and the read stays exact for as
+/// long as the snapshot is retained — an expired pin FAILS the scan, it never
+/// reads 0 rows). Grouped per catalog as `(namespace, table) -> snapshot id`.
+/// Read doorways only; the merge doorways always read current.
+type SnapshotIds = HashMap<String, HashMap<(String, String), i64>>;
+
+fn parse_snapshot_ids(snapshot_ids: Option<HashMap<String, i64>>) -> PyResult<SnapshotIds> {
+    let mut out: SnapshotIds = HashMap::new();
+    for (fqn, snapshot_id) in snapshot_ids.unwrap_or_default() {
+        let parts: Vec<&str> = fqn.split('.').collect();
+        if parts.len() < 3 {
+            return Err(PyValueError::new_err(format!(
+                "snapshot_ids key `{fqn}` must be `catalog.namespace.table`"
+            )));
+        }
+        let catalog = parts[0].to_string();
+        let table = parts[parts.len() - 1].to_string();
+        let namespace = parts[1..parts.len() - 1].join(".");
+        out.entry(catalog)
+            .or_default()
+            .insert((namespace, table), snapshot_id);
+    }
+    Ok(out)
+}
+
 type ScopedTables = HashMap<String, HashMap<String, Vec<String>>>;
 
 /// `{catalog: ["namespace.table", ...]}` -> catalog -> namespace -> tables.
@@ -496,6 +524,7 @@ impl MemoryPool for PeakTrackingPool {
 async fn session_with_catalogs(
     catalogs: HashMap<String, HashMap<String, String>>,
     mut scan_files: ScanFiles,
+    mut snapshot_ids: SnapshotIds,
     mut scoped_tables: ScopedTables,
     local_tables: HashMap<String, String>,
     options: Option<Arc<MorMergeOptions>>,
@@ -588,11 +617,28 @@ async fn session_with_catalogs(
                     ))
                 })?;
         }
+        // Snapshot pins (time travel for externally planned reads) — applied
+        // per call like the allowlists and composing with them: the
+        // allowlist filters the PINNED snapshot's plan.
+        for ((namespace, table), snapshot_id) in snapshot_ids.remove(&name).unwrap_or_default() {
+            provider
+                .with_table_snapshot_id(&namespace, &table, snapshot_id)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "snapshot_ids for `{name}.{namespace}.{table}`: {e}"
+                    ))
+                })?;
+        }
         ctx.register_catalog(&name, Arc::new(provider));
     }
     if let Some(unmatched) = scan_files.keys().next() {
         return Err(PyValueError::new_err(format!(
             "scan_files references catalog `{unmatched}` which is not in `catalogs`"
+        )));
+    }
+    if let Some(unmatched) = snapshot_ids.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "snapshot_ids references catalog `{unmatched}` which is not in `catalogs`"
         )));
     }
     if let Some(unmatched) = scoped_tables.keys().next() {
@@ -750,6 +796,7 @@ fn merge_into(
                 session_with_catalogs(
                     catalogs,
                     scan_files,
+                    SnapshotIds::new(),
                     scoped_tables,
                     local_tables,
                     Some(options),
@@ -1021,6 +1068,7 @@ fn merge_into_window(
                 session_with_catalogs(
                     catalogs,
                     scan_files,
+                    SnapshotIds::new(),
                     scoped_tables,
                     local_tables,
                     Some(options),
@@ -1096,7 +1144,7 @@ fn merge_into_window(
 /// only, no data IO, no commit), so a failing or suspicious merge can be
 /// inspected with zero writes.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, scoped_tables=None, local_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, scoped_tables=None, local_tables=None, snapshot_ids=None))]
 fn dry_run_inspect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -1104,15 +1152,23 @@ fn dry_run_inspect(
     scan_files: Option<HashMap<String, Vec<String>>>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
 ) -> PyResult<HashMap<String, String>> {
     let scan_files = parse_scan_files(scan_files)?;
+    let snapshot_ids = parse_snapshot_ids(snapshot_ids)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
     let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let (ctx, _pool) =
-                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
-                    .await?;
+            let (ctx, _pool) = session_with_catalogs(
+                catalogs,
+                scan_files,
+                snapshot_ids,
+                scoped_tables,
+                local_tables,
+                None,
+            )
+            .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -1140,7 +1196,7 @@ fn dry_run_inspect(
 /// JSON-serializable by the arrow JSON writer — wrap variant/binary columns
 /// in `variant_to_json(...)` in the statement.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None, snapshot_ids=None))]
 fn sql_collect(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -1149,17 +1205,25 @@ fn sql_collect(
     max_rows: usize,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
 ) -> PyResult<String> {
     use datafusion::logical_expr::LogicalPlan;
 
     let scan_files = parse_scan_files(scan_files)?;
+    let snapshot_ids = parse_snapshot_ids(snapshot_ids)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
     let local_tables = local_tables.unwrap_or_default();
     py.detach(|| {
         runtime().block_on(async move {
-            let (ctx, _pool) =
-                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
-                    .await?;
+            let (ctx, _pool) = session_with_catalogs(
+                catalogs,
+                scan_files,
+                snapshot_ids,
+                scoped_tables,
+                local_tables,
+                None,
+            )
+            .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -1209,7 +1273,7 @@ fn sql_collect(
 /// guard and loud `max_rows` cap; the stream always carries the schema, so
 /// a zero-row result is a valid empty table, not an error.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files=None, max_rows=100_000, scoped_tables=None, local_tables=None, snapshot_ids=None))]
 fn sql_collect_ipc(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -1218,17 +1282,25 @@ fn sql_collect_ipc(
     max_rows: usize,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
 ) -> PyResult<Py<pyo3::types::PyBytes>> {
     use datafusion::logical_expr::LogicalPlan;
 
     let scan_files = parse_scan_files(scan_files)?;
+    let snapshot_ids = parse_snapshot_ids(snapshot_ids)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
     let local_tables = local_tables.unwrap_or_default();
     let buf: Vec<u8> = py.detach(|| {
         runtime().block_on(async move {
-            let (ctx, _pool) =
-                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None)
-                    .await?;
+            let (ctx, _pool) = session_with_catalogs(
+                catalogs,
+                scan_files,
+                snapshot_ids,
+                scoped_tables,
+                local_tables,
+                None,
+            )
+            .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -1722,7 +1794,7 @@ async fn await_flush(h: tokio::task::JoinHandle<PyResult<bool>>) -> PyResult<boo
 /// reply is still delivered — the executor decides. `Label Already Exists` is
 /// retried once with `-r<8hex>` and the final label reported.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files, load, headers, chunk_rows, pk_cols, variant_cols, label_prefix, label_suffix, on_chunk, scoped_tables=None, local_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files, load, headers, chunk_rows, pk_cols, variant_cols, label_prefix, label_suffix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None))]
 #[allow(clippy::too_many_arguments)]
 fn stream_load_file(
     py: Python<'_>,
@@ -1739,12 +1811,13 @@ fn stream_load_file(
     on_chunk: Py<PyAny>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
 ) -> PyResult<Py<PyAny>> {
     let mut load = load;
     load.insert("label_suffix".to_string(), label_suffix);
     let targets = vec![build_load_target(&load, &headers)?];
     stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
-                     on_chunk, scoped_tables, local_tables, false)
+                     on_chunk, scoped_tables, local_tables, snapshot_ids, false)
 }
 
 /// The multi-target form of `stream_load_file`: ONE bronze read and ONE
@@ -1758,7 +1831,7 @@ fn stream_load_file(
 /// Pass `pk_cols=[]` when the executor needs no keys (v2 has no routing) —
 /// the pk tuple set is then empty and costs nothing.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix, on_chunk, scoped_tables=None, local_tables=None))]
+#[pyo3(signature = (catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None))]
 #[allow(clippy::too_many_arguments)]
 fn stream_load_file_multi(
     py: Python<'_>,
@@ -1773,10 +1846,11 @@ fn stream_load_file_multi(
     on_chunk: Py<PyAny>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
 ) -> PyResult<Py<PyAny>> {
     let targets = build_load_targets(&targets)?;
     stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
-                     on_chunk, scoped_tables, local_tables, true)
+                     on_chunk, scoped_tables, local_tables, snapshot_ids, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1793,12 +1867,14 @@ fn stream_load_impl(
     on_chunk: Py<PyAny>,
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
+    snapshot_ids: Option<HashMap<String, i64>>,
     multi: bool,
 ) -> PyResult<Py<PyAny>> {
     use datafusion::logical_expr::LogicalPlan;
     use futures::StreamExt;
 
     let scan_files = parse_scan_files(scan_files)?;
+    let snapshot_ids = parse_snapshot_ids(snapshot_ids)?;
     let scoped_tables = parse_scoped_tables(scoped_tables)?;
     let local_tables = local_tables.unwrap_or_default();
     let n_targets = targets.len();
@@ -1806,8 +1882,15 @@ fn stream_load_impl(
 
     let (chunks, rows): (usize, usize) = py.detach(|| {
         runtime().block_on(async move {
-            let (ctx, _pool) =
-                session_with_catalogs(catalogs, scan_files, scoped_tables, local_tables, None).await?;
+            let (ctx, _pool) = session_with_catalogs(
+                catalogs,
+                scan_files,
+                snapshot_ids,
+                scoped_tables,
+                local_tables,
+                None,
+            )
+            .await?;
             let df = ctx
                 .sql(&sql)
                 .await
@@ -2226,5 +2309,49 @@ mod unspillable_reserve_tests {
         }
         unsafe { std::env::remove_var("MERGE_DF_UNSPILLABLE_RESERVE_PCT") };
         assert_eq!(UnspillableReservePool::reserve_pct_from_env(), None);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_pin_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_ids_group_per_catalog_and_split_multilevel_namespaces() {
+        let ids = parse_snapshot_ids(Some(HashMap::from([
+            (
+                "bronze_dbnew.cashify_mart.orders".to_string(),
+                1_833_894_294_735_745_083_i64,
+            ),
+            (
+                "bronze_dbadhoc.rawtwin.kapture.ticket_report_data_t6".to_string(),
+                8_076_658_723_558_311_002_i64,
+            ),
+        ])))
+        .unwrap();
+        assert_eq!(
+            ids["bronze_dbnew"][&("cashify_mart".to_string(), "orders".to_string())],
+            1_833_894_294_735_745_083
+        );
+        assert_eq!(
+            ids["bronze_dbadhoc"][&(
+                "rawtwin.kapture".to_string(),
+                "ticket_report_data_t6".to_string()
+            )],
+            8_076_658_723_558_311_002
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_reject_a_two_part_key() {
+        assert!(
+            parse_snapshot_ids(Some(HashMap::from([("bronze.orders".to_string(), 1_i64)])))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn no_snapshot_ids_is_empty() {
+        assert!(parse_snapshot_ids(None).unwrap().is_empty());
     }
 }

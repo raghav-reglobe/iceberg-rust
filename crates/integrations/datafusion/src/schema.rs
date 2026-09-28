@@ -147,6 +147,26 @@ impl IcebergSchemaProvider {
         self.tables.insert(table.to_string(), Arc::new(restricted));
         Ok(())
     }
+
+    /// Pin every scan of `table` to `snapshot_id` (see
+    /// [`IcebergTableProvider::with_snapshot_id`]); composes with a scan-file
+    /// allowlist set before or after.
+    pub(crate) fn set_snapshot_id(&self, table: &str, snapshot_id: i64) -> Result<()> {
+        let pinned = {
+            let provider = self.tables.get(table).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::TableNotFound,
+                    format!(
+                        "table `{table}` not found in namespace `{}` (snapshot pin)",
+                        self.namespace.to_url_string()
+                    ),
+                )
+            })?;
+            provider.as_ref().clone().with_snapshot_id(snapshot_id)
+        };
+        self.tables.insert(table.to_string(), Arc::new(pinned));
+        Ok(())
+    }
 }
 
 #[async_trait]

@@ -143,6 +143,31 @@ impl IcebergCatalogProvider {
             })?;
         schema.set_scan_file_allowlist(table, files)
     }
+
+    /// Pin every scan of `namespace.table` to `snapshot_id` (time travel for
+    /// externally planned reads); composes with a scan-file allowlist.
+    pub fn with_table_snapshot_id(
+        &self,
+        namespace: &str,
+        table: &str,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        let schema = self.schemas.get(namespace).ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::NamespaceNotFound,
+                format!("namespace `{namespace}` not mounted (snapshot pin)"),
+            )
+        })?;
+        let schema = (schema.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<IcebergSchemaProvider>()
+            .ok_or_else(|| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("schema provider for `{namespace}` is not Iceberg-backed"),
+                )
+            })?;
+        schema.set_snapshot_id(table, snapshot_id)
+    }
 }
 
 impl CatalogProvider for IcebergCatalogProvider {

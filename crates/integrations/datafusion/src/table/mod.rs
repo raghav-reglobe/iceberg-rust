@@ -101,6 +101,13 @@ pub struct IcebergTableProvider {
     /// When set, scans read ONLY the data files whose path is in the set
     /// (externally planned file subset; deletes still apply).
     scan_file_allowlist: Option<Arc<HashSet<String>>>,
+    /// When set, every scan reads THIS snapshot instead of the current one
+    /// (time travel for externally pinned reads: a planned file set stays
+    /// exact for as long as the snapshot is retained). Checked against the
+    /// freshly loaded metadata on every scan — an expired or unknown pin is
+    /// an ERROR, never an empty read. Composes with the allowlist; writes
+    /// and merges into the table are unaffected.
+    snapshot_id: Option<i64>,
 }
 
 impl IcebergTableProvider {
@@ -124,6 +131,7 @@ impl IcebergTableProvider {
             table_ident,
             schema,
             scan_file_allowlist: None,
+            snapshot_id: None,
         })
     }
 
@@ -132,6 +140,14 @@ impl IcebergTableProvider {
     /// merges into the table are unaffected.
     pub fn with_scan_file_allowlist(mut self, files: impl IntoIterator<Item = String>) -> Self {
         self.scan_file_allowlist = Some(Arc::new(files.into_iter().collect()));
+        self
+    }
+
+    /// Pin every scan of this provider to `snapshot_id` (time travel). The
+    /// pin is checked against fresh metadata on each scan: a snapshot expired
+    /// since the pin was taken fails the scan instead of reading nothing.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -183,6 +199,7 @@ impl TableProvider for IcebergTableProvider {
             && let Some(w) = options.window.as_ref()
             && w.hold_requested()
             && filters_imply_current_only(filters)
+            && self.snapshot_id.is_none()
         {
             let projected_names: Vec<String> = match projection {
                 Some(indices) => indices
@@ -208,10 +225,26 @@ impl TableProvider for IcebergTableProvider {
             }
         }
 
-        // Create scan with fresh metadata (always use current snapshot)
+        // A pinned read must name a snapshot the FRESH metadata still holds:
+        // retention can expire it between mount and scan, and a silent fall
+        // back (to the current snapshot, or to nothing) would return a
+        // different row set under the caller's pin.
+        if let Some(snapshot_id) = self.snapshot_id
+            && table.metadata().snapshot_by_id(snapshot_id).is_none()
+        {
+            return Err(to_datafusion_error(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "pinned snapshot id {snapshot_id} not found in table {} (expired or wrong id)",
+                    self.table_ident
+                ),
+            )));
+        }
+
+        // Create scan with fresh metadata: the pinned snapshot when set, else current
         Ok(Arc::new(IcebergTableScan::new(
             table,
-            None, // Always use current snapshot for catalog-backed provider
+            self.snapshot_id,
             self.schema.clone(),
             projection,
             filters,

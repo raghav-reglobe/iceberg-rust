@@ -214,13 +214,17 @@ struct WindowOut {
 ///  "files": [(path, record_count, sequence_number, file_size_in_bytes), ...]}
 /// ```
 ///
-/// `files` lists live DATA files of the CURRENT snapshot whose data
+/// `files` lists live DATA files of the CURRENT snapshot — or of
+/// `head_snapshot_id` when given: the plan is then taken against that PINNED
+/// snapshot (the planning companion of the read doorways' `snapshot_ids`,
+/// so an externally pinned load plans AND reads one snapshot; an unknown or
+/// expired pin is an error, never an empty plan) — whose data
 /// sequence_number > from_seq, sorted by (sequence_number, path). When the
 /// resolved cursor is at/past the head sequence the manifest walk is skipped
 /// (`walked=False`, `files=[]`) — that walk is provably empty, not a
 /// different semantic. Cursor/plan-kind decisions stay with the caller.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, cursor_snap=None, cursor_seq=None, timeout_s=None))]
+#[pyo3(signature = (catalog_props, fqn, cursor_snap=None, cursor_seq=None, timeout_s=None, head_snapshot_id=None))]
 fn append_window(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -228,6 +232,7 @@ fn append_window(
     cursor_snap: Option<i64>,
     cursor_seq: Option<i64>,
     timeout_s: Option<u64>,
+    head_snapshot_id: Option<i64>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
     let out: WindowOut = py.detach(|| {
@@ -237,15 +242,28 @@ fn append_window(
             async move {
                 let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
                 let meta = table.metadata_ref();
-                let Some(current) = meta.current_snapshot() else {
-                    return Ok::<_, PyErr>(WindowOut {
-                        head_snapshot_id: None,
-                        head_seq: None,
-                        resolved_cursor_seq: None,
-                        from_seq: 0,
-                        walked: false,
-                        files: vec![],
-                    });
+                // The plan's head: the pinned snapshot when the caller names one
+                // (it must still be retained — a vanished pin is an error, never
+                // a plan against a different snapshot), else the current one.
+                let current = match head_snapshot_id {
+                    Some(id) => meta.snapshot_by_id(id).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "pinned head snapshot id {id} not found in table {fqn} (expired or wrong id)"
+                        ))
+                    })?,
+                    None => match meta.current_snapshot() {
+                        Some(s) => s,
+                        None => {
+                            return Ok::<_, PyErr>(WindowOut {
+                                head_snapshot_id: None,
+                                head_seq: None,
+                                resolved_cursor_seq: None,
+                                from_seq: 0,
+                                walked: false,
+                                files: vec![],
+                            });
+                        }
+                    },
                 };
                 let head_id = current.snapshot_id();
                 let head_seq = current.sequence_number();

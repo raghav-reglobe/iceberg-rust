@@ -946,3 +946,84 @@ async fn test_insert_into_partitioned() -> Result<()> {
 
     Ok(())
 }
+
+/// A per-table snapshot pin makes a read exact against an OLDER snapshot
+/// (time travel through the catalog-backed provider), composes with a
+/// current-snapshot mount of the same table in the same session, and FAILS
+/// — never reads nothing — when the pinned snapshot does not exist.
+#[tokio::test]
+async fn test_pinned_snapshot_read() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_pinned_snapshot".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+    ctx.sql("INSERT INTO catalog.test_pinned_snapshot.my_table VALUES (1, 'alan'), (2, 'turing')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let table = client
+        .load_table(&TableIdent::new(namespace.clone(), "my_table".to_string()))
+        .await?;
+    let first = table.metadata().current_snapshot_id().unwrap();
+    ctx.sql("INSERT INTO catalog.test_pinned_snapshot.my_table VALUES (3, 'ada')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // The same table mounted twice: current, and pinned to the first snapshot.
+    let pinned = IcebergCatalogProvider::try_new(client.clone()).await?;
+    pinned.with_table_snapshot_id("test_pinned_snapshot", "my_table", first)?;
+    ctx.register_catalog("pinned", Arc::new(pinned));
+
+    async fn count(ctx: &SessionContext, sql: &str) -> i64 {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT count(*) FROM catalog.test_pinned_snapshot.my_table"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT count(*) FROM pinned.test_pinned_snapshot.my_table"
+        )
+        .await,
+        2
+    );
+
+    // An unknown (expired) pin fails the read at scan time.
+    let stale = IcebergCatalogProvider::try_new(client.clone()).await?;
+    stale.with_table_snapshot_id("test_pinned_snapshot", "my_table", 424_242)?;
+    ctx.register_catalog("stale", Arc::new(stale));
+    let failed = match ctx
+        .sql("SELECT count(*) FROM stale.test_pinned_snapshot.my_table")
+        .await
+    {
+        Err(_) => true,
+        Ok(df) => df.collect().await.is_err(),
+    };
+    assert!(failed, "an unknown pinned snapshot must fail the read");
+    Ok(())
+}
