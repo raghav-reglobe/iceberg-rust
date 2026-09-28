@@ -74,6 +74,137 @@ fn is_object_node_set(children: &Fields) -> bool {
     !children.is_empty() && children.iter().all(|c| is_shred_node(c.data_type()))
 }
 
+/// The Variant shredding spec's REPETITION for a shredded layout: every shred
+/// node wrapper (`{value?, typed_value?}` around an object field or an array
+/// element) is REQUIRED — field presence is encoded by both children being
+/// null, never by a null wrapper — while `metadata`/`value`/`typed_value`
+/// and the column itself keep their nullability. Spec-enforcing readers
+/// (Doris' native parquet reader, file scanner v2) reject an OPTIONAL wrapper
+/// group as corruption ("shredded wrapper N must be required"); DuckDB wrote
+/// OPTIONAL wrappers, and a writer that adopts a file's own arrow type as its
+/// layout (the merge's passthrough layout) inherits them for ever. Apply this
+/// to any layout ADOPTED from a file before it becomes a writer layout.
+pub fn spec_wrapper_nullability(t: &DataType) -> DataType {
+    fn spec_field(f: &Field) -> Field {
+        let dt = spec_wrapper_nullability(f.data_type());
+        let nullable = if is_shred_node(f.data_type()) {
+            false
+        } else {
+            f.is_nullable()
+        };
+        f.clone().with_data_type(dt).with_nullable(nullable)
+    }
+    match t {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|c| Arc::new(spec_field(c)))
+                .collect::<Vec<FieldRef>>()
+                .into(),
+        ),
+        DataType::List(el) => DataType::List(Arc::new(spec_field(el))),
+        DataType::LargeList(el) => DataType::LargeList(Arc::new(spec_field(el))),
+        other => other.clone(),
+    }
+}
+
+/// Mask `arr`'s validity with `parent`: a slot that is null in the parent is
+/// null in the result (the array's own nulls are kept). Columnar: one bitmap
+/// AND, no buffer copies.
+fn mask_nulls_with(arr: &ArrayRef, parent: &arrow_buffer::NullBuffer) -> Result<ArrayRef> {
+    let merged = match arr.nulls() {
+        Some(own) => arrow_buffer::NullBuffer::new(own.inner() & parent.inner()),
+        None => parent.clone(),
+    };
+    let data = arr
+        .to_data()
+        .into_builder()
+        .nulls(Some(merged))
+        .build()
+        .map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, "masking a shred node's children").with_source(e)
+        })?;
+    Ok(arrow_array::make_array(data))
+}
+
+/// Make a shred node wrapper array spec-REQUIRED: a NULL wrapper slot (an
+/// OPTIONAL-lineage file's encoding of a missing object field) becomes a
+/// valid wrapper whose `value` and `typed_value` are both null — the spec's
+/// own encoding of the same thing — so the array can sit under a
+/// non-nullable field. `fields` are the target (non-nullable) wrapper's
+/// children. A wrapper without nulls is returned untouched.
+fn require_shred_node(arr: &ArrayRef, fields: &Fields) -> Result<ArrayRef> {
+    let sa = arr
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("shred node is a StructArray");
+    let Some(wrapper_nulls) = sa.nulls() else {
+        return Ok(Arc::new(StructArray::new(
+            fields.clone(),
+            sa.columns().to_vec(),
+            None,
+        )) as ArrayRef);
+    };
+    let cols = sa
+        .columns()
+        .iter()
+        .map(|c| mask_nulls_with(c, wrapper_nulls))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(StructArray::new(fields.clone(), cols, None)) as ArrayRef)
+}
+
+/// Make an ARRAY-element shred node wrapper array spec-REQUIRED: a NULL element
+/// wrapper (an OPTIONAL-lineage file's encoding of a null array element) becomes
+/// a valid wrapper carrying the variant NULL primitive in `value` (the spec's
+/// encoding: one 0x00 byte) with `typed_value` null. Elements are always
+/// present, so this is the only faithful mapping. A wrapper without nulls is
+/// returned untouched (fields re-declared).
+fn require_shred_element(arr: &ArrayRef, fields: &Fields) -> Result<ArrayRef> {
+    let sa = arr
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("shred node is a StructArray");
+    let Some(wrapper_nulls) = sa.nulls() else {
+        return Ok(Arc::new(StructArray::new(
+            fields.clone(),
+            sa.columns().to_vec(),
+            None,
+        )) as ArrayRef);
+    };
+    let present = arrow_array::BooleanArray::new(wrapper_nulls.inner().clone(), None);
+    let mut cols = Vec::with_capacity(fields.len());
+    for (f, c) in fields.iter().zip(sa.columns()) {
+        if f.name() == "value" {
+            let variant_null: ArrayRef = match c.data_type() {
+                DataType::Binary => Arc::new(arrow_array::BinaryArray::from_iter_values([[0u8]])),
+                DataType::LargeBinary => {
+                    Arc::new(arrow_array::LargeBinaryArray::from_iter_values([[0u8]]))
+                }
+                DataType::BinaryView => {
+                    Arc::new(arrow_array::BinaryViewArray::from_iter_values([[0u8]]))
+                }
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("shred node `value` child has non-binary type {other}"),
+                    ));
+                }
+            };
+            // `c` is an ArrayRef (Arc<dyn Array>), a Datum by the blanket impl
+            let filled =
+                arrow_select::zip::zip(&present, c, &arrow_array::Scalar::new(variant_null))
+                    .map_err(|e| {
+                        Error::new(ErrorKind::DataInvalid, "filling null array elements")
+                            .with_source(e)
+                    })?;
+            cols.push(filled);
+        } else {
+            cols.push(mask_nulls_with(c, wrapper_nulls)?);
+        }
+    }
+    Ok(Arc::new(StructArray::new(fields.clone(), cols, None)) as ArrayRef)
+}
+
 /// Recover the PLAIN requested type from a file's `typed_value` tree — the
 /// inverse of the `{value, typed_value}` wrapping `shred_variant` applies.
 /// Fields shredded value-only (no `typed_value`) are skipped: re-shredding
@@ -125,8 +256,9 @@ pub fn shred_types_from_file_schema(
 }
 
 /// Like [`shred_types_from_file_schema`], but ALSO returns the file's OWN
-/// full arrow type for each shredded variant column (verbatim, as the scan
-/// will produce it raw). The file type — not the shred kernel's probe output
+/// full arrow type for each shredded variant column (as the scan will produce
+/// it raw, except for the wrapper REPETITION, which is normalized to the spec
+/// by [`spec_wrapper_nullability`]). The file type — not the shred kernel's probe output
 /// — is the writer layout that makes shredded PASSTHROUGH possible: a
 /// late-fetched column from a same-layout file compares equal byte-for-byte
 /// (the kernel's output differs in child ORDER and uses BinaryView where
@@ -151,7 +283,13 @@ pub fn shred_types_with_arrow_from_file_schema(
             continue; // canonical in the input -> canonical in the output
         };
         if let Some(plain) = unwrap_typed_value(tv.data_type()) {
-            out.insert(field.name().to_string(), (plain, field.data_type().clone()));
+            // The file's layout with the spec's wrapper REPETITION: an
+            // OPTIONAL-wrapper lineage (DuckDB, pre-fix merges) must not
+            // propagate through a writer that adopts this type.
+            out.insert(
+                field.name().to_string(),
+                (plain, spec_wrapper_nullability(field.data_type())),
+            );
         }
     }
     out
@@ -324,7 +462,20 @@ pub fn conform_variant_to_type(arr: &ArrayRef, target: &DataType) -> Result<Arra
                         ),
                     )
                 })?;
-                cols.push(conform_variant_to_type(child, tf.data_type())?);
+                let mut conformed = conform_variant_to_type(child, tf.data_type())?;
+                // A spec-REQUIRED wrapper receiving an OPTIONAL-lineage array:
+                // null wrapper slots become valid wrappers with both children
+                // null (the same "missing field"), so the non-nullable target
+                // field holds. Any other non-nullable target with nulls is a
+                // genuine mismatch and fails below in StructArray::new.
+                if !tf.is_nullable()
+                    && conformed.null_count() > 0
+                    && let DataType::Struct(node) = tf.data_type()
+                    && is_shred_node(tf.data_type())
+                {
+                    conformed = require_shred_node(&conformed, node)?;
+                }
+                cols.push(conformed);
             }
             Ok(Arc::new(StructArray::new(
                 tchildren.clone(),
@@ -337,7 +488,17 @@ pub fn conform_variant_to_type(arr: &ArrayRef, target: &DataType) -> Result<Arra
                 .as_any()
                 .downcast_ref::<arrow_array::ListArray>()
                 .expect("list type is a ListArray");
-            let values = conform_variant_to_type(src.values(), tel.data_type())?;
+            let mut values = conform_variant_to_type(src.values(), tel.data_type())?;
+            // A spec-REQUIRED element wrapper receiving an OPTIONAL-lineage
+            // array: null element wrappers become valid wrappers carrying the
+            // variant NULL primitive (an element is always present).
+            if !tel.is_nullable()
+                && values.null_count() > 0
+                && let DataType::Struct(node) = tel.data_type()
+                && is_shred_node(tel.data_type())
+            {
+                values = require_shred_element(&values, node)?;
+            }
             Ok(Arc::new(arrow_array::ListArray::new(
                 Arc::clone(tel),
                 src.offsets().clone(),
@@ -437,7 +598,9 @@ pub fn shredded_output_type(canonical: &DataType, plain: &DataType) -> Result<Da
         )
         .with_source(e)
     })?;
-    Ok(ArrayRef::from(shredded).data_type().clone())
+    Ok(spec_wrapper_nullability(
+        ArrayRef::from(shredded).data_type(),
+    ))
 }
 
 /// Shred the named variant columns of one CANONICAL batch. The transformed
@@ -472,6 +635,15 @@ pub fn shred_record_batch(
             Error::new(ErrorKind::DataInvalid, format!("shredding column {name}")).with_source(e)
         })?;
         let arr = ArrayRef::from(shredded);
+        // The kernel takes each ARRAY element's wrapper field from the plain
+        // type (nullable) — the spec wants every wrapper REQUIRED; kernel
+        // wrappers carry no nulls, so this is a columnar re-declaration.
+        let spec = spec_wrapper_nullability(arr.data_type());
+        let arr = if &spec == arr.data_type() {
+            arr
+        } else {
+            conform_variant_to_type(&arr, &spec)?
+        };
         fields[idx] = Arc::new(
             fields[idx]
                 .as_ref()
@@ -792,8 +964,8 @@ mod tests {
             Some(doc(VariantDecimal4::try_new(7, 1).unwrap().into())),  // 0.7  -> fits
             Some(doc(VariantDecimal4::try_new(70, 2).unwrap().into())), // 0.70 -> fits (exact)
             Some(doc(VariantDecimal8::try_new(996, 3).unwrap().into())), // 0.996 -> does not fit
-            Some(doc(Variant::Double(0.68))),                           // double 0.68 -> does not fit
-            Some(doc(Variant::Int32(3))),                               // 3 -> 3.0 fits
+            Some(doc(Variant::Double(0.68))), // double 0.68 -> does not fit
+            Some(doc(Variant::Int32(3))),     // 3 -> 3.0 fits
         ];
         let arr = canonical_doc_array(&rows);
         let variant = VariantArray::try_new(&arr).unwrap();
@@ -951,5 +1123,196 @@ mod tests {
             panic!("row 0 folds back to an object");
         };
         assert_eq!(obj.get("a"), Some(Variant::Int64(7)));
+    }
+
+    /// The spec's REPETITION for a file-derived layout: every shred node
+    /// wrapper (object field, array element) becomes non-nullable; the column,
+    /// `metadata`, `value` and `typed_value` keep theirs; idempotent; and the
+    /// file-derived WRITER layout carries it (an OPTIONAL lineage — DuckDB,
+    /// pre-fix merges — must not propagate through the passthrough layout).
+    #[test]
+    fn spec_wrapper_nullability_makes_wrappers_required_and_nothing_else() {
+        let node = |t: DataType| {
+            DataType::Struct(Fields::from(vec![
+                Field::new("value", DataType::Binary, true),
+                Field::new("typed_value", t, true),
+            ]))
+        };
+        let optional_lineage = DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+            Field::new(
+                "typed_value",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", node(DataType::Int64), true),
+                    Field::new(
+                        "tags",
+                        node(DataType::List(Arc::new(Field::new(
+                            "element",
+                            node(DataType::Int64),
+                            true,
+                        )))),
+                        true,
+                    ),
+                ])),
+                true,
+            ),
+        ]));
+        let spec = spec_wrapper_nullability(&optional_lineage);
+        let DataType::Struct(top) = &spec else {
+            panic!("not a struct");
+        };
+        assert!(!top[0].is_nullable() && top[1].is_nullable() && top[2].is_nullable());
+        let DataType::Struct(obj) = top[2].data_type() else {
+            panic!("typed_value is not an object node set");
+        };
+        assert!(
+            obj.iter().all(|w| !w.is_nullable()),
+            "wrappers REQUIRED: {obj:?}"
+        );
+        let DataType::Struct(a_node) = obj[0].data_type() else {
+            panic!("a is not a node");
+        };
+        assert!(
+            a_node.iter().all(|c| c.is_nullable()),
+            "value/typed_value stay optional"
+        );
+        let DataType::Struct(tags_node) = obj[1].data_type() else {
+            panic!("tags is not a node");
+        };
+        let DataType::List(el) = tags_node[1].data_type() else {
+            panic!("tags typed_value is not a list");
+        };
+        assert!(!el.is_nullable(), "array-element wrapper REQUIRED");
+        assert_eq!(spec_wrapper_nullability(&spec), spec, "idempotent");
+        let file_schema = ArrowSchema::new(vec![Field::new("doc", optional_lineage, true)]);
+        let derived = shred_types_with_arrow_from_file_schema(&file_schema, &table_schema());
+        assert_eq!(derived.get("doc").map(|(_, t)| t.clone()), Some(spec));
+    }
+
+    /// Conforming an OPTIONAL-lineage wrapper array (a NULL wrapper slot = the
+    /// lineage's "missing field") onto the spec-REQUIRED layout yields a valid
+    /// wrapper whose children are both null at that slot, identical data
+    /// elsewhere, and no null bitmap on the wrapper.
+    #[test]
+    fn conform_masks_null_wrappers_onto_their_children() {
+        let wrapper_fields = Fields::from(vec![
+            Field::new("value", DataType::Binary, true),
+            Field::new("typed_value", DataType::Int64, true),
+        ]);
+        let value = Arc::new(BinaryArray::from_opt_vec(vec![
+            None,
+            Some(b"junk".as_ref()),
+            None,
+        ])) as ArrayRef;
+        let typed = Arc::new(arrow_array::Int64Array::from(vec![
+            Some(7),
+            Some(99),
+            Some(9),
+        ])) as ArrayRef;
+        let a = Arc::new(StructArray::new(
+            wrapper_fields,
+            vec![value, typed],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )) as ArrayRef;
+        let src_fields = Fields::from(vec![Field::new("a", a.data_type().clone(), true)]);
+        let src_type = DataType::Struct(src_fields.clone());
+        let src = Arc::new(StructArray::new(src_fields, vec![a], None)) as ArrayRef;
+        let target = spec_wrapper_nullability(&src_type);
+        assert_ne!(target, src_type, "the wrapper flips to REQUIRED");
+
+        let out = conform_variant_to_type(&src, &target).unwrap();
+        assert_eq!(out.data_type(), &target);
+        let out_s = out.as_any().downcast_ref::<StructArray>().unwrap();
+        let a_out = out_s
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(a_out.nulls().is_none(), "wrapper carries no null bitmap");
+        let tv = a_out
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        let val = a_out.column_by_name("value").unwrap();
+        assert!(
+            tv.is_null(1) && val.is_null(1),
+            "missing field = both children null"
+        );
+        assert!(tv.is_valid(0) && tv.is_valid(2) && val.is_null(0) && val.is_null(2));
+        assert_eq!((tv.value(0), tv.value(2)), (7, 9));
+        // already at the spec layout: untouched
+        let again = conform_variant_to_type(&out, &target).unwrap();
+        assert_eq!(again.data_type(), &target);
+        assert_eq!(again.as_ref(), out.as_ref());
+    }
+
+    /// A null ARRAY-element wrapper (OPTIONAL lineage) conforms to the spec's
+    /// REQUIRED element as the variant NULL primitive in `value`, typed_value
+    /// null; present elements are untouched.
+    #[test]
+    fn conform_fills_null_array_elements_with_the_variant_null_primitive() {
+        let node_fields = Fields::from(vec![
+            Field::new("value", DataType::Binary, true),
+            Field::new("typed_value", DataType::Int64, true),
+        ]);
+        let value = Arc::new(BinaryArray::from_opt_vec(vec![None, None, None])) as ArrayRef;
+        let typed = Arc::new(arrow_array::Int64Array::from(vec![
+            Some(1),
+            Some(42),
+            Some(3),
+        ])) as ArrayRef;
+        let elements = Arc::new(StructArray::new(
+            node_fields.clone(),
+            vec![value, typed],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )) as ArrayRef;
+        let el_field = Arc::new(Field::new("element", elements.data_type().clone(), true));
+        let list = Arc::new(arrow_array::ListArray::new(
+            el_field,
+            arrow_buffer::OffsetBuffer::new(vec![0i32, 3].into()),
+            elements,
+            None,
+        )) as ArrayRef;
+        let target = spec_wrapper_nullability(list.data_type());
+        assert_ne!(&target, list.data_type());
+        let out = conform_variant_to_type(&list, &target).unwrap();
+        assert_eq!(out.data_type(), &target);
+        let out_list = out
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        let el = out_list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(el.nulls().is_none());
+        let v = el
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let tv = el
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert!(
+            v.is_null(0) && v.is_null(2),
+            "present typed elements keep a null value"
+        );
+        assert_eq!(
+            v.value(1),
+            &[0u8],
+            "the null element is the variant null primitive"
+        );
+        assert!(tv.is_valid(0) && tv.is_null(1) && tv.is_valid(2));
+        assert_eq!((tv.value(0), tv.value(2)), (1, 3));
     }
 }

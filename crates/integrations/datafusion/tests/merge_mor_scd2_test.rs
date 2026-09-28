@@ -42,6 +42,7 @@ use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
+use iceberg::arrow::variant_shred::spec_wrapper_nullability;
 use iceberg::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, ManifestContentType,
     ManifestList, NestedField, PartitionKey, PrimitiveType, Schema, Struct as IcebergStruct,
@@ -67,7 +68,7 @@ use iceberg_datafusion::{
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{Compression, LogicalType};
+use parquet::basic::{Compression, LogicalType, Repetition};
 use parquet::file::properties::WriterProperties;
 use parquet::variant::VariantBuilder;
 use tempfile::TempDir;
@@ -680,7 +681,7 @@ async fn merge_variant_output_is_annotated_compressed_and_null_faithful() {
 
     let canonical_fields = Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, true),
+        Field::new("value", DataType::Binary, false),
     ]);
     let doc_array = |rows: &[Option<(Vec<u8>, Vec<u8>)>]| -> ArrayRef {
         let metas = BinaryArray::from_iter_values(
@@ -1106,10 +1107,14 @@ fn doc_with_tags(a: i64, tags: &[i64]) -> (Vec<u8>, Vec<u8>) {
     builder.finish()
 }
 
+/// The canonical variant layout as the Iceberg schema maps it: BOTH children
+/// REQUIRED since e80ab63d (2026-08-11, JVM-writer estate parity) - a seed
+/// batch declaring `value` nullable no longer matches the plain writer's
+/// schema (parquet-rs rejects the nested nullability mismatch at write).
 fn variant_canonical_fields() -> Fields {
     Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, true),
+        Field::new("value", DataType::Binary, false),
     ])
 }
 
@@ -1611,12 +1616,14 @@ async fn merge_shred_write_preserves_per_file_layouts() {
             merge_types.push(doc_type_of(&table, &p).await);
         }
     }
-    // BOTH seed layouts appear among the merge outputs, verbatim — the
-    // passthrough proof (a folded victim could only re-shred to the single
-    // primary layout).
+    // BOTH seed layouts appear among the merge outputs, up to the spec's
+    // wrapper REPETITION (the writer normalizes every adopted layout to it)
+    // — the passthrough proof (a folded victim could only re-shred to the
+    // single primary layout).
     for st in &seed_types {
+        let st_spec = spec_wrapper_nullability(st);
         assert!(
-            merge_types.iter().any(|t| t == st),
+            merge_types.iter().any(|t| *t == st_spec),
             "seed layout {st:?} not preserved among merge outputs: {merge_types:?}"
         );
     }
@@ -3275,4 +3282,292 @@ async fn window_budget_stops_between_slices() {
     assert!(run.outcomes[0].committed);
     let table = load_table(&catalog).await;
     assert_eq!(table.metadata().snapshots().count(), snaps_before + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper REPETITION (the Variant shredding spec: `required group <field> {
+// optional value; optional typed_value }`). DuckDB and every pre-fix rust
+// merge wrote the per-field wrappers OPTIONAL, and the merge adopts the probed
+// file's own arrow type as its passthrough writer layout — so the lineage
+// perpetuated itself until Doris' spec-enforcing reader (file scanner v2)
+// rejected the files: "Parquet Variant shredded wrapper N must be required".
+// The fix normalizes the adopted layout to the spec and conforms OPTIONAL-
+// lineage arrays onto it columnarly (a null wrapper = a valid wrapper with
+// both children null). This test seeds the OPTIONAL lineage — including a
+// genuinely NULL wrapper slot — and checks the merge's OUTPUT at the parquet
+// level, plus the demoted row's document through the fold.
+// ---------------------------------------------------------------------------
+
+fn is_node_fields(f: &Fields) -> bool {
+    !f.is_empty()
+        && f.iter()
+            .all(|x| x.name() == "value" || x.name() == "typed_value")
+}
+
+/// Rebuild a shredded variant array at the OPTIONAL-wrapper lineage: every
+/// shred node wrapper field nullable; the wrapper named `null_target.0` gets a
+/// NULL slot at row `null_target.1` (the lineage's "missing field").
+fn relax_wrappers(arr: &ArrayRef, name: &str, null_target: Option<(&str, usize)>) -> ArrayRef {
+    use datafusion::arrow::array::{Array, ListArray, StructArray};
+    match arr.data_type() {
+        DataType::Struct(fields) => {
+            let sa = arr.as_any().downcast_ref::<StructArray>().unwrap();
+            let is_node = is_node_fields(fields);
+            let cols: Vec<ArrayRef> = fields
+                .iter()
+                .zip(sa.columns())
+                .map(|(f, c)| relax_wrappers(c, f.name(), null_target))
+                .collect();
+            let new_fields: Fields = fields
+                .iter()
+                .zip(cols.iter())
+                .map(|(f, c)| {
+                    let node_child =
+                        matches!(f.data_type(), DataType::Struct(k) if is_node_fields(k));
+                    Arc::new(Field::new(
+                        f.name(),
+                        c.data_type().clone(),
+                        if node_child { true } else { f.is_nullable() },
+                    ))
+                })
+                .collect();
+            let nulls = match (is_node, null_target) {
+                (true, Some((target, row))) if target == name => Some(NullBuffer::from(
+                    (0..sa.len()).map(|i| i != row).collect::<Vec<bool>>(),
+                )),
+                _ => sa.nulls().cloned(),
+            };
+            Arc::new(StructArray::new(new_fields, cols, nulls))
+        }
+        DataType::List(el) => {
+            let la = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = relax_wrappers(la.values(), el.name(), null_target);
+            let node_el = matches!(el.data_type(), DataType::Struct(k) if is_node_fields(k));
+            let f = Arc::new(Field::new(
+                el.name(),
+                values.data_type().clone(),
+                if node_el { true } else { el.is_nullable() },
+            ));
+            Arc::new(ListArray::new(
+                f,
+                la.offsets().clone(),
+                values,
+                la.nulls().cloned(),
+            ))
+        }
+        _ => Arc::clone(arr),
+    }
+}
+
+/// Like `seed_shredded_prefixed`, but the file is written at the OPTIONAL-
+/// wrapper lineage (the writer takes the relaxed type as its layout, so the
+/// parquet groups come out OPTIONAL), with `doc.typed_value.a` NULL for the
+/// row `null_row`.
+async fn seed_optional_lineage_prefixed(
+    catalog: &Arc<dyn Catalog>,
+    batch: RecordBatch,
+    plain: &DataType,
+    prefix: &str,
+    null_row: usize,
+) {
+    use iceberg::arrow::variant_shred::shred_record_batch as core_shred;
+    let table = load_table(catalog).await;
+    let plain_map = HashMap::from([("doc".to_string(), plain.clone())]);
+    let shredded = core_shred(&batch, &plain_map).unwrap();
+    let idx = shredded.schema().index_of("doc").unwrap();
+    let relaxed = relax_wrappers(shredded.column(idx), "doc", Some(("a", null_row)));
+    let mut fields: Vec<Arc<Field>> = shredded.schema().fields().iter().cloned().collect();
+    fields[idx] = Arc::new(
+        fields[idx]
+            .as_ref()
+            .clone()
+            .with_data_type(relaxed.data_type().clone()),
+    );
+    let mut columns = shredded.columns().to_vec();
+    columns[idx] = relaxed.clone();
+    let relaxed_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            shredded.schema().metadata().clone(),
+        )),
+        columns,
+    )
+    .unwrap();
+    let overrides = HashMap::from([("doc".to_string(), relaxed.data_type().clone())]);
+    let schema = table.metadata().current_schema().clone();
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+            .with_variant_shred_types(overrides),
+        table.file_io().clone(),
+        DefaultLocationGenerator::new(table.metadata()).unwrap(),
+        DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet),
+    );
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        IcebergStruct::from_iter(vec![Some(Literal::bool(true))]),
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(Some(partition_key))
+        .await
+        .unwrap();
+    writer.write(relaxed_batch).await.unwrap();
+    let data_files = writer.close().await.unwrap();
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+}
+
+/// Every shred node wrapper group of a parquet file with its parquet-level
+/// repetition (read from the thrift schema, not arrow nullability).
+async fn wrapper_repetitions(table: &Table, path: &str) -> Vec<(String, Repetition)> {
+    use parquet::schema::types::Type as PqType;
+    fn is_node(t: &PqType) -> bool {
+        matches!(t, PqType::GroupType { fields, .. }
+            if !fields.is_empty() && fields.iter().all(|f| f.name() == "value" || f.name() == "typed_value"))
+    }
+    fn walk(t: &PqType, path: &str, out: &mut Vec<(String, Repetition)>) {
+        if let PqType::GroupType { fields, .. } = t {
+            for f in fields {
+                let p = format!("{path}.{}", f.name());
+                if is_node(f) {
+                    out.push((p.clone(), f.get_basic_info().repetition()));
+                }
+                walk(f, &p, out);
+            }
+        }
+    }
+    let bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let mut out = Vec::new();
+    walk(reader.parquet_schema().root_schema(), "", &mut out);
+    out
+}
+
+#[tokio::test]
+async fn merge_shred_write_emits_spec_required_wrappers_from_an_optional_lineage() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = variant_table(
+        &warehouse,
+        HashMap::from([(
+            "write.parquet.shred-variants".to_string(),
+            "true".to_string(),
+        )]),
+    )
+    .await;
+    let plain = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+            true,
+        ),
+    ]));
+    // Seed at the OPTIONAL lineage: id=1 (row 0) has its `a` wrapper NULL —
+    // the document reads as {"tags":[10,11]} with `a` MISSING.
+    seed_optional_lineage_prefixed(
+        &catalog,
+        variant_seed_batch(&[
+            (1, Some(doc_with_tags(1, &[10, 11]))),
+            (2, Some(doc_with_tags(9, &[90]))),
+        ]),
+        &plain,
+        "seedopt",
+        0,
+    )
+    .await;
+    let seeded = load_table(&catalog).await;
+    let seed_path = live_data_paths(&seeded)
+        .await
+        .into_iter()
+        .find(|p| p.contains("seedopt"))
+        .expect("seed file");
+    let seed_reps = wrapper_repetitions(&seeded, &seed_path).await;
+    assert!(
+        !seed_reps.is_empty() && seed_reps.iter().all(|(_, r)| *r == Repetition::OPTIONAL),
+        "the seed models the OPTIONAL lineage: {seed_reps:?}"
+    );
+
+    // A new version of id=1 demotes the OPTIONAL-lineage row through the
+    // writer (the late-materialized re-append); id=5 is a plain insert.
+    let ctx = variant_session(&catalog, &[
+        (1, Some(doc_with_tags(2, &[20, 21])), 20, 200),
+        (5, Some(doc_with_tags(5, &[50])), 20, 201),
+    ])
+    .await;
+    ctx.sql(&variant_merge_sql())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = load_table(&catalog).await;
+    let merge_files: Vec<String> = live_data_paths(&table)
+        .await
+        .into_iter()
+        .filter(|p| p.contains("merge-"))
+        .collect();
+    assert!(!merge_files.is_empty(), "merge appended data files");
+    for path in &merge_files {
+        let reps = wrapper_repetitions(&table, path).await;
+        assert!(!reps.is_empty(), "merge output is shredded in {path}");
+        for (p, r) in &reps {
+            assert_eq!(
+                *r,
+                Repetition::REQUIRED,
+                "wrapper {p} in {path} must be REQUIRED"
+            );
+        }
+    }
+
+    // The demoted OPTIONAL-lineage row folds to the same document: `a`
+    // stays MISSING (the null wrapper became null children), tags intact.
+    let rows = ctx
+        .sql(&format!(
+            "SELECT variant_to_json(doc) AS j FROM {CATALOG}.{NS}.{TABLE} WHERE id = 1 AND NOT _is_current"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let j = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert!(!j.contains("\"a\""), "missing field stays missing: {j}");
+    assert!(j.contains("10") && j.contains("11"), "tags survive: {j}");
+    // and the inserted new version carries a=2
+    let rows = ctx
+        .sql(&format!(
+            "SELECT variant_to_json(doc) AS j FROM {CATALOG}.{NS}.{TABLE} WHERE id = 1 AND _is_current"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let j = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert!(j.contains("\"a\":2"), "new version carries a=2: {j}");
 }

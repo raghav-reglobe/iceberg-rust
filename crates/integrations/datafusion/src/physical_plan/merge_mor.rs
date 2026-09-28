@@ -73,8 +73,8 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::variant_shred::{
     conform_batch_variants, is_shredded_variant_type, shred_record_batch, shred_shape_compatible,
-    shred_types_with_arrow_from_file_schema, shredded_output_type, unshred_batch_columns,
-    variant_column_count,
+    shred_types_with_arrow_from_file_schema, shredded_output_type, spec_wrapper_nullability,
+    unshred_batch_columns, variant_column_count,
 };
 use iceberg::arrow::{
     ArrowFileReader, ArrowReader as IcebergArrowReader, PROJECTED_PARTITION_VALUE_COLUMN,
@@ -390,7 +390,15 @@ impl WriterPool {
             .filter(|f| {
                 self.ctx.variant_columns.contains(f.name())
                     && is_shredded_variant_type(f.data_type())
-                    && self.ctx.shred_overrides.get(f.name().as_str()) != Some(f.data_type())
+                    // A difference in wrapper REPETITION alone (an OPTIONAL-
+                    // lineage file under a spec-normalized primary layout)
+                    // is NOT a layout: the primary writer conforms it
+                    // columnarly. Only a real shape difference routes away.
+                    && !self
+                        .ctx
+                        .shred_overrides
+                        .get(f.name().as_str())
+                        .is_some_and(|o| *o == spec_wrapper_nullability(f.data_type()))
             })
             .map(|f| (f.name().clone(), f.data_type().clone()))
             .collect();
@@ -413,7 +421,12 @@ impl WriterPool {
             // First batch of a new layout: spawn its dedicated writer with
             // the primary overrides overlaid by this layout's columns.
             let mut overrides = self.ctx.shred_overrides.clone();
-            overrides.extend(sig.iter().cloned());
+            // The layout's own type, at the spec's wrapper repetition — the
+            // batch is conformed onto it in the writer task.
+            overrides.extend(
+                sig.iter()
+                    .map(|(name, dt)| (name.clone(), spec_wrapper_nullability(dt))),
+            );
             let (tx, rx) = tokio::sync::mpsc::channel::<WriteItem>(2);
             self.handles.push(tokio::spawn(writer_task(
                 Arc::clone(&self.ctx),
@@ -552,7 +565,11 @@ async fn writer_task(
                 .filter(|f| {
                     ctx.variant_columns.contains(f.name())
                         && is_shredded_variant_type(f.data_type())
-                        && overrides.get(f.name().as_str()) != Some(f.data_type())
+                        // wrapper repetition aside — that difference is
+                        // conformed columnarly below, never folded
+                        && !overrides
+                            .get(f.name().as_str())
+                            .is_some_and(|o| *o == spec_wrapper_nullability(f.data_type()))
                 })
                 .map(|f| f.name().clone())
                 .collect();
@@ -566,7 +583,14 @@ async fn writer_task(
                 .iter()
                 .filter(|(name, _)| match out.schema().index_of(name.as_str()) {
                     Ok(i) => {
-                        overrides.get(name.as_str()) != Some(out.schema().field(i).data_type())
+                        let schema = out.schema();
+                        let dt = schema.field(i).data_type();
+                        // canonical (never shredded, or folded above) -> shred;
+                        // already shredded at the layout (repetition aside) -> keep
+                        !is_shredded_variant_type(dt)
+                            || !overrides
+                                .get(name.as_str())
+                                .is_some_and(|o| *o == spec_wrapper_nullability(dt))
                     }
                     Err(_) => true,
                 })
@@ -575,12 +599,15 @@ async fn writer_task(
             let out = if to_shred.is_empty() {
                 out
             } else {
-                // The kernel's output layout differs from the file-derived
-                // writer layout (child order, BinaryView); conform it —
-                // columnar metadata shuffling, not row work.
-                let shredded = shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?;
-                conform_batch_variants(&shredded, &overrides).map_err(to_datafusion_error)?
+                shred_record_batch(&out, &to_shred).map_err(to_datafusion_error)?
             };
+            // Conform every variant column to this writer's layout: the kernel's
+            // output differs from the file-derived layout (child order,
+            // BinaryView), and an OPTIONAL-lineage passthrough differs in
+            // wrapper repetition — both are columnar metadata shuffling (a null
+            // wrapper becomes a valid wrapper with null children), not row
+            // work. Columns already at the layout pass untouched.
+            let out = conform_batch_variants(&out, &overrides).map_err(to_datafusion_error)?;
             let out = with_partition_column(out, partition_calc.as_ref())?;
             if writer.is_none() {
                 let (builder, spec) = pending.take().expect("writer built once");
