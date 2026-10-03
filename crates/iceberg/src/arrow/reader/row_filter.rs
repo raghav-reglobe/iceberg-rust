@@ -1643,6 +1643,113 @@ mod row_position_range_tests {
         assert_eq!(rows, expected);
     }
 
+    /// A struct child RENAMED after this file was written (same field id,
+    /// new name in the task's schema) must come out of the reader under
+    /// the NEW name: the batch is what a query engine addresses.
+    #[tokio::test]
+    async fn nested_field_renamed_after_write_reads_under_the_new_name() {
+        use crate::spec::StructType;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!(
+            "{}/renamed_nested.parquet",
+            tmp_dir.path().to_str().unwrap()
+        );
+        // The file's layout: _cdc { op (3), ts (4) }.
+        let meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let file_cdc_fields = arrow_schema::Fields::from(vec![
+            Field::new("op", DataType::Utf8, true).with_metadata(meta("3")),
+            Field::new("ts", DataType::Int64, true).with_metadata(meta("4")),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(meta("1")),
+            Field::new("_cdc", DataType::Struct(file_cdc_fields.clone()), true)
+                .with_metadata(meta("2")),
+        ]));
+        let cdc = arrow_array::StructArray::new(
+            file_cdc_fields,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["c", "u", "d"])),
+                Arc::new(Int64Array::from(vec![10, 11, 12])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(cdc),
+        ])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&file_path).unwrap(),
+            arrow_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+
+        // The table's CURRENT schema: ts -> capture_ts, id 4 unchanged.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(2)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "_cdc",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(3, "op", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::optional(
+                                4,
+                                "capture_ts",
+                                Type::Primitive(PrimitiveType::Long),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(file_size)
+            .with_start(0)
+            .with_length(file_size)
+            .with_data_file_path(file_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1, 2])
+            .with_case_sensitive(false)
+            .build();
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+        let out = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let cdc = out
+            .column_by_name("_cdc")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        let ts = cdc
+            .column_by_name("capture_ts")
+            .expect("the renamed child is addressable")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.values(), &[10, 11, 12]);
+        assert!(cdc.column_by_name("ts").is_none());
+    }
+
     /// The whole-file data cache under BYTE-RANGE tasks (the late-mat fetch
     /// shape): ONE whole-file fetch serves every ranged read, and the
     /// batches are identical to direct reads.
@@ -1659,15 +1766,13 @@ mod row_position_range_tests {
         async fn get(&self, path: &str) -> Option<bytes::Bytes> {
             let out = self.map.lock().unwrap().get(path).cloned();
             if out.is_some() {
-                self.hits
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             out
         }
 
         async fn set(&self, path: &str, bytes: bytes::Bytes) {
-            self.sets
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.sets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.map.lock().unwrap().insert(path.to_string(), bytes);
         }
     }
@@ -1860,13 +1965,19 @@ mod row_position_range_tests {
 
         // A narrow projection (1% of the file) reads its ranges directly.
         let store = Arc::new(CountingBytesCache::default());
-        assert_eq!(read(Some(cache(&store, 0.5, 0)), tasks(sizes(10, 990))).await, direct);
+        assert_eq!(
+            read(Some(cache(&store, 0.5, 0)), tasks(sizes(10, 990))).await,
+            direct
+        );
         assert_eq!(store.sets.load(Ordering::SeqCst), 0, "no whole-file fetch");
         assert_eq!(store.hits.load(Ordering::SeqCst), 0);
 
         // A wide projection (99%) takes the whole-file path.
         let store = Arc::new(CountingBytesCache::default());
-        assert_eq!(read(Some(cache(&store, 0.5, 0)), tasks(sizes(990, 10))).await, direct);
+        assert_eq!(
+            read(Some(cache(&store, 0.5, 0)), tasks(sizes(990, 10))).await,
+            direct
+        );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1);
 
         // No recorded sizes: the share is unknown — whole-file, as before.
@@ -1884,7 +1995,10 @@ mod row_position_range_tests {
 
         // The check disabled (fraction 0): every file within the cap.
         let store = Arc::new(CountingBytesCache::default());
-        assert_eq!(read(Some(cache(&store, 0.0, 0)), tasks(sizes(10, 990))).await, direct);
+        assert_eq!(
+            read(Some(cache(&store, 0.0, 0)), tasks(sizes(10, 990))).await,
+            direct
+        );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1);
     }
 }

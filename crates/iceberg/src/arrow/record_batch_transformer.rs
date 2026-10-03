@@ -119,6 +119,38 @@ fn arrow_field_id(field: &Field) -> Option<i32> {
         .and_then(|id| id.parse::<i32>().ok())
 }
 
+/// [`DataType::equals_datatype`] plus equality of every STRUCT child name,
+/// at any depth (through lists and maps). Metadata is still ignored, as are
+/// the wrapper names of list elements and map entries — nothing addresses
+/// those by name. A column whose nested names differ must be rebuilt
+/// ([`adapt_column`] re-wraps its children by field id under the target
+/// names) rather than passed through with the file's names.
+fn same_type_and_nested_names(a: &DataType, b: &DataType) -> bool {
+    if !a.equals_datatype(b) {
+        return false;
+    }
+    match (a, b) {
+        (DataType::Struct(x), DataType::Struct(y)) => x.iter().zip(y.iter()).all(|(f, g)| {
+            f.name() == g.name() && same_type_and_nested_names(f.data_type(), g.data_type())
+        }),
+        (DataType::List(x), DataType::List(y))
+        | (DataType::LargeList(x), DataType::LargeList(y))
+        | (DataType::ListView(x), DataType::ListView(y))
+        | (DataType::LargeListView(x), DataType::LargeListView(y))
+        | (DataType::FixedSizeList(x, _), DataType::FixedSizeList(y, _))
+        | (DataType::Map(x, _), DataType::Map(y, _)) => {
+            same_type_and_nested_names(x.data_type(), y.data_type())
+        }
+        (DataType::Dictionary(_, x), DataType::Dictionary(_, y)) => {
+            same_type_and_nested_names(x, y)
+        }
+        (DataType::RunEndEncoded(_, x), DataType::RunEndEncoded(_, y)) => {
+            same_type_and_nested_names(x.data_type(), y.data_type())
+        }
+        _ => true,
+    }
+}
+
 /// Adapt a source column to `target_type`, handling Iceberg schema evolution
 /// INSIDE nested types.
 ///
@@ -753,9 +785,14 @@ impl RecordBatchTransformer {
                 //
                 // At this point, all field IDs in the source schema are trustworthy.
                 // No conflict detection needed - schema resolution happened in reader.rs.
+                // A column passes through only when its type AND every nested
+                // field name already match the target: `equals_datatype` alone
+                // ignores nested names, so a struct child renamed by schema
+                // evolution would keep the file's old name in the batch and a
+                // reader addressing the new name would not find it.
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
-                        if source_field.data_type().equals_datatype(target_type) {
+                        if same_type_and_nested_names(source_field.data_type(), target_type) {
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
@@ -1367,6 +1404,185 @@ mod test {
             .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(op.value(1), "u");
+    }
+
+    /// A nested field RENAMED by schema evolution (same field id, new name):
+    /// a file written before the rename must read back under the NEW name.
+    /// `equals_datatype` ignores nested names, so the old gate passed the
+    /// struct through with the file's child names and a reader addressing
+    /// the new name found nothing.
+    #[test]
+    fn nested_field_rename_reads_under_the_new_name() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(2)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "_cdc",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(3, "op", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            // renamed from `ts`
+                            NestedField::optional(
+                                4,
+                                "capture_ts",
+                                Type::Primitive(PrimitiveType::Long),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        // The file: written under the OLD child name, same field id.
+        let file_cdc_fields = Fields::from(vec![
+            simple_field("op", DataType::LargeUtf8, true, "3"),
+            simple_field("ts", DataType::Int64, true, "4"),
+        ]);
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, true, "1"),
+            simple_field("_cdc", DataType::Struct(file_cdc_fields.clone()), true, "2"),
+        ]));
+        let cdc_array = StructArray::new(
+            file_cdc_fields,
+            vec![
+                Arc::new(LargeStringArray::from(vec!["c", "u", "d"])),
+                Arc::new(Int64Array::from(vec![10, 11, 12])),
+            ],
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(cdc_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let cdc = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let DataType::Struct(cdc_fields) = cdc.data_type() else {
+            panic!("_cdc must stay a struct");
+        };
+        assert_eq!(
+            cdc_fields
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["op", "capture_ts"],
+            "the batch carries the TARGET nested names"
+        );
+        let ts = cdc
+            .column_by_name("capture_ts")
+            .expect("addressable under the new name")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.values(), &[10, 11, 12], "same data, same field id");
+        assert!(cdc.column_by_name("ts").is_none(), "the old name is gone");
+    }
+
+    /// The same rename one level deeper — inside a list of structs — and a
+    /// file whose nested names already match passes through untouched.
+    #[test]
+    fn nested_field_rename_inside_a_list_and_passthrough_when_names_match() {
+        use arrow_array::ListArray;
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(2)
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "events",
+                        Type::List(crate::spec::ListType::new(
+                            NestedField::list_element(
+                                2,
+                                Type::Struct(crate::spec::StructType::new(vec![
+                                    NestedField::optional(
+                                        3,
+                                        "capture_ts",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .into(),
+                                ])),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let make_batch = |child_name: &str| {
+            let item_fields =
+                Fields::from(vec![simple_field(child_name, DataType::Int64, true, "3")]);
+            let item_field = Arc::new(simple_field(
+                "element",
+                DataType::Struct(item_fields.clone()),
+                true,
+                "2",
+            ));
+            let schema = Arc::new(ArrowSchema::new(vec![simple_field(
+                "events",
+                DataType::List(Arc::clone(&item_field)),
+                true,
+                "1",
+            )]));
+            let items = StructArray::new(
+                item_fields,
+                vec![Arc::new(Int64Array::from(vec![10, 11, 12]))],
+                None,
+            );
+            let list = ListArray::new(
+                item_field,
+                OffsetBuffer::from_lengths([2, 1]),
+                Arc::new(items),
+                None,
+            );
+            RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap()
+        };
+
+        // Old name inside the list element -> renamed.
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(Arc::clone(&snapshot_schema), &[1]).build();
+        let result = transformer.process_record_batch(make_batch("ts")).unwrap();
+        let list = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let items = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let ts = items
+            .column_by_name("capture_ts")
+            .expect("renamed inside the list element")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.values(), &[10, 11, 12]);
+        assert_eq!(list.value_offsets(), &[0, 2, 3], "list shape untouched");
+
+        // Names already match -> the batch passes through unchanged.
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1]).build();
+        let same = make_batch("capture_ts");
+        let result = transformer.process_record_batch(same.clone()).unwrap();
+        assert_eq!(result, same);
     }
 
     /// The pure add-only shape (unequal field counts — the exact production
