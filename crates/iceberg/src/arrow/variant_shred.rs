@@ -1018,6 +1018,67 @@ mod tests {
         expect_g(1, Variant::from(VariantDecimal16::try_new(7, 1).unwrap()));
     }
 
+    /// A FLOAT typed leaf is lossless too: a decimal the float reproduces
+    /// shreds; a wider one stays a variant `value` under the field and
+    /// comes back unchanged.
+    #[test]
+    fn inexact_decimals_stay_values_at_float_leaves() {
+        use parquet::variant::VariantDecimal4;
+
+        fn doc(g: Variant<'_, '_>) -> (Vec<u8>, Vec<u8>) {
+            let mut builder = VariantBuilder::new();
+            let mut obj = builder.new_object();
+            obj.insert("g", g);
+            obj.finish();
+            builder.finish()
+        }
+        let wide = VariantDecimal16::try_new(123456789012345678901234567890, 29).unwrap();
+        let plain = DataType::Struct(Fields::from(vec![Field::new("g", DataType::Float64, true)]));
+        let rows = vec![
+            Some(doc(VariantDecimal4::try_new(68, 2).unwrap().into())), // 0.68 -> typed
+            Some(doc(wide.into())),                                     // 30 digits -> value
+            Some(doc(Variant::Int64((1 << 53) + 1))), // past the mantissa -> value
+        ];
+        let arr = canonical_doc_array(&rows);
+        let variant = VariantArray::try_new(&arr).unwrap();
+        let shredded = shred_variant(&variant, &plain).unwrap();
+
+        let root = ArrayRef::from(shredded.clone());
+        let g_typed = root
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("g")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .clone();
+        let typed: Vec<Option<f64>> = (0..rows.len())
+            .map(|i| g_typed.is_valid(i).then(|| g_typed.value(i)))
+            .collect();
+        assert_eq!(typed, vec![Some(0.68), None, None]);
+
+        let unshredded = unshred_variant(&shredded).unwrap();
+        let expect_g = |i: usize, expected: Variant<'_, '_>| {
+            let v = unshredded.value(i);
+            let obj = v.as_object().expect("object");
+            assert_eq!(obj.get("g").expect("g present"), expected, "row {i}");
+        };
+        expect_g(1, wide.into());
+        expect_g(2, Variant::Int64((1 << 53) + 1));
+    }
+
     /// `variant_column_count` counts only variant fields.
     #[test]
     fn variant_count() {

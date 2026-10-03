@@ -5745,8 +5745,6 @@ dependencies = [
 [[package]]
 name = "parquet-variant-json"
 version = "59.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57b4abded29d8a7d1b450795aace3e06577399a35eef0023fb03ce6acd6c23e8"
 dependencies = [
  "arrow-schema",
  "base64",

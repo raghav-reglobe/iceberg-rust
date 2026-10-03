@@ -2889,4 +2889,119 @@ mod tests {
             "strings are not numbers"
         );
     }
+
+    /// Shredding into a FLOAT leaf is lossless too: an integer past the
+    /// mantissa or a decimal the float cannot reproduce stays a variant
+    /// value; what the float holds exactly shreds.
+    #[test]
+    fn inexact_numerics_are_not_shredded_into_float_leaves() {
+        use arrow::array::{Float32Array, Float64Array};
+        use parquet_variant::{VariantDecimal4, VariantDecimal16};
+
+        let values: Vec<Variant<'static, 'static>> = vec![
+            Variant::from(VariantDecimal4::try_new(68, 2).unwrap()),   // 0.68 -> typed
+            Variant::from(VariantDecimal4::try_new(1230, 2).unwrap()), // 12.30 -> typed 12.3
+            Variant::from(
+                VariantDecimal16::try_new(123456789012345678901234567890, 29).unwrap(),
+            ), // 30 digits -> stays a value
+            Variant::Int64(1 << 53),       // exact in f64
+            Variant::Int64((1 << 53) + 1), // not exact -> stays a value
+            Variant::Double(0.1),          // a double is itself
+            Variant::Int8(3),              // exact
+            Variant::from("1.5"),          // not a number -> stays a value (as before)
+        ];
+        let mut builder = VariantArrayBuilder::new(values.len());
+        for v in &values {
+            builder.append_variant(v.clone());
+        }
+        let array = builder.build();
+
+        let shredded = shred_variant(&array, &DataType::Float64).unwrap();
+        let typed = shredded
+            .typed_value_field()
+            .expect("typed_value present")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let got: Vec<Option<f64>> = (0..values.len())
+            .map(|i| typed.is_valid(i).then(|| typed.value(i)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(0.68),
+                Some(12.3),
+                None,
+                Some(9007199254740992.0),
+                None,
+                Some(0.1),
+                Some(3.0),
+                None
+            ]
+        );
+        let residual = shredded.value_field().expect("value present");
+        for (i, v) in values.iter().enumerate() {
+            if got[i].is_none() {
+                assert_eq!(&shredded.value(i), v, "row {i} reads back exactly");
+                assert!(residual.is_valid(i));
+            } else {
+                assert!(residual.is_null(i), "row {i} shredded: no residual");
+            }
+        }
+
+        // Float32: the same rule at 24 bits of mantissa.
+        let values32: Vec<Variant<'static, 'static>> = vec![
+            Variant::Double(0.5),     // exact in f32
+            Variant::Double(0.1),     // not exact in f32 -> stays a value
+            Variant::Int32(16777216), // 2^24 exact
+            Variant::Int32(16777217), // not exact -> stays a value
+            Variant::from(VariantDecimal4::try_new(25, 2).unwrap()), // 0.25 -> typed
+        ];
+        let mut builder = VariantArrayBuilder::new(values32.len());
+        for v in &values32 {
+            builder.append_variant(v.clone());
+        }
+        let shredded = shred_variant(&builder.build(), &DataType::Float32).unwrap();
+        let typed = shredded
+            .typed_value_field()
+            .expect("typed_value present")
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let got: Vec<Option<f32>> = (0..values32.len())
+            .map(|i| typed.is_valid(i).then(|| typed.value(i)))
+            .collect();
+        assert_eq!(got, vec![Some(0.5), None, Some(16777216.0), None, Some(0.25)]);
+    }
+
+    /// A plain cast to a float (not shredding) still rounds.
+    #[test]
+    fn plain_float_casts_still_round() {
+        use crate::type_conversion::ExactFloatFromVariant;
+        use crate::{GetOptions, variant_get};
+        use arrow::array::Float64Array;
+        use arrow::datatypes::Float64Type;
+        use parquet_variant::VariantDecimal16;
+
+        let wide = Variant::from(
+            VariantDecimal16::try_new(123456789012345678901234567890, 29).unwrap(),
+        );
+        assert_eq!(Float64Type::from_variant_exact(&wide), None);
+        let mut builder = VariantArrayBuilder::new(1);
+        builder.append_variant(wide.clone());
+        let array: ArrayRef = ArrayRef::from(builder.build());
+        let options = GetOptions {
+            as_type: Some(Arc::new(arrow::datatypes::Field::new(
+                "v",
+                DataType::Float64,
+                true,
+            ))),
+            ..Default::default()
+        };
+        let out = variant_get(&array, options).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(out.is_valid(0), "the cast converts");
+        // ... to a nearby double (the plain cast's own rounding), not to None.
+        assert!((out.value(0) - 1.2345678901234568).abs() < 1e-14, "{}", out.value(0));
+    }
 }

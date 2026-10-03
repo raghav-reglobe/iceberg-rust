@@ -179,6 +179,10 @@ zstd = "0.13.3"
 # carries the exactness guard; its manifest keeps the registry dependencies,
 # so no other crate in the graph is duplicated.
 parquet-variant-compute = { path = "vendor/parquet-variant-compute" }
+# A JSON number is typed from its TEXT (decimal4/8/16 for plain decimal
+# notation within 38 digits, the text's scale kept; double otherwise) instead
+# of "anything non-integer is a double"; see vendor/README.md.
+parquet-variant-json = { path = "vendor/parquet-variant-json" }
 # A shredded typed_value DECIMAL(1, s) must be INT32 (shredding spec: INT32 for
 # every precision <= 9); the released crate's `precision > 1` guard sent it to
 # INT64, which spec-enforcing readers (Doris file scanner v2) reject. One-line

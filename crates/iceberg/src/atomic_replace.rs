@@ -1431,3 +1431,50 @@ fn writer_properties(table: &Table) -> parquet::file::properties::WriterProperti
         .set_compression(compression)
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::Fields;
+    use parquet::variant::{Variant, VariantArray, VariantDecimal4, VariantDecimal16};
+
+    use super::*;
+
+    /// The JSON-to-variant path types numbers from their text: a decimal
+    /// keeps its digits and scale, an exponent form is a double, an
+    /// integer past int64 is a decimal of scale 0.
+    #[test]
+    fn json_strings_become_decimal_primitives() {
+        let target = Field::new(
+            "doc",
+            DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, true),
+            ])),
+            true,
+        );
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"g": 12.30}"#),
+            Some(r#"{"g": 0.68}"#),
+            Some(r#"{"g": 1e3}"#),
+            Some(r#"{"g": 9223372036854775808}"#),
+            Some(r#"{"g": 3}"#),
+            None,
+        ]));
+        let out = json_strings_to_variant(&input, &target).unwrap();
+        let variant = VariantArray::try_new(&out).unwrap();
+        let expect_g = |i: usize, expected: Variant<'_, '_>| {
+            let v = variant.value(i);
+            let obj = v.as_object().expect("object");
+            assert_eq!(obj.get("g").expect("g present"), expected, "row {i}");
+        };
+        expect_g(0, Variant::from(VariantDecimal4::try_new(1230, 2).unwrap()));
+        expect_g(1, Variant::from(VariantDecimal4::try_new(68, 2).unwrap()));
+        expect_g(2, Variant::Double(1000.0));
+        expect_g(
+            3,
+            Variant::from(VariantDecimal16::try_new(9223372036854775808, 0).unwrap()),
+        );
+        expect_g(4, Variant::Int8(3));
+        assert!(variant.is_null(5), "a null document stays null");
+    }
+}

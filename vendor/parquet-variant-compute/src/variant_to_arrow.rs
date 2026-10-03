@@ -20,7 +20,7 @@ use crate::shred_variant::{
     make_variant_to_shredded_variant_arrow_row_builder,
 };
 use crate::type_conversion::{
-    PrimitiveFromVariant, TimestampFromVariant, variant_cast_with_options,
+    ExactFloatFromVariant, PrimitiveFromVariant, TimestampFromVariant, variant_cast_with_options,
     variant_to_unscaled_decimal, variant_to_unscaled_decimal_exact,
 };
 use crate::variant_array::ShreddedVariantFieldArray;
@@ -164,8 +164,8 @@ pub(crate) enum PrimitiveVariantToArrowRowBuilder<'a> {
     UInt32(VariantToPrimitiveArrowRowBuilder<'a, datatypes::UInt32Type>),
     UInt64(VariantToPrimitiveArrowRowBuilder<'a, datatypes::UInt64Type>),
     Float16(VariantToPrimitiveArrowRowBuilder<'a, datatypes::Float16Type>),
-    Float32(VariantToPrimitiveArrowRowBuilder<'a, datatypes::Float32Type>),
-    Float64(VariantToPrimitiveArrowRowBuilder<'a, datatypes::Float64Type>),
+    Float32(VariantToFloatArrowRowBuilder<'a, datatypes::Float32Type>),
+    Float64(VariantToFloatArrowRowBuilder<'a, datatypes::Float64Type>),
     Decimal32(VariantToDecimalArrowRowBuilder<'a, datatypes::Decimal32Type>),
     Decimal64(VariantToDecimalArrowRowBuilder<'a, datatypes::Decimal64Type>),
     Decimal128(VariantToDecimalArrowRowBuilder<'a, datatypes::Decimal128Type>),
@@ -210,6 +210,8 @@ impl<'a> PrimitiveVariantToArrowRowBuilder<'a> {
             Decimal64(b) => b.exact = true,
             Decimal128(b) => b.exact = true,
             Decimal256(b) => b.exact = true,
+            Float32(b) => b.exact = true,
+            Float64(b) => b.exact = true,
             _ => {}
         }
     }
@@ -397,14 +399,8 @@ pub(crate) fn make_primitive_variant_to_arrow_row_builder<'a>(
                 cast_options,
                 capacity,
             )),
-            DataType::Float32 => Float32(VariantToPrimitiveArrowRowBuilder::new(
-                cast_options,
-                capacity,
-            )),
-            DataType::Float64 => Float64(VariantToPrimitiveArrowRowBuilder::new(
-                cast_options,
-                capacity,
-            )),
+            DataType::Float32 => Float32(VariantToFloatArrowRowBuilder::new(cast_options, capacity)),
+            DataType::Float64 => Float64(VariantToFloatArrowRowBuilder::new(cast_options, capacity)),
             DataType::Decimal32(precision, scale) => Decimal32(
                 VariantToDecimalArrowRowBuilder::new(cast_options, capacity, *precision, *scale)?,
             ),
@@ -891,6 +887,62 @@ where
 
     fn finish(mut self) -> Result<ArrayRef> {
         Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// Builder for converting variant values to arrow Float32 / Float64 values.
+/// In its default mode it converts like the generic primitive builder; in
+/// EXACT mode a numeric the float cannot hold exactly (an integer past the
+/// mantissa, a decimal with more digits than the float reproduces) is
+/// reported as not converted — see
+/// [`PrimitiveVariantToArrowRowBuilder::require_exact_numeric`].
+pub(crate) struct VariantToFloatArrowRowBuilder<'a, T>
+where
+    T: PrimitiveFromVariant + ExactFloatFromVariant,
+{
+    inner: VariantToPrimitiveArrowRowBuilder<'a, T>,
+    exact: bool,
+}
+
+impl<'a, T> VariantToFloatArrowRowBuilder<'a, T>
+where
+    T: PrimitiveFromVariant + ExactFloatFromVariant,
+{
+    fn new(cast_options: &'a CastOptions<'a>, capacity: usize) -> Self {
+        Self {
+            inner: VariantToPrimitiveArrowRowBuilder::new(cast_options, capacity),
+            exact: false,
+        }
+    }
+
+    fn append_null(&mut self) -> Result<()> {
+        self.inner.append_null()
+    }
+
+    fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
+        if !self.exact {
+            return self.inner.append_value(value);
+        }
+        match variant_cast_with_options(value, self.inner.cast_options, |value| {
+            T::from_variant_exact(value)
+        }) {
+            Ok(Some(v)) => {
+                self.inner.builder.append_value(v);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.inner.builder.append_null();
+                Ok(false)
+            }
+            Err(_) => Err(ArrowError::CastError(format!(
+                "Failed to extract primitive of type {type_name} from variant {value:?} at path VariantPath([])",
+                type_name = T::DATA_TYPE,
+            ))),
+        }
+    }
+
+    fn finish(self) -> Result<ArrayRef> {
+        self.inner.finish()
     }
 }
 

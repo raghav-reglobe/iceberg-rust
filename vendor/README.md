@@ -40,3 +40,38 @@ sees the same values. Test: `arrow::schema::tests::test_decimal_precision_one_is
 `src/arrow/schema/mod.rs`. Existing files written before the patch are NOT
 rewritten by it - the fix is for what the writers produce from here on.
 
+## parquet-variant-json 59.0.0
+
+`json_to_variant` typed every non-integer JSON number as an IEEE double — the
+released encoder parses into a `serde_json::Value`, whose `Number` has
+already lost the digits the number was written with, so it could not know a
+decimal's scale (`12.30` became the double 12.3; a 30-digit decimal became a
+17-digit double; an integer past int64 became a double). The crate's own
+decimal expectations were present but `#[ignore]`d for exactly that reason.
+
+The copy parses through `serde_json::value::RawValue` (feature `raw_value`,
+additive — it adds a type and changes nothing about `Number`), so every value
+is seen as its text, and types numbers the way Spark's `VariantBuilder`
+does: an integer that fits int64 → the narrowest int8/16/32/64; plain
+decimal notation (sign, digits, one `.`; no exponent) with at most 38
+significant digits and a scale of at most 38 → decimal4/8/16 by the
+narrowest width whose precision and scale limits both hold, keeping the
+text's scale; anything else → double. `-0.0` becomes decimal4(0, 1). Objects
+keep a repeated key's last value and sort keys, as before. Each nesting
+level re-validates its own subtree, so parsing costs the document size times
+its depth. The fifteen upstream decimal tests are enabled;
+`test_json_to_variant_double_precision` (29 digits at scale 29, within the
+decimal16 limits) now expects a decimal16 and is named accordingly. Files
+touched: `src/from_json.rs`, `Cargo.toml` (the feature).
+
+## parquet-variant-compute 59.0.0 — float leaves (second change)
+
+`PrimitiveVariantToArrowRowBuilder::require_exact_numeric` also covers
+Float32/Float64 targets: an integer past the float's mantissa, a decimal the
+float does not reproduce (its shortest round-trip rendering differs
+numerically), or a double a Float32 cannot hold, is reported as not
+converted — shredding then keeps it a variant `value`. Plain casts
+(`variant_get`) keep rounding. Trait `type_conversion::ExactFloatFromVariant`,
+`VariantToFloatArrowRowBuilder` in `src/variant_to_arrow.rs`; tests
+`shred_variant::tests::{inexact_numerics_are_not_shredded_into_float_leaves,
+plain_float_casts_still_round}`.

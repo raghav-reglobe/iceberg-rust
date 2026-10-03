@@ -96,6 +96,135 @@ impl_primitive_from_variant!(datatypes::UInt64Type, as_u64);
 impl_primitive_from_variant!(datatypes::Float16Type, as_f16);
 impl_primitive_from_variant!(datatypes::Float32Type, as_f32);
 impl_primitive_from_variant!(datatypes::Float64Type, as_f64);
+
+/// A float target that can refuse the numerics it cannot hold EXACTLY.
+pub(crate) trait ExactFloatFromVariant: PrimitiveFromVariant {
+    /// Like [`PrimitiveFromVariant::from_variant`], but `None` for a numeric
+    /// the float would round: an integer must survive the round trip through
+    /// the float; a decimal must read back from the float's shortest decimal
+    /// rendering as the same number; a wider float must round-trip through
+    /// the narrower one. Non-numerics convert as `from_variant` does.
+    fn from_variant_exact(variant: &Variant<'_, '_>) -> Option<Self::Native>;
+}
+
+/// The two float natives, over the one exactness rule.
+trait ExactFloatNative: Copy + std::fmt::Display + std::str::FromStr {
+    fn from_i128_exact(i: i128) -> Option<Self>;
+    fn from_f64_exact(f: f64) -> Option<Self>;
+}
+
+impl ExactFloatNative for f64 {
+    fn from_i128_exact(i: i128) -> Option<f64> {
+        let f = i as f64;
+        (f as i128 == i).then_some(f)
+    }
+    fn from_f64_exact(f: f64) -> Option<f64> {
+        Some(f)
+    }
+}
+
+impl ExactFloatNative for f32 {
+    fn from_i128_exact(i: i128) -> Option<f32> {
+        let f = i as f32;
+        (f as i128 == i).then_some(f)
+    }
+    fn from_f64_exact(f: f64) -> Option<f32> {
+        let g = f as f32;
+        (f.is_nan() || f64::from(g) == f).then_some(g)
+    }
+}
+
+/// A decimal converts exactly when the float parsed from its text prints
+/// (shortest round-trip form) as the same number.
+fn float_from_decimal_exact<N: ExactFloatNative>(unscaled: i128, scale: u8) -> Option<N> {
+    let f: N = decimal_text(unscaled, scale).parse().ok()?;
+    let (back_unscaled, back_scale) = plain_decimal_parts(&format!("{f}"))?;
+    (normalize_decimal(unscaled, scale) == normalize_decimal(back_unscaled, back_scale)).then_some(f)
+}
+
+/// `unscaled × 10^-scale` in plain decimal notation (`-12.30`, `0.0001`, `7`).
+fn decimal_text(unscaled: i128, scale: u8) -> String {
+    let digits = unscaled.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let mut out = String::with_capacity(digits.len() + scale + 3);
+    if unscaled < 0 {
+        out.push('-');
+    }
+    if scale == 0 {
+        out.push_str(&digits);
+    } else if digits.len() > scale {
+        out.push_str(&digits[..digits.len() - scale]);
+        out.push('.');
+        out.push_str(&digits[digits.len() - scale..]);
+    } else {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', scale - digits.len()));
+        out.push_str(&digits);
+    }
+    out
+}
+
+/// `(unscaled, scale)` of plain decimal text (`-12.3` → `(-123, 1)`); `None`
+/// when the text is not plain decimal notation or exceeds i128.
+fn plain_decimal_parts(text: &str) -> Option<(i128, u8)> {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (int_digits, frac_digits) = body.split_once('.').unwrap_or((body, ""));
+    if int_digits.is_empty()
+        || !int_digits.bytes().all(|b| b.is_ascii_digit())
+        || !frac_digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = [int_digits, frac_digits].concat();
+    let unscaled: i128 = digits.trim_start_matches('0').parse().unwrap_or(0);
+    Some((
+        if negative { -unscaled } else { unscaled },
+        u8::try_from(frac_digits.len()).ok()?,
+    ))
+}
+
+/// Strip trailing fractional zeros so equal numbers compare equal.
+fn normalize_decimal(mut unscaled: i128, mut scale: u8) -> (i128, u8) {
+    if unscaled == 0 {
+        return (0, 0);
+    }
+    while scale > 0 && unscaled % 10 == 0 {
+        unscaled /= 10;
+        scale -= 1;
+    }
+    (unscaled, scale)
+}
+
+macro_rules! impl_exact_float_from_variant {
+    ($arrow_type:ty, $native:ty, $as_fn:ident) => {
+        impl ExactFloatFromVariant for $arrow_type {
+            fn from_variant_exact(variant: &Variant<'_, '_>) -> Option<$native> {
+                match variant {
+                    Variant::Int8(i) => <$native>::from_i128_exact(i128::from(*i)),
+                    Variant::Int16(i) => <$native>::from_i128_exact(i128::from(*i)),
+                    Variant::Int32(i) => <$native>::from_i128_exact(i128::from(*i)),
+                    Variant::Int64(i) => <$native>::from_i128_exact(i128::from(*i)),
+                    Variant::Float(f) => <$native>::from_f64_exact(f64::from(*f)),
+                    Variant::Double(f) => <$native>::from_f64_exact(*f),
+                    Variant::Decimal4(d) => {
+                        float_from_decimal_exact(i128::from(d.integer()), d.scale())
+                    }
+                    Variant::Decimal8(d) => {
+                        float_from_decimal_exact(i128::from(d.integer()), d.scale())
+                    }
+                    Variant::Decimal16(d) => float_from_decimal_exact(d.integer(), d.scale()),
+                    _ => variant.$as_fn(),
+                }
+            }
+        }
+    };
+}
+
+impl_exact_float_from_variant!(datatypes::Float32Type, f32, as_f32);
+impl_exact_float_from_variant!(datatypes::Float64Type, f64, as_f64);
 impl_primitive_from_variant!(datatypes::Date32Type, as_naive_date, |v| {
     Some(datatypes::Date32Type::from_naive_date(v))
 });
