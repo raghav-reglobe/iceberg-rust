@@ -542,17 +542,47 @@ impl TransactionAction for UpdateSchemaAction {
             .with_identifier_field_ids(base_schema.identifier_field_ids())
             .build()?;
 
+        let requirements = vec![TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: base_schema.schema_id(),
+        }];
+
+        // --- 6. Reuse an existing schema when the result is structurally identical ---
+        // A catalog treats `AddSchema` of a schema it already holds (same fields, same
+        // identifier fields) as a no-op that does NOT record a "last added" schema, so a
+        // following `SetCurrentSchema { schema_id: -1 }` has nothing to resolve and the
+        // commit fails. Dropping a recently added column is the common case: the result
+        // is the schema the table had before. Point at that schema's id instead, and emit
+        // nothing when it is already current.
+        if let Some(existing) = table
+            .metadata()
+            .schemas_iter()
+            .find(|existing| same_schema(existing, &schema))
+        {
+            let updates = if existing.schema_id() == base_schema.schema_id() {
+                vec![]
+            } else {
+                vec![TableUpdate::SetCurrentSchema {
+                    schema_id: existing.schema_id(),
+                }]
+            };
+            return Ok(ActionCommit::new(updates, requirements));
+        }
+
         let updates = vec![
             TableUpdate::AddSchema { schema },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
 
-        let requirements = vec![TableRequirement::CurrentSchemaIdMatch {
-            current_schema_id: base_schema.schema_id(),
-        }];
-
         Ok(ActionCommit::new(updates, requirements))
     }
+}
+
+/// Two schemas are the same schema when their fields and identifier fields agree; the
+/// schema id is an assignment detail of the table metadata, not part of the identity.
+fn same_schema(a: &Schema, b: &Schema) -> bool {
+    a.as_struct() == b.as_struct()
+        && a.identifier_field_ids().collect::<HashSet<i32>>()
+            == b.identifier_field_ids().collect::<HashSet<i32>>()
 }
 
 #[cfg(test)]
@@ -1303,5 +1333,105 @@ mod tests {
             *f.field_type,
             Type::Primitive(PrimitiveType::Long)
         ));
+    }
+    // -----------------------------------------------------------------------
+    // Reusing an existing schema
+    // -----------------------------------------------------------------------
+
+    /// A table whose metadata holds two schemas: schema 0 (x, y) and the current
+    /// schema 1, which is schema 0 plus a nullable `extra` column.
+    fn make_v2_table_with_schema_history() -> Table {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/test/location",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 3,
+            "current-schema-id": 1,
+            "schemas": [
+                {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "identifier-field-ids": [1],
+                    "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"},
+                        {"id": 2, "name": "y", "required": true, "type": "long"}
+                    ]
+                },
+                {
+                    "type": "struct",
+                    "schema-id": 1,
+                    "identifier-field-ids": [1],
+                    "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"},
+                        {"id": 2, "name": "y", "required": true, "type": "long"},
+                        {"id": 3, "name": "extra", "required": false, "type": "string"}
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }"#;
+        let reader = BufReader::new(json.as_bytes());
+        let metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+        Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v2.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "history"]).unwrap())
+            .file_io(crate::io::FileIO::new_with_memory())
+            .runtime(crate::test_utils::test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_column_back_to_an_existing_schema_sets_current_to_its_id() {
+        // Dropping `extra` yields exactly schema 0 again. A catalog treats an `AddSchema`
+        // of a schema it already holds as a no-op that records no "last added" schema, so
+        // `SetCurrentSchema { schema_id: -1 }` would fail; the action must point at
+        // schema 0 by its id instead, and add nothing.
+        let table = make_v2_table_with_schema_history();
+        let tx = Transaction::new(&table);
+        let action = tx.update_schema().delete_column("extra");
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let requirements = action_commit.take_requirements();
+        assert_eq!(updates, vec![TableUpdate::SetCurrentSchema {
+            schema_id: 0
+        }]);
+        assert_eq!(requirements, vec![TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: 1,
+        }]);
+    }
+
+    #[tokio::test]
+    async fn delete_column_to_a_new_shape_still_adds_a_schema() {
+        // Dropping `y` leaves (x, extra), a shape no existing schema has: the usual
+        // `AddSchema` + `SetCurrentSchema { -1 }` pair.
+        let table = make_v2_table_with_schema_history();
+        let tx = Transaction::new(&table);
+        let action = tx.update_schema().delete_column("y");
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        assert_eq!(updates.len(), 2);
+        let new_schema = match &updates[0] {
+            TableUpdate::AddSchema { schema } => schema,
+            other => panic!("expected AddSchema, got {other:?}"),
+        };
+        let names: Vec<&str> = new_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["x", "extra"]);
+        assert_eq!(updates[1], TableUpdate::SetCurrentSchema { schema_id: -1 });
     }
 }
