@@ -47,6 +47,7 @@
 //! completes under the same pool with byte-identical results.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -54,6 +55,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::spec::{
@@ -1050,4 +1052,192 @@ async fn chunked_update_store_and_large_utf8_offsets() {
         2,
         "replay must commit nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A tiny delta against a large target on a small pool
+// ---------------------------------------------------------------------------
+
+async fn load_bronze(catalog: &Arc<dyn Catalog>) -> Table {
+    catalog
+        .load_table(&TableIdent::new(
+            NamespaceIdent::new(NS.to_string()),
+            BRONZE.to_string(),
+        ))
+        .await
+        .unwrap()
+}
+
+/// A bounded session with the engine's default batch size and sort settings
+/// (the shape a merge run uses), unlike [`session`], which shrinks both. The
+/// pool is returned so a test can read what is still reserved.
+async fn default_shaped_session(
+    catalog: &Arc<dyn Catalog>,
+    pool_mb: usize,
+    target_partitions: usize,
+) -> (SessionContext, Arc<TrackConsumersPool<GreedyMemoryPool>>) {
+    let pool = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(pool_mb * 1024 * 1024),
+        NonZeroUsize::new(5).unwrap(),
+    ));
+    let config = SessionConfig::new()
+        .with_target_partitions(target_partitions)
+        .with_extension(Arc::new(MorMergeOptions::default()));
+    let rt = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+        .build_arc()
+        .unwrap();
+    let ctx = SessionContext::new_with_config_rt(config, rt);
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(Arc::clone(catalog))
+            .await
+            .unwrap(),
+    );
+    ctx.register_catalog(CATALOG, provider);
+    (ctx, pool)
+}
+
+/// Bytes the plan's `RepartitionExec` nodes wrote to spill files.
+fn repartition_spilled_bytes(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let own = if plan.name() == "RepartitionExec" {
+        plan.metrics().and_then(|m| m.spilled_bytes()).unwrap_or(0)
+    } else {
+        0
+    };
+    own + plan
+        .children()
+        .into_iter()
+        .map(repartition_spilled_bytes)
+        .sum::<usize>()
+}
+
+/// A merge of ONE new event into a LARGE target.
+///
+/// The statement's semi/anti joins are hash-partitioned on the event's keys,
+/// so with a single event only one partition of each join has a build row.
+/// The other partitions know at once that they produce nothing and never read
+/// their side of the target scan. Two things must hold:
+///
+/// 1. Nothing is buffered for those partitions. A repartition that keeps
+///    collecting rows for a reader that will never come holds a share of the
+///    whole target scan — first in the pool, then in spill files — for the
+///    length of the merge, however small the change being merged is.
+/// 2. On a pool smaller than the merge's working set the merge either
+///    finishes or fails with an error, promptly. It must never sit idle until
+///    an external deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_event_merge_neither_buffers_the_target_scan_nor_stalls() {
+    const FILES: i32 = 40;
+    const ROWS_PER_FILE: i32 = 50_000;
+    // Longer than any bounded wait inside the engine (the scan memory gate
+    // gives up after 60 s), so only an unbounded wait can run into it.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(90);
+    // A share of the target scan is tens of MB here; what a finished merge may
+    // still hold is bookkeeping.
+    const LEFTOVER_LIMIT: usize = 8 * 1024 * 1024;
+
+    let warehouse = TempDir::new().unwrap();
+    let seed = vec![(0, payload(0, 0, 16), 1_000, None, true, 0)];
+    let first_event = vec![(0, payload(0, 1, 16), "u", 5_000_000, 5_000_000, None)];
+    let catalog = setup_tables(&warehouse, &seed, &first_event).await;
+    for f in 0..FILES {
+        let rows: Vec<_> = (0..ROWS_PER_FILE)
+            .map(|i| {
+                let id = 1 + f * ROWS_PER_FILE + i;
+                (
+                    id,
+                    payload(id, id as i64, 16),
+                    1_000 + id as i64,
+                    None,
+                    true,
+                    id as i64,
+                )
+            })
+            .collect();
+        let silver = load_silver(&catalog).await;
+        append_file(
+            &catalog,
+            &silver,
+            silver_batch(&rows),
+            &format!("bulk{f}"),
+            Some(IcebergStruct::from_iter(vec![Some(Literal::bool(true))])),
+        )
+        .await;
+    }
+
+    // (pool MB, must succeed). The first run only consumes the setup event, so
+    // that every later run merges exactly one new event.
+    let runs = [
+        (2_000usize, true),
+        (2_000, true),
+        (400, true),
+        (170, false),
+        (150, false),
+        (130, false),
+        (110, false),
+    ];
+    for (run, (pool_mb, must_succeed)) in runs.into_iter().enumerate() {
+        if run > 0 {
+            let id = 10 + run as i32;
+            let ts = 6_000_000 + run as i64;
+            let bronze = load_bronze(&catalog).await;
+            append_file(
+                &catalog,
+                &bronze,
+                bronze_batch(&[(id, payload(id, ts, 16), "u", ts, ts, None)]),
+                &format!("ev{run}"),
+                None,
+            )
+            .await;
+        }
+
+        let (ctx, pool) = default_shaped_session(&catalog, pool_mb, 2).await;
+        // Keep the plan: what its operators still hold after the run is the
+        // memory they held for nobody.
+        let plan = ctx
+            .sql(&narrow_scd2_merge_sql())
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            STALL,
+            datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()),
+        )
+        .await;
+        let took = t0.elapsed().as_secs_f64();
+        let result = outcome.unwrap_or_else(|_| {
+            panic!(
+                "run {run}, pool {pool_mb} MB: the merge neither finished nor failed in \
+                 {took:.0}s; the pool holds:\n{}",
+                pool.report_top(20)
+            )
+        });
+        match result {
+            Ok(_) => {
+                if run == 0 {
+                    continue;
+                }
+                let leftover = pool.reserved();
+                assert!(
+                    leftover < LEFTOVER_LIMIT,
+                    "run {run}, pool {pool_mb} MB: {leftover} bytes are still reserved \
+                     after the merge finished:\n{}",
+                    pool.report_top(20)
+                );
+                assert_eq!(
+                    repartition_spilled_bytes(&plan),
+                    0,
+                    "run {run}, pool {pool_mb} MB: rows were spilled for a partition \
+                     nobody reads"
+                );
+            }
+            Err(e) => assert!(
+                !must_succeed,
+                "run {run}, pool {pool_mb} MB: a roomy pool must not fail: {e}"
+            ),
+        }
+    }
 }
