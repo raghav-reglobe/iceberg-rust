@@ -115,11 +115,20 @@ struct HeadOut {
     snapshot_id: i64,
     sequence_number: i64,
     timestamp_ms: i64,
+    schema_id: Option<i32>,
+    current_schema_id: i32,
 }
 
 /// Current-snapshot pointer for one table: `{"snapshot_id", "sequence_number",
-/// "timestamp_ms"}`, or `None` when the table has no current snapshot. One
-/// metadata.json read — no manifest IO.
+/// "timestamp_ms", "schema_id", "current_schema_id"}`, or `None` when the
+/// table has no current snapshot. One metadata.json read — no manifest IO.
+///
+/// `schema_id` is the id of the schema the head snapshot was written with
+/// (`None` when the snapshot records none); `current_schema_id` is the table's
+/// current schema. They differ when the schema was changed after the head
+/// snapshot was committed: a time-travel read pinned to the head then binds
+/// `schema_id`, not the current schema (`catalog.table_schema_json(...,
+/// snapshot_id=)` returns that schema).
 #[pyfunction]
 #[pyo3(signature = (catalog_props, fqn, timeout_s=None))]
 fn head(
@@ -135,10 +144,13 @@ fn head(
             "reading the table head",
             async move {
                 let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
-                Ok::<_, PyErr>(table.metadata().current_snapshot().map(|s| HeadOut {
+                let metadata = table.metadata();
+                Ok::<_, PyErr>(metadata.current_snapshot().map(|s| HeadOut {
                     snapshot_id: s.snapshot_id(),
                     sequence_number: s.sequence_number(),
                     timestamp_ms: s.timestamp_ms(),
+                    schema_id: s.schema_id(),
+                    current_schema_id: metadata.current_schema_id(),
                 }))
             },
         ))
@@ -150,6 +162,8 @@ fn head(
             d.set_item("snapshot_id", h.snapshot_id)?;
             d.set_item("sequence_number", h.sequence_number)?;
             d.set_item("timestamp_ms", h.timestamp_ms)?;
+            d.set_item("schema_id", h.schema_id)?;
+            d.set_item("current_schema_id", h.current_schema_id)?;
             Ok(Some(d.into_any().unbind()))
         }
     }

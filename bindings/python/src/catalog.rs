@@ -314,14 +314,26 @@ fn expire_snapshots(
     })
 }
 
-/// The table's CURRENT schema as an Iceberg schema-JSON document. The
-/// pyiceberg-free source for schema projection (VARIANT columns come back
-/// as real `"variant"` — no UnknownType detour).
+/// The table's schema as an Iceberg schema-JSON document. The pyiceberg-free
+/// source for schema projection (VARIANT columns come back as real
+/// `"variant"` — no UnknownType detour).
+///
+/// Without `snapshot_id`: the table's CURRENT schema.
+///
+/// With `snapshot_id`: the schema THAT SNAPSHOT was written with — the schema
+/// a time-travel read of the snapshot binds, which is not the current schema
+/// when the table's schema was changed after the snapshot was committed. A
+/// snapshot that records no schema id resolves to the current schema (the
+/// document's own `schema-id` says which schema came back). A snapshot id
+/// that is not in the table's metadata (unknown, or expired) is an error,
+/// never a silent fall-back to the current schema.
 #[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, snapshot_id=None))]
 fn table_schema_json(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
+    snapshot_id: Option<i64>,
 ) -> PyResult<String> {
     let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
     py.detach(|| {
@@ -333,10 +345,29 @@ fn table_schema_json(
                 .load_table(&iceberg::TableIdent::new(namespace, table))
                 .await
                 .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
-            serde_json::to_string(t.metadata().current_schema().as_ref())
+            let schema = schema_of(t.metadata(), snapshot_id)
+                .map_err(|e| PyValueError::new_err(format!("{fqn}: {e}")))?;
+            serde_json::to_string(schema.as_ref())
                 .map_err(|e| PyValueError::new_err(format!("serializing schema: {e}")))
         })
     })
+}
+
+/// The current schema, or the schema `snapshot_id` was written with (see
+/// [`table_schema_json`]).
+fn schema_of(
+    metadata: &iceberg::spec::TableMetadata,
+    snapshot_id: Option<i64>,
+) -> Result<iceberg::spec::SchemaRef, String> {
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(metadata.current_schema().clone());
+    };
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        format!("snapshot {snapshot_id} is not in the table's metadata (unknown or expired)")
+    })?;
+    snapshot
+        .schema(metadata)
+        .map_err(|e| format!("schema of snapshot {snapshot_id}: {e}"))
 }
 
 /// Drop a table (metadata-only — never a purge; orphaned files are the
@@ -551,4 +582,85 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(table_properties, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod schema_of_tests {
+    use iceberg::spec::TableMetadata;
+
+    use super::schema_of;
+
+    /// Two schemas (0 = `x`; 1 = `x, y, z`, the current one) and two
+    /// snapshots: the older one recording `older_schema_id`, the head
+    /// recording schema 1.
+    const OLDER: i64 = 3051729675574597004;
+    const HEAD: i64 = 3055729675574597004;
+
+    fn metadata(older_schema_id: Option<i32>) -> TableMetadata {
+        let mut doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/iceberg/testdata/table_metadata/TableMetadataV2Valid.json"
+        ))
+        .unwrap();
+        let older = doc["snapshots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["snapshot-id"] == OLDER)
+            .unwrap();
+        match older_schema_id {
+            Some(id) => older["schema-id"] = id.into(),
+            None => {
+                older.as_object_mut().unwrap().remove("schema-id");
+            }
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn names(metadata: &TableMetadata, snapshot_id: Option<i64>) -> (i32, Vec<String>) {
+        let schema = schema_of(metadata, snapshot_id).unwrap();
+        let names = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        (schema.schema_id(), names)
+    }
+
+    #[test]
+    fn no_pin_is_the_current_schema() {
+        let m = metadata(Some(0));
+        assert_eq!(
+            names(&m, None),
+            (1, vec!["x".into(), "y".into(), "z".into()])
+        );
+    }
+
+    #[test]
+    fn a_pin_resolves_to_the_schema_the_snapshot_recorded() {
+        let m = metadata(Some(0));
+        // written before `y` and `z` were added: the pin does not see them
+        assert_eq!(names(&m, Some(OLDER)), (0, vec!["x".into()]));
+        assert_eq!(
+            names(&m, Some(HEAD)),
+            (1, vec!["x".into(), "y".into(), "z".into()])
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_a_recorded_schema_resolves_to_the_current_one() {
+        let m = metadata(None);
+        assert_eq!(
+            names(&m, Some(OLDER)),
+            (1, vec!["x".into(), "y".into(), "z".into()])
+        );
+    }
+
+    #[test]
+    fn an_unknown_snapshot_is_an_error_not_the_current_schema() {
+        let m = metadata(Some(0));
+        let err = schema_of(&m, Some(42)).unwrap_err();
+        assert!(err.contains("snapshot 42"), "{err}");
+        assert!(err.contains("unknown or expired"), "{err}");
+    }
 }
