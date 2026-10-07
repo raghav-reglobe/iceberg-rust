@@ -399,7 +399,21 @@ struct DataFileRow {
     n_deletes: usize,
     bound_lower: Option<serde_json::Value>,
     bound_upper: Option<serde_json::Value>,
+    /// Per requested field (`bound_fields`, plus `bound_field`): the manifest
+    /// entry's column statistics for this file, in request order.
+    stats: Vec<(String, FieldStats)>,
     arrow_schema: Option<Vec<(String, String)>>,
+}
+
+/// One field's manifest column statistics on one data file — exactly what the
+/// manifest entry carries (Iceberg `lower_bounds` / `upper_bounds` /
+/// `value_counts` / `null_value_counts` by field id); None = not recorded.
+#[derive(Clone, Default)]
+struct FieldStats {
+    lower: Option<serde_json::Value>,
+    upper: Option<serde_json::Value>,
+    value_count: Option<u64>,
+    null_value_count: Option<u64>,
 }
 
 fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
@@ -414,6 +428,9 @@ fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
         PrimitiveLiteral::Float(v) => serde_json::Value::from(v.into_inner()),
         PrimitiveLiteral::Double(v) => serde_json::Value::from(v.into_inner()),
         PrimitiveLiteral::String(v) => serde_json::Value::from(v.clone()),
+        // a DECIMAL / 128-bit bound — as exact text (JSON numbers would round it)
+        PrimitiveLiteral::Int128(v) => serde_json::Value::from(v.to_string()),
+        PrimitiveLiteral::UInt128(v) => serde_json::Value::from(v.to_string()),
         _ => return None,
     })
 }
@@ -429,6 +446,10 @@ fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
 ///  "n_deletes": int,          # delete files bound by scan planning
 ///  "bound_lower"/"bound_upper": json|None,  # column stats for
 ///                `bound_field` (full dotted name), when requested
+///  "stats": {field: {"lower": json|None, "upper": json|None,
+///                    "value_count": int|None, "null_value_count": int|None}}
+///                # the manifest entry's column statistics for every
+///                # `bound_fields` name (+ `bound_field`); {} when none asked
 ///  "arrow_schema": {field: type_string}|None}  # the parquet FOOTER's
 ///                top-level arrow fields, ENGINE-rendered, when
 ///                `include_arrow_schema` (physical-layout inspection —
@@ -437,11 +458,15 @@ fn literal_to_json(lit: &iceberg::spec::Literal) -> Option<serde_json::Value> {
 /// ```
 ///
 /// Scan planning provides path/size/partition/delete bindings; when
-/// `bound_field` is given, a manifest walk (through the parsed-manifest
-/// cache — cache-hot after the plan) merges that field's lower/upper
-/// column-stat bounds by path.
+/// `bound_field` / `bound_fields` are given, a manifest walk (through the
+/// parsed-manifest cache — cache-hot after the plan) merges those fields'
+/// column statistics by path. `snapshot_id` pins BOTH the scan and the
+/// manifest walk to that snapshot (a bootstrap's planned set); an id the
+/// metadata does not hold is an error, never a fall-back to the current
+/// snapshot. Timestamp/date bounds arrive as their Iceberg long/int
+/// encoding (micros / days); decimals as exact text.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, bound_field=None, include_arrow_schema=false, timeout_s=None))]
+#[pyo3(signature = (catalog_props, fqn, bound_field=None, include_arrow_schema=false, timeout_s=None, snapshot_id=None, bound_fields=None))]
 fn data_files(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -449,8 +474,19 @@ fn data_files(
     bound_field: Option<String>,
     include_arrow_schema: bool,
     timeout_s: Option<u64>,
+    snapshot_id: Option<i64>,
+    bound_fields: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    let fqn_text = fqn.clone();
+    // the fields whose column statistics ride each row: `bound_fields` in order, then
+    // the legacy singular `bound_field` (which also fills bound_lower/bound_upper)
+    let mut wanted: Vec<String> = bound_fields.unwrap_or_default();
+    if let Some(f) = bound_field.as_ref() {
+        if !wanted.iter().any(|w| w == f) {
+            wanted.push(f.clone());
+        }
+    }
     let rows: Vec<DataFileRow> = py.detach(|| {
         runtime().block_on(metadata_deadline(
             timeout_s,
@@ -458,13 +494,24 @@ fn data_files(
             async move {
                 let table = load_table_only(catalog_props, catalog_name, ns, table_name).await?;
                 let meta = table.metadata_ref();
-                if meta.current_snapshot().is_none() {
-                    return Ok::<_, PyErr>(vec![]);
-                }
+                let snapshot = match snapshot_id {
+                    Some(id) => meta.snapshot_by_id(id).cloned().ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "snapshot {id} unknown or expired on {fqn_text}: data_files reads a retained snapshot only"
+                        ))
+                    })?,
+                    None => match meta.current_snapshot() {
+                        Some(s) => s.clone(),
+                        None => return Ok::<_, PyErr>(vec![]),
+                    },
+                };
                 let n_spec_fields = meta.default_partition_spec().fields().len();
 
-                let scan = table
-                    .scan()
+                let mut scan_builder = table.scan();
+                if let Some(id) = snapshot_id {
+                    scan_builder = scan_builder.snapshot_id(id);
+                }
+                let scan = scan_builder
                     .build()
                     .map_err(|e| PyValueError::new_err(format!("building scan: {e}")))?;
                 let tasks: Vec<_> = scan
@@ -492,29 +539,28 @@ fn data_files(
                             n_deletes: t.deletes.len(),
                             bound_lower: None,
                             bound_upper: None,
+                            stats: Vec::new(),
                             arrow_schema: None,
                         }
                     })
                     .collect();
 
-                if let Some(field_name) = bound_field {
-                    let field = meta
-                        .current_schema()
-                        .field_by_name(&field_name)
-                        .ok_or_else(|| {
-                            PyValueError::new_err(format!("bound_field `{field_name}` not found"))
+                if !wanted.is_empty() {
+                    // field ids are stable across schema versions (a rename keeps the id; a field
+                    // absent from an older file simply has no statistics there)
+                    let mut field_ids: Vec<(String, i32)> = Vec::with_capacity(wanted.len());
+                    for name in &wanted {
+                        let field = meta.current_schema().field_by_name(name).ok_or_else(|| {
+                            PyValueError::new_err(format!("bound_field `{name}` not found"))
                         })?;
-                    let field_id = field.id;
-                    let current = meta.current_snapshot().unwrap();
+                        field_ids.push((name.clone(), field.id));
+                    }
                     let mlist = table
-                        .manifest_list_reader(current)
+                        .manifest_list_reader(&snapshot)
                         .load()
                         .await
                         .map_err(|e| PyValueError::new_err(format!("manifest list: {e}")))?;
-                    let mut bounds: HashMap<
-                        String,
-                        (Option<serde_json::Value>, Option<serde_json::Value>),
-                    > = HashMap::new();
+                    let mut per_file: HashMap<String, Vec<(String, FieldStats)>> = HashMap::new();
                     for mf in mlist.entries() {
                         if mf.content != ManifestContentType::Data {
                             continue;
@@ -527,21 +573,38 @@ fn data_files(
                                 continue;
                             }
                             let df = entry.data_file();
-                            let lo = df
-                                .lower_bounds()
-                                .get(&field_id)
-                                .and_then(|d| literal_to_json(&d.clone().into()));
-                            let hi = df
-                                .upper_bounds()
-                                .get(&field_id)
-                                .and_then(|d| literal_to_json(&d.clone().into()));
-                            bounds.insert(df.file_path().to_string(), (lo, hi));
+                            let stats: Vec<(String, FieldStats)> = field_ids
+                                .iter()
+                                .map(|(name, id)| {
+                                    (
+                                        name.clone(),
+                                        FieldStats {
+                                            lower: df
+                                                .lower_bounds()
+                                                .get(id)
+                                                .and_then(|d| literal_to_json(&d.clone().into())),
+                                            upper: df
+                                                .upper_bounds()
+                                                .get(id)
+                                                .and_then(|d| literal_to_json(&d.clone().into())),
+                                            value_count: df.value_counts().get(id).copied(),
+                                            null_value_count: df.null_value_counts().get(id).copied(),
+                                        },
+                                    )
+                                })
+                                .collect();
+                            per_file.insert(df.file_path().to_string(), stats);
                         }
                     }
                     for r in rows.iter_mut() {
-                        if let Some((lo, hi)) = bounds.get(&r.path) {
-                            r.bound_lower = lo.clone();
-                            r.bound_upper = hi.clone();
+                        if let Some(stats) = per_file.get(&r.path) {
+                            r.stats = stats.clone();
+                            if let Some(f) = bound_field.as_ref() {
+                                if let Some((_, fs)) = stats.iter().find(|(n, _)| n == f) {
+                                    r.bound_lower = fs.lower.clone();
+                                    r.bound_upper = fs.upper.clone();
+                                }
+                            }
                         }
                     }
                 }
@@ -595,6 +658,16 @@ fn data_files(
         d.set_item("n_deletes", r.n_deletes)?;
         d.set_item("bound_lower", opt_json_to_py(py, &r.bound_lower)?)?;
         d.set_item("bound_upper", opt_json_to_py(py, &r.bound_upper)?)?;
+        let stats = PyDict::new(py);
+        for (name, fs) in &r.stats {
+            let fd = PyDict::new(py);
+            fd.set_item("lower", opt_json_to_py(py, &fs.lower)?)?;
+            fd.set_item("upper", opt_json_to_py(py, &fs.upper)?)?;
+            fd.set_item("value_count", fs.value_count)?;
+            fd.set_item("null_value_count", fs.null_value_count)?;
+            stats.set_item(name, fd)?;
+        }
+        d.set_item("stats", stats)?;
         match &r.arrow_schema {
             None => d.set_item("arrow_schema", py.None())?,
             Some(fields) => {
