@@ -725,8 +725,6 @@ pub(crate) mod tests {
             .is_some()
         );
         FileScanTaskDeleteFile {
-                sequence_number: None,
-                partition: None,
             file_path: path.to_string(),
             file_size_in_bytes: 1,
             file_type: DataContentType::EqualityDeletes,
