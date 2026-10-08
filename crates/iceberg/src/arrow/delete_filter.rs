@@ -679,6 +679,8 @@ pub(crate) mod tests {
         spec_id: i32,
         partition: Option<Struct>,
     ) -> FileScanTaskDeleteFile {
+                sequence_number: None,
+                partition: None,
         assert!(filter.try_start_eq_del_load(path).is_some());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(
@@ -709,6 +711,8 @@ pub(crate) mod tests {
             .is_some()
         );
         FileScanTaskDeleteFile {
+                sequence_number: None,
+                partition: None,
             file_path: path.to_string(),
             file_size_in_bytes: 1,
             file_type: DataContentType::EqualityDeletes,
@@ -730,6 +734,7 @@ pub(crate) mod tests {
         partition: Option<Struct>,
         deletes: Vec<FileScanTaskDeleteFile>,
     ) -> FileScanTask {
+            sequence_number: None,
         let mut task = setup(tmp).into_iter().next().expect("a fixture task");
         task.sequence_number = seq;
         task.partition = partition;
@@ -1052,11 +1057,11 @@ pub(crate) mod tests {
         set2.keys.insert_tuple(vec![Some(Datum::long(30))]).unwrap();
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del-1.parquet", rx1);
+        filter.insert_equality_delete("eq-del-1.parquet", rx1, None);
         tx1.send(Arc::new(set1)).unwrap();
 
         let (tx2, rx2) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del-2.parquet", rx2);
+        filter.insert_equality_delete("eq-del-2.parquet", rx2, None);
         tx2.send(Arc::new(set2)).unwrap();
 
         // Small delay to allow the spawned tasks to complete
@@ -1151,11 +1156,11 @@ pub(crate) mod tests {
             .unwrap();
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del-by-id.parquet", rx1);
+        filter.insert_equality_delete("eq-del-by-id.parquet", rx1, None);
         tx1.send(Arc::new(set_by_id)).unwrap();
 
         let (tx2, rx2) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del-by-name.parquet", rx2);
+        filter.insert_equality_delete("eq-del-by-name.parquet", rx2, None);
         tx2.send(Arc::new(set_by_name)).unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

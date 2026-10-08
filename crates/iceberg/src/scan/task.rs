@@ -405,6 +405,7 @@ mod tests {
         project: Vec<i32>,
         column_sizes: Option<HashMap<i32, u64>>,
     ) -> FileScanTask {
+            sequence_number: None,
         FileScanTask::builder()
             .with_file_size_in_bytes(file_size)
             .with_start(0)
