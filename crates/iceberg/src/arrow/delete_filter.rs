@@ -198,21 +198,33 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Option<Arc<EqDeleteSet>> {
-        let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
+        // The `Notified` is created UNDER the state lock: the loader's
+        // `notify_waiters()` stores no permit, so a waiter that registered
+        // after the signal would wait forever. Creating it while the entry is
+        // observably `Loading` closes that window (the positional path has the
+        // same guard in `try_start_pos_del_load`). This was the
+        // equality-delete lost-wakeup hang: a scan task sharing a delete file
+        // with another in-flight task parked forever once that task's load
+        // finished between the state read and the await.
+        let notified = {
+            let state = self.state.read().unwrap();
+            match state.equality_deletes.get(file_path) {
                 None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
                 Some(EqDelState::Loaded(eq_delete_set)) => {
                     return Some(eq_delete_set.clone());
                 }
+                Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
             }
         };
 
-        notifier.notified().await;
+        notified.await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(eq_delete_set)) => Some(eq_delete_set.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            // The loader failed and cleared its entry (`insert_equality_delete`):
+            // report the set as missing so the caller fails the task loudly
+            // instead of waiting on a load that will never finish.
+            _ => None,
         }
     }
 
@@ -307,12 +319,24 @@ impl DeleteFilter {
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         self.runtime.cpu().spawn(async move {
-            let eq_del = eq_del.await.unwrap();
+            // A dropped sender means the loader failed before producing the
+            // set. The old `unwrap()` panicked here, which left the entry
+            // `Loading` forever and parked every later waiter (the stranded
+            // Loading state): clear the entry instead, so waiters observe
+            // "missing" and a later task can retry the load.
+            let loaded = eq_del.await;
             {
                 let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                match loaded {
+                    Ok(eq_del) => {
+                        state
+                            .equality_deletes
+                            .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                    }
+                    Err(_) => {
+                        state.equality_deletes.remove(&delete_file_path);
+                    }
+                }
             }
             notify.notify_waiters();
         });
@@ -385,6 +409,72 @@ pub(crate) mod tests {
         assert!(
             waited.is_ok(),
             "WaitFor future must resolve after finish_pos_del_load"
+        );
+    }
+
+    // Regression test for the EQUALITY-delete lost-wakeup hang: the loader
+    // completes and fires `notify_waiters()` while a waiter is between its
+    // state read and its await. The waiter's `Notified` is now created under
+    // the state lock, so the signal cannot be missed; the old getter created
+    // it after releasing the lock and could park forever.
+    #[tokio::test]
+    async fn test_eq_del_waiter_completes_when_load_finishes_concurrently() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/eq-delete.parquet";
+        assert!(filter.try_start_eq_del_load(path).is_some());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        filter.insert_equality_delete(path, receiver);
+        let waiter = {
+            let filter = filter.clone();
+            tokio::spawn(async move {
+                filter
+                    .get_equality_delete_set_for_delete_file_path(path)
+                    .await
+            })
+        };
+        // Complete the load while the waiter is (or is about to be) parked.
+        tokio::task::yield_now().await;
+        sender
+            .send(Arc::new(EqDeleteSet {
+                keys: EqDeleteKeys::Generic(std::collections::HashSet::new()),
+                fields: vec![("id".to_string(), 1)],
+            }))
+            .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("eq-delete waiter must wake once the load completes")
+            .unwrap();
+        assert!(got.is_some(), "the loaded set is handed to the waiter");
+    }
+
+    // Regression test for the stranded `Loading` state: the loader drops its
+    // sender (its load failed). Waiters must observe "missing" instead of
+    // parking forever, and the entry must be clear so a later task can retry.
+    #[tokio::test]
+    async fn test_eq_del_failed_load_releases_waiters_and_clears_entry() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/eq-delete-failed.parquet";
+        assert!(filter.try_start_eq_del_load(path).is_some());
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
+        filter.insert_equality_delete(path, receiver);
+        let waiter = {
+            let filter = filter.clone();
+            tokio::spawn(async move {
+                filter
+                    .get_equality_delete_set_for_delete_file_path(path)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(sender); // the loader failed
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a failed load must release its waiters")
+            .unwrap();
+        assert!(got.is_none(), "a failed load reports the set as missing");
+        assert!(
+            filter.try_start_eq_del_load(path).is_some(),
+            "the failed entry is cleared so the load can be retried"
         );
     }
 
