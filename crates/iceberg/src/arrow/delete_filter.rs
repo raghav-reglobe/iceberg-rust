@@ -83,10 +83,11 @@ pub(crate) struct EqFoldTarget {
     pub(crate) partition: Option<Struct>,
 }
 
-/// `ICEBERG_EQ_DELETE_INDEX=0` keeps every task on the per-set path (the
-/// index is still folded, never consulted) — the reader-side kill switch for
-/// a pod whose memory envelope cannot hold one map of the pile's distinct
-/// keys beside the per-file sets. Read once per process.
+/// `ICEBERG_EQ_DELETE_INDEX=0` keeps every task on the per-set path and
+/// folds nothing — no index exists, so the process carries no memory term
+/// beyond the per-file sets: byte for byte the pre-index reader. The
+/// kill switch for a pod whose envelope cannot hold one map of the pile's
+/// distinct keys. Read once per process.
 pub(crate) fn eq_delete_index_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -517,7 +518,7 @@ impl DeleteFilter {
             // so once it sees Loaded every key of that file is in the index.
             // The fold takes the state lock only to find the index; the keys
             // go in under the index's own shard locks.
-            if let (Some(set), Some(target)) = (&loaded, fold) {
+            if let (Some(set), Some(target), true) = (&loaded, fold, eq_delete_index_enabled()) {
                 let index = {
                     let mut st = state.write().unwrap();
                     st.eq_indexes
