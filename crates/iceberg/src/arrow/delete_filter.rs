@@ -83,6 +83,20 @@ pub(crate) struct EqFoldTarget {
     pub(crate) partition: Option<Struct>,
 }
 
+/// `ICEBERG_EQ_DELETE_INDEX=0` keeps every task on the per-set path (the
+/// index is still folded, never consulted) — the reader-side kill switch for
+/// a pod whose memory envelope cannot hold one map of the pile's distinct
+/// keys beside the per-file sets. Read once per process.
+pub(crate) fn eq_delete_index_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("ICEBERG_EQ_DELETE_INDEX").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Identity of one equality-delete index: the delete's partition scope plus
 /// the field layout of its keys.
 type EqIndexKey = (i32, Option<Struct>, Vec<(String, i32)>);
@@ -438,9 +452,10 @@ impl DeleteFilter {
             entry.0.push(eq_set);
         }
         let mut out = Vec::with_capacity(groups.len());
+        let index_enabled = eq_delete_index_enabled();
         for (fields, (sets, keys, unindexable)) in groups {
             let indexed = match file_scan_task.sequence_number {
-                Some(data_seq) if !unindexable => {
+                Some(data_seq) if index_enabled && !unindexable => {
                     let state = self.state.read().unwrap();
                     let indexes: Option<Vec<Arc<EqDeleteIndex>>> =
                         keys.iter().map(|k| state.eq_indexes.get(k).cloned()).collect();
