@@ -147,6 +147,7 @@ impl ManifestEntryContext {
             )
             .with_deletes(deletes)
             .with_partition(Some(self.manifest_entry.data_file.partition.clone()))
+            .with_sequence_number(self.manifest_entry.sequence_number())
             .with_partition_spec(self.partition_spec.clone())
             .with_name_mapping(self.name_mapping)
             .with_case_sensitive(self.case_sensitive)

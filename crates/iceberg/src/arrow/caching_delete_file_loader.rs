@@ -22,7 +22,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray, St
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction};
+use super::delete_filter::{DeleteFilter, EqFoldTarget, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
@@ -105,38 +105,6 @@ impl EqDeleteKeys {
 
     /// Probe one key tuple. Union semantics across sets are the caller's
     /// job (`EqDeleteGroup`); this answers membership in ONE set.
-    /// Absorb every key of `other` into `self` (set union). Both sides must
-    /// use the same representation — a group of equality-delete files that
-    /// share one field layout always does, since the representation is
-    /// chosen from the field type — otherwise the caller keeps probing the
-    /// sets one by one.
-    pub(crate) fn merge_from(&mut self, other: &EqDeleteKeys) -> Result<()> {
-        match (self, other) {
-            (Self::Generic(keys), Self::Generic(other_keys)) => {
-                keys.extend(other_keys.iter().cloned());
-                Ok(())
-            }
-            (
-                Self::SingleInt {
-                    keys,
-                    contains_null,
-                },
-                Self::SingleInt {
-                    keys: other_keys,
-                    contains_null: other_null,
-                },
-            ) => {
-                keys.extend(other_keys.iter().copied());
-                *contains_null |= *other_null;
-                Ok(())
-            }
-            _ => Err(Error::new(
-                ErrorKind::Unexpected,
-                "cannot merge equality delete sets of different representations",
-            )),
-        }
-    }
-
     pub(crate) fn contains_tuple(&self, key: &EqDeleteKey) -> bool {
         match self {
             Self::Generic(keys) => keys.contains(key),
@@ -155,7 +123,7 @@ impl EqDeleteKeys {
 /// promotion drift between a delete file's stored type and an evolved
 /// batch column type (the generic datum tuple treats Int(5) and Long(5) as
 /// distinct keys).
-fn datum_as_i64(datum: &Datum) -> Result<i64> {
+pub(crate) fn datum_as_i64(datum: &Datum) -> Result<i64> {
     use crate::spec::PrimitiveLiteral;
     match datum.literal() {
         PrimitiveLiteral::Int(v) => Ok(*v as i64),
@@ -499,7 +467,15 @@ impl CachingDeleteFileLoader {
                 };
 
                 let (sender, receiver) = channel();
-                del_filter.insert_equality_delete(&task.file_path, receiver);
+                del_filter.insert_equality_delete(
+                    &task.file_path,
+                    receiver,
+                    task.sequence_number.map(|sequence_number| EqFoldTarget {
+                        sequence_number,
+                        partition_spec_id: task.partition_spec_id,
+                        partition: task.partition.clone(),
+                    }),
+                );
 
                 // Per the Iceberg spec, equality_ids is required for equality delete files.
                 // Evolve schema only for the equality_ids columns, not all table columns.
@@ -1020,6 +996,7 @@ mod tests {
 
         // The read path's shape: shared Arcs grouped, never unioned.
         let group = EqDeleteGroup {
+            indexed: None,
             fields: fields.clone(),
             sets: sets.clone(),
         };
@@ -1754,6 +1731,8 @@ mod tests {
             .unwrap();
 
         let dv_del = FileScanTaskDeleteFile {
+                sequence_number: None,
+                partition: None,
             key_metadata: None,
             file_path: dv_data_file.file_path().to_string(),
             file_size_in_bytes: dv_data_file.file_size_in_bytes(),
@@ -1767,6 +1746,7 @@ mod tests {
         };
 
         let file_scan_task = FileScanTask {
+            sequence_number: None,
             row_selection_positions: None,
             key_metadata: None,
             column_sizes: None,
@@ -1879,6 +1859,8 @@ mod tests {
             .iter()
             .zip([data_file_1.clone(), data_file_2.clone()])
             .map(|(blob_meta, referenced)| FileScanTaskDeleteFile {
+                sequence_number: None,
+                partition: None,
                 key_metadata: None,
                 file_path: container_path.clone(),
                 file_size_in_bytes: file_size,
@@ -2002,39 +1984,4 @@ mod tests {
         assert!(Arc::ptr_eq(&dv1, &dv2));
     }
 
-    #[test]
-    fn eq_delete_keys_merge_from_unions_single_int_sets() {
-        use super::{EqDeleteKey, EqDeleteKeys};
-        use crate::spec::Datum;
-        let mut a = EqDeleteKeys::SingleInt {
-            keys: [1i64, 2].into_iter().collect(),
-            contains_null: false,
-        };
-        let b = EqDeleteKeys::SingleInt {
-            keys: [2i64, 3].into_iter().collect(),
-            contains_null: true,
-        };
-        a.merge_from(&b).unwrap();
-        assert_eq!(a.len(), 4, "{{1,2,3}} plus the null marker");
-        let k = |v: i64| EqDeleteKey(vec![Some(Datum::long(v))]);
-        assert!(a.contains_tuple(&k(1)) && a.contains_tuple(&k(3)));
-        assert!(!a.contains_tuple(&k(4)));
-        assert!(a.contains_tuple(&EqDeleteKey(vec![None])), "null absorbed");
-    }
-
-    #[test]
-    fn eq_delete_keys_merge_from_unions_generic_sets_and_refuses_mixed() {
-        use super::{EqDeleteKey, EqDeleteKeys};
-        use crate::spec::Datum;
-        let key = |v: &str| EqDeleteKey(vec![Some(Datum::string(v))]);
-        let mut a = EqDeleteKeys::Generic([key("x")].into_iter().collect());
-        let b = EqDeleteKeys::Generic([key("y")].into_iter().collect());
-        a.merge_from(&b).unwrap();
-        assert!(a.contains_tuple(&key("x")) && a.contains_tuple(&key("y")));
-        let single = EqDeleteKeys::SingleInt {
-            keys: [1i64].into_iter().collect(),
-            contains_null: false,
-        };
-        assert!(a.merge_from(&single).is_err(), "mixed representations are refused");
-    }
 }

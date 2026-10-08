@@ -1261,6 +1261,7 @@ mod tests {
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let task = FileScanTask {
+            sequence_number: None,
             row_selection_positions: None,
             file_size_in_bytes: file_size,
             start: 0,
@@ -1355,6 +1356,7 @@ mod tests {
             .build();
 
         let task_sub2 = FileScanTask {
+            sequence_number: None,
             row_selection_positions: None,
             file_size_in_bytes: file_size,
             start: 0,
@@ -1366,6 +1368,8 @@ mod tests {
             project_field_ids: vec![1, 2],
             predicate: Some(predicate_sub2),
             deletes: vec![FileScanTaskDeleteFile {
+                sequence_number: None,
+                partition: None,
                 file_path: pos_del_path.clone(),
                 file_type: DataContentType::PositionDeletes,
                 partition_spec_id: 0,

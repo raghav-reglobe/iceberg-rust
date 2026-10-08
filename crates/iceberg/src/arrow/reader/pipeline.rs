@@ -769,7 +769,8 @@ impl ArrowReader {
     /// match an entry in ANY of the group's delete sets. Uses hash lookups per
     /// row, probing the shared per-delete-file sets sequentially with early
     /// exit — semantically identical to probing the union of the sets, which
-    /// is deliberately never materialized (see `build_equality_delete_groups`).
+    /// is decided by the filter's equality-delete index when the task carries
+    /// one (see `build_equality_delete_groups`), else by probing each set.
     fn apply_eq_delete_filter(
         batch: &RecordBatch,
         delete_group: &EqDeleteGroup,
@@ -838,16 +839,43 @@ impl ArrowReader {
         // Reuse a single EqDeleteKey allocation across all rows to avoid
         // per-row Vec allocation + clone.
         let mut probe_key = EqDeleteKey(vec![None; num_cols]);
+        // ICEBERG_EQ_DELETE_REFEREE: cross-check every indexed verdict
+        // against the per-set union (the exact form) and fail loudly on a
+        // disagreement — the gate for the index on real piles.
+        let referee = std::env::var_os("ICEBERG_EQ_DELETE_REFEREE").is_some();
 
         for (row_idx, keep_row) in keep.iter_mut().enumerate() {
             for (col_idx, col) in datum_columns.iter().enumerate() {
                 probe_key.0[col_idx].clone_from(&col[row_idx]);
             }
-            if delete_group
-                .sets
-                .iter()
-                .any(|set| set.keys.contains_tuple(&probe_key))
-            {
+            let hit = match &delete_group.indexed {
+                Some(probe) => {
+                    let hit = probe.deleted(&probe_key);
+                    if referee {
+                        let exact = delete_group
+                            .sets
+                            .iter()
+                            .any(|set| set.keys.contains_tuple(&probe_key));
+                        if exact != hit {
+                            return Err(Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "equality-delete index referee mismatch at row {row_idx}: \
+                                     index={hit} per-set={exact} key={probe_key:?} \
+                                     data_seq={}",
+                                    probe.data_seq
+                                ),
+                            ));
+                        }
+                    }
+                    hit
+                }
+                None => delete_group
+                    .sets
+                    .iter()
+                    .any(|set| set.keys.contains_tuple(&probe_key)),
+            };
+            if hit {
                 *keep_row = false;
             }
         }

@@ -22,11 +22,11 @@ use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::oneshot::Receiver;
 
-use super::caching_delete_file_loader::EqDeleteSet;
+use super::caching_delete_file_loader::{EqDeleteKey, EqDeleteKeys, EqDeleteSet, datum_as_i64};
 use crate::delete_vector::DeleteVector;
 use crate::runtime::Runtime;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-use crate::spec::DataContentType;
+use crate::spec::{DataContentType, Struct};
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Debug)]
@@ -35,20 +35,172 @@ enum EqDelState {
     Loaded(Arc<EqDeleteSet>),
 }
 
-/// A group of equality delete sets sharing one field layout, probed
-/// sequentially at read time. Rows are removed when their key is in ANY of
-/// the sets — identical semantics to the union of the sets. From
-/// `MERGE_SETS_FROM` bound sets on, the union IS materialized, once per
-/// distinct set of delete files and shared through the filter's cache (see
-/// `build_equality_delete_groups`): probing N sets per row made a task bound
-/// to ~1,700 equality-delete files cost N hash probes per row — hours for a
-/// few million rows — where one merged set costs one.
+/// A group of equality delete sets sharing one field layout. Rows are
+/// removed when their key is in ANY of the sets — identical semantics to the
+/// union of the sets. When `indexed` is set the row is decided by the
+/// filter's equality-delete INDEX instead (one probe per row: key -> the
+/// highest delete sequence number, compared with the task's data sequence
+/// number); `sets` stays the exact per-file form, used as the fallback and
+/// by the referee. Probing N sets per row made a task bound to ~1,700
+/// equality-delete files cost N hash probes per row.
 #[derive(Debug, Clone)]
 pub(crate) struct EqDeleteGroup {
     /// Ordered `(field_name, field_id)` — identical across `sets`.
     pub(crate) fields: Vec<(String, i32)>,
     /// The per-delete-file sets (shared cache `Arc`s).
     pub(crate) sets: Vec<Arc<EqDeleteSet>>,
+    /// The indexed probe for this task, when every bound delete file and the
+    /// task itself carry a data sequence number.
+    pub(crate) indexed: Option<IndexedEqProbe>,
+}
+
+/// One probe per row against the equality-delete indexes a task's bound
+/// delete files were folded into (its own partition's and the global one).
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedEqProbe {
+    pub(crate) indexes: Vec<Arc<EqDeleteIndex>>,
+    /// The task's data sequence number: a key is deleted iff some folded
+    /// delete file holding it has a strictly greater sequence number.
+    pub(crate) data_seq: i64,
+}
+
+impl IndexedEqProbe {
+    pub(crate) fn deleted(&self, key: &EqDeleteKey) -> bool {
+        self.indexes
+            .iter()
+            .any(|ix| ix.max_seq(key).is_some_and(|seq| seq > self.data_seq))
+    }
+}
+
+/// Where a loaded equality-delete file is folded: its data sequence number
+/// and the partition it applies to (`None` = unpartitioned, applies to every
+/// data file). Mirrors `DeleteFileIndex`'s binding: a partitioned delete is
+/// scoped to data files of the same spec id and partition tuple.
+#[derive(Debug, Clone)]
+pub(crate) struct EqFoldTarget {
+    pub(crate) sequence_number: i64,
+    pub(crate) partition_spec_id: i32,
+    pub(crate) partition: Option<Struct>,
+}
+
+/// Identity of one equality-delete index: the delete's partition scope plus
+/// the field layout of its keys.
+type EqIndexKey = (i32, Option<Struct>, Vec<(String, i32)>);
+
+const EQ_INDEX_SHARDS: usize = 64;
+
+#[derive(Debug, Default)]
+struct EqIndexShard {
+    single_int: HashMap<i64, i64>,
+    generic: HashMap<EqDeleteKey, i64>,
+    /// Highest sequence number among delete files holding a NULL key
+    /// (single-column integer sets); kept on shard 0.
+    null_max_seq: Option<i64>,
+}
+
+/// key -> the highest data sequence number of any equality-delete file
+/// holding it, for one partition scope and field layout. Built once per
+/// filter (per reader) by folding each delete file as it loads; sharded by
+/// key hash so a fold of one file never blocks readers of the others for
+/// its whole length.
+#[derive(Debug)]
+pub(crate) struct EqDeleteIndex {
+    shards: Vec<RwLock<EqIndexShard>>,
+}
+
+impl EqDeleteIndex {
+    fn new() -> Self {
+        Self {
+            shards: (0..EQ_INDEX_SHARDS)
+                .map(|_| RwLock::new(EqIndexShard::default()))
+                .collect(),
+        }
+    }
+
+    fn shard_of_i64(k: i64) -> usize {
+        let x = (k as u64) ^ ((k as u64) >> 32);
+        (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % EQ_INDEX_SHARDS
+    }
+
+    fn shard_of_key(key: &EqDeleteKey) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        (h.finish() % EQ_INDEX_SHARDS as u64) as usize
+    }
+
+    /// Fold one loaded delete file: every key takes the max of its recorded
+    /// sequence number and `seq`.
+    fn fold(&self, set: &EqDeleteSet, seq: i64) {
+        match &set.keys {
+            EqDeleteKeys::SingleInt {
+                keys,
+                contains_null,
+            } => {
+                let mut buckets: Vec<Vec<i64>> = vec![Vec::new(); EQ_INDEX_SHARDS];
+                for k in keys {
+                    buckets[Self::shard_of_i64(*k)].push(*k);
+                }
+                for (i, bucket) in buckets.into_iter().enumerate() {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    let mut shard = self.shards[i].write().unwrap();
+                    for k in bucket {
+                        let e = shard.single_int.entry(k).or_insert(seq);
+                        if *e < seq {
+                            *e = seq;
+                        }
+                    }
+                }
+                if *contains_null {
+                    let mut s0 = self.shards[0].write().unwrap();
+                    s0.null_max_seq = Some(s0.null_max_seq.map_or(seq, |m| m.max(seq)));
+                }
+            }
+            EqDeleteKeys::Generic(keys) => {
+                let mut buckets: Vec<Vec<&EqDeleteKey>> = vec![Vec::new(); EQ_INDEX_SHARDS];
+                for k in keys {
+                    buckets[Self::shard_of_key(k)].push(k);
+                }
+                for (i, bucket) in buckets.into_iter().enumerate() {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    let mut shard = self.shards[i].write().unwrap();
+                    for k in bucket {
+                        let e = shard.generic.entry(k.clone()).or_insert(seq);
+                        if *e < seq {
+                            *e = seq;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The highest delete sequence number holding `key`, if any file does.
+    pub(crate) fn max_seq(&self, key: &EqDeleteKey) -> Option<i64> {
+        let mut best: Option<i64> = None;
+        if key.0.len() <= 1 {
+            match key.0.first() {
+                Some(Some(datum)) => {
+                    if let Ok(v) = datum_as_i64(datum) {
+                        let shard = self.shards[Self::shard_of_i64(v)].read().unwrap();
+                        best = shard.single_int.get(&v).copied();
+                    }
+                }
+                Some(None) | None => {
+                    best = self.shards[0].read().unwrap().null_max_seq;
+                }
+            }
+        }
+        let shard = self.shards[Self::shard_of_key(key)].read().unwrap();
+        if let Some(s) = shard.generic.get(key) {
+            best = Some(best.map_or(*s, |b| b.max(*s)));
+        }
+        best
+    }
 }
 
 /// State tracking for positional delete files.
@@ -75,24 +227,13 @@ enum PosDelState {
 /// (Parquet pos-del stream), which keeps path-level identity.
 type PosDelKey = (String, Option<u64>);
 
-/// Identity of one merged equality-delete set: the field layout plus the
-/// sorted paths of the delete files it unions.
-type MergedEqKey = (Vec<(String, i32)>, Vec<String>);
-
-/// Bound sets per field layout from which a task's group materializes the
-/// union instead of probing each set per row.
-pub(crate) const MERGE_SETS_FROM: usize = 8;
-
-/// Distinct merged sets kept per filter; beyond this the cache is dropped
-/// (each merged set can be the size of every delete file it unions).
-const MERGED_EQ_CACHE_MAX: usize = 16;
-
 #[derive(Debug, Default)]
 struct DeleteFileFilterState {
     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
     equality_deletes: HashMap<String, EqDelState>,
     positional_deletes: HashMap<PosDelKey, PosDelState>,
-    merged_equality_sets: HashMap<MergedEqKey, Arc<EqDeleteSet>>,
+    /// The equality-delete indexes, one per partition scope + field layout.
+    eq_indexes: HashMap<EqIndexKey, Arc<EqDeleteIndex>>,
 }
 
 #[derive(Clone, Debug)]
@@ -248,27 +389,15 @@ impl DeleteFilter {
     /// Builds equality delete groups for the provided task.
     ///
     /// Returns one group per distinct `equality_ids` field layout, each
-    /// holding the cached `Arc`s of every applicable delete file's set.
-    /// Most tables use a single `equality_ids` set, so this typically returns
-    /// zero or one group. Multiple groups occur only when different delete
-    /// files on the same partition use different equality column sets.
-    ///
-    /// The per-group UNION of the sets is deliberately NOT materialized:
-    /// with N delete files bound to one data file, unioning deep-cloned the
-    /// whole applicable key space into a PRIVATE `HashSet` per data file
-    /// (~100 B per key tuple, up to 10^8 keys, held concurrently across the
-    /// decode pool) — the compact-path memory balloon. Probing the shared
-    /// `Arc`s sequentially (`apply_eq_delete_filter`) is semantically
-    /// identical — a row is deleted when its key is in ANY set — at zero
-    /// copies.
+    /// holding the cached `Arc`s of every applicable delete file's set and,
+    /// when the task and every bound delete carry a data sequence number,
+    /// the indexed probe over the indexes those files were folded into.
     pub(crate) async fn build_equality_delete_groups(
         &self,
         file_scan_task: &FileScanTask,
     ) -> Result<Vec<EqDeleteGroup>> {
-        // Collect all applicable equality delete sets, reusing cached Arcs.
-        // Group by field layout so batch key columns are converted once per
-        // layout at probe time.
-        let mut groups: HashMap<Vec<(String, i32)>, Vec<(String, Arc<EqDeleteSet>)>> =
+        // (sets, index keys, unindexable) per field layout
+        let mut groups: HashMap<Vec<(String, i32)>, (Vec<Arc<EqDeleteSet>>, Vec<EqIndexKey>, bool)> =
             HashMap::new();
         for delete in &file_scan_task.deletes {
             if !is_equality_delete(delete) {
@@ -286,66 +415,46 @@ impl DeleteFilter {
                     ),
                 ));
             };
-            if !eq_set.is_empty() {
-                groups
-                    .entry(eq_set.fields.clone())
-                    .or_default()
-                    .push((delete.file_path.clone(), eq_set));
+            if eq_set.is_empty() {
+                continue;
             }
+            let entry = groups.entry(eq_set.fields.clone()).or_default();
+            match delete.sequence_number {
+                Some(_) => {
+                    let key: EqIndexKey = (
+                        delete.partition_spec_id,
+                        delete.partition.clone(),
+                        eq_set.fields.clone(),
+                    );
+                    if !entry.1.contains(&key) {
+                        entry.1.push(key);
+                    }
+                }
+                // A delete without a sequence number is bound only when the
+                // data file has none either (every delete applies then); the
+                // index cannot express that — the per-set path can.
+                None => entry.2 = true,
+            }
+            entry.0.push(eq_set);
         }
         let mut out = Vec::with_capacity(groups.len());
-        for (fields, sets) in groups {
-            let sets = if sets.len() >= MERGE_SETS_FROM {
-                match self.merged_equality_set(&fields, &sets) {
-                    Some(merged) => vec![merged],
-                    None => sets.into_iter().map(|(_, s)| s).collect(),
+        for (fields, (sets, keys, unindexable)) in groups {
+            let indexed = match file_scan_task.sequence_number {
+                Some(data_seq) if !unindexable => {
+                    let state = self.state.read().unwrap();
+                    let indexes: Option<Vec<Arc<EqDeleteIndex>>> =
+                        keys.iter().map(|k| state.eq_indexes.get(k).cloned()).collect();
+                    indexes.map(|indexes| IndexedEqProbe { indexes, data_seq })
                 }
-            } else {
-                sets.into_iter().map(|(_, s)| s).collect()
+                _ => None,
             };
-            out.push(EqDeleteGroup { fields, sets });
+            out.push(EqDeleteGroup {
+                fields,
+                sets,
+                indexed,
+            });
         }
         Ok(out)
-    }
-
-    /// The union of `sets` (one field layout), built once per distinct set of
-    /// delete files and shared through the filter's cache. `None` when the
-    /// sets cannot be merged (mixed representations) — the caller then
-    /// probes them one by one, the old behaviour.
-    fn merged_equality_set(
-        &self,
-        fields: &[(String, i32)],
-        sets: &[(String, Arc<EqDeleteSet>)],
-    ) -> Option<Arc<EqDeleteSet>> {
-        let mut paths: Vec<String> = sets.iter().map(|(p, _)| p.clone()).collect();
-        paths.sort_unstable();
-        let key: MergedEqKey = (fields.to_vec(), paths);
-        if let Some(hit) = self.state.read().unwrap().merged_equality_sets.get(&key) {
-            return Some(hit.clone());
-        }
-        // Built outside the lock: a union of hundreds of sets takes seconds
-        // and must not block the other readers. A concurrent builder of the
-        // same key wins the insert below; the loser uses the winner's set.
-        let (_, first) = sets.first()?;
-        let mut merged = EqDeleteSet {
-            keys: first.keys.clone(),
-            fields: fields.to_vec(),
-        };
-        for (_, set) in &sets[1..] {
-            if merged.keys.merge_from(&set.keys).is_err() {
-                return None;
-            }
-        }
-        let merged = Arc::new(merged);
-        let mut state = self.state.write().unwrap();
-        if let Some(hit) = state.merged_equality_sets.get(&key) {
-            return Some(hit.clone());
-        }
-        if state.merged_equality_sets.len() >= MERGED_EQ_CACHE_MAX {
-            state.merged_equality_sets.clear();
-        }
-        state.merged_equality_sets.insert(key, merged.clone());
-        Some(merged)
     }
 
     pub(crate) fn upsert_delete_vector(
@@ -369,6 +478,7 @@ impl DeleteFilter {
         &self,
         delete_file_path: &str,
         eq_del: Receiver<Arc<EqDeleteSet>>,
+        fold: Option<EqFoldTarget>,
     ) {
         let notify = Arc::new(Notify::new());
         {
@@ -387,16 +497,34 @@ impl DeleteFilter {
             // `Loading` forever and parked every later waiter (the stranded
             // Loading state): clear the entry instead, so waiters observe
             // "missing" and a later task can retry the load.
-            let loaded = eq_del.await;
+            let loaded = eq_del.await.ok();
+            // Fold BEFORE publishing Loaded: a task awaits its own bound files,
+            // so once it sees Loaded every key of that file is in the index.
+            // The fold takes the state lock only to find the index; the keys
+            // go in under the index's own shard locks.
+            if let (Some(set), Some(target)) = (&loaded, fold) {
+                let index = {
+                    let mut st = state.write().unwrap();
+                    st.eq_indexes
+                        .entry((
+                            target.partition_spec_id,
+                            target.partition,
+                            set.fields.clone(),
+                        ))
+                        .or_insert_with(|| Arc::new(EqDeleteIndex::new()))
+                        .clone()
+                };
+                index.fold(set, target.sequence_number);
+            }
             {
                 let mut state = state.write().unwrap();
                 match loaded {
-                    Ok(eq_del) => {
+                    Some(eq_del) => {
                         state
                             .equality_deletes
                             .insert(delete_file_path, EqDelState::Loaded(eq_del));
                     }
-                    Err(_) => {
+                    None => {
                         state.equality_deletes.remove(&delete_file_path);
                     }
                 }
@@ -428,7 +556,7 @@ pub(crate) mod tests {
         CachingDeleteFileLoader, EqDeleteKey, EqDeleteKeys, EqDeleteSet,
     };
     use crate::io::FileIO;
-    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
+    use crate::spec::{DataFileFormat, Datum, Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
     type ArrowSchemaRef = Arc<ArrowSchema>;
 
@@ -486,7 +614,7 @@ pub(crate) mod tests {
         let path = "s3://bucket/eq-delete.parquet";
         assert!(filter.try_start_eq_del_load(path).is_some());
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete(path, receiver);
+        filter.insert_equality_delete(path, receiver, None);
         let waiter = {
             let filter = filter.clone();
             tokio::spawn(async move {
@@ -519,7 +647,7 @@ pub(crate) mod tests {
         let path = "s3://bucket/eq-delete-failed.parquet";
         assert!(filter.try_start_eq_del_load(path).is_some());
         let (sender, receiver) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
-        filter.insert_equality_delete(path, receiver);
+        filter.insert_equality_delete(path, receiver, None);
         let waiter = {
             let filter = filter.clone();
             tokio::spawn(async move {
@@ -541,73 +669,147 @@ pub(crate) mod tests {
         );
     }
 
-    // A task bound to many equality-delete files (same layout) gets ONE
-    // merged set; the merge is cached by the set of delete paths, and a task
-    // bound to fewer sets than the threshold keeps the per-set group.
-    #[tokio::test]
-    async fn test_many_bound_eq_delete_sets_are_merged_once_and_cached() {
-        let filter = DeleteFilter::new(Runtime::current());
-        let fields = vec![("id".to_string(), 1)];
-        let n = MERGE_SETS_FROM + 2;
-        let mut deletes = Vec::new();
-        for i in 0..n {
-            let path = format!("s3://bucket/eq-{i}.parquet");
-            assert!(filter.try_start_eq_del_load(&path).is_some());
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            filter.insert_equality_delete(&path, receiver);
-            sender
-                .send(Arc::new(EqDeleteSet {
-                    keys: EqDeleteKeys::SingleInt {
-                        keys: [i as i64 * 10].into_iter().collect(),
-                        contains_null: false,
-                    },
-                    fields: fields.clone(),
-                }))
-                .unwrap();
-            deletes.push(FileScanTaskDeleteFile {
-                file_path: path,
-                file_size_in_bytes: 1,
-                file_type: DataContentType::EqualityDeletes,
-                partition_spec_id: 0,
-                equality_ids: Some(vec![1]),
-                file_format: DataFileFormat::Parquet,
-                referenced_data_file: None,
-                content_offset: None,
-                content_size_in_bytes: None,
-                key_metadata: None,
-            });
-        }
-        for d in &deletes {
-            assert!(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    filter.get_equality_delete_set_for_delete_file_path(&d.file_path)
-                )
-                .await
-                .unwrap()
-                .is_some()
-            );
-        }
-        let tmp = TempDir::new().unwrap();
-        let mut task = setup(tmp.path()).into_iter().next().expect("a fixture task");
-        task.deletes = deletes;
-        let groups = filter.build_equality_delete_groups(&task).await.unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].sets.len(), 1, "merged into one set");
-        assert_eq!(groups[0].sets[0].keys.len(), n, "the union holds every key");
-        let again = filter.build_equality_delete_groups(&task).await.unwrap();
+    /// Load one synthetic equality-delete file into `filter` (keys on field
+    /// `id`), folded at `seq` into the scope `(spec_id, partition)`.
+    async fn load_eq_delete(
+        filter: &DeleteFilter,
+        path: &str,
+        keys: &[i64],
+        seq: i64,
+        spec_id: i32,
+        partition: Option<Struct>,
+    ) -> FileScanTaskDeleteFile {
+        assert!(filter.try_start_eq_del_load(path).is_some());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        filter.insert_equality_delete(
+            path,
+            receiver,
+            Some(EqFoldTarget {
+                sequence_number: seq,
+                partition_spec_id: spec_id,
+                partition: partition.clone(),
+            }),
+        );
+        sender
+            .send(Arc::new(EqDeleteSet {
+                keys: EqDeleteKeys::SingleInt {
+                    keys: keys.iter().copied().collect(),
+                    contains_null: false,
+                },
+                fields: vec![("id".to_string(), 1)],
+            }))
+            .unwrap();
         assert!(
-            Arc::ptr_eq(&groups[0].sets[0], &again[0].sets[0]),
-            "the merged set is served from the cache"
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                filter.get_equality_delete_set_for_delete_file_path(path)
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
-        let mut few = task.clone();
-        few.deletes.truncate(MERGE_SETS_FROM - 1);
-        let small = filter.build_equality_delete_groups(&few).await.unwrap();
-        assert_eq!(
-            small[0].sets.len(),
-            MERGE_SETS_FROM - 1,
-            "below the threshold: per-set probing"
+        FileScanTaskDeleteFile {
+            file_path: path.to_string(),
+            file_size_in_bytes: 1,
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: spec_id,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            key_metadata: None,
+            sequence_number: Some(seq),
+            partition,
+        }
+    }
+
+    fn data_task(
+        tmp: &Path,
+        seq: Option<i64>,
+        partition: Option<Struct>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+    ) -> FileScanTask {
+        let mut task = setup(tmp).into_iter().next().expect("a fixture task");
+        task.sequence_number = seq;
+        task.partition = partition;
+        task.deletes = deletes;
+        task
+    }
+
+    fn key(v: i64) -> EqDeleteKey {
+        EqDeleteKey(vec![Some(Datum::long(v))])
+    }
+
+    // (i) Partition scoping on a spec partitioned by a boolean: one pk in
+    // both partitions, a repair-style equality delete in the `true`
+    // partition at a sequence number above both files'. The `true` row
+    // dies; the `false` row survives (its task binds nothing — the index
+    // never binds a partitioned delete across partitions — so no group is
+    // built at all). The sequence rule: a file at or above the delete's
+    // sequence number keeps its row.
+    #[tokio::test]
+    async fn test_indexed_probe_scopes_partitioned_deletes_and_applies_the_seq_rule() {
+        let tmp = TempDir::new().unwrap();
+        let filter = DeleteFilter::new(Runtime::current());
+        let p_true = Some(Struct::from_iter([Some(Literal::bool(true))]));
+        let p_false = Some(Struct::from_iter([Some(Literal::bool(false))]));
+        let d = load_eq_delete(&filter, "s3://b/del-true.parquet", &[42], 10, 1, p_true.clone()).await;
+
+        let task_true = data_task(tmp.path(), Some(5), p_true.clone(), vec![d.clone()]);
+        let groups = filter.build_equality_delete_groups(&task_true).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        let probe = groups[0].indexed.as_ref().expect("indexed probe");
+        assert!(probe.deleted(&key(42)), "the true-partition row dies");
+        assert!(!probe.deleted(&key(43)), "an unrelated key survives");
+
+        let task_false = data_task(tmp.path(), Some(5), p_false, vec![]);
+        assert!(
+            filter.build_equality_delete_groups(&task_false).await.unwrap().is_empty(),
+            "the false-partition file binds nothing and keeps its row"
         );
+
+        let task_later = data_task(tmp.path(), Some(10), p_true, vec![d]);
+        let groups = filter.build_equality_delete_groups(&task_later).await.unwrap();
+        assert!(
+            !groups[0].indexed.as_ref().unwrap().deleted(&key(42)),
+            "a file at the delete's own sequence number keeps the row (strict >)"
+        );
+    }
+
+    // (ii) Two specs: a spec-0 unpartitioned data file plus spec-1
+    // partitioned files; one global delete and one partitioned delete. The
+    // spec-0 file honours only the global delete even though the
+    // partitioned delete's key sits in the filter's other index.
+    #[tokio::test]
+    async fn test_indexed_probe_consults_only_the_global_index_for_an_unpartitioned_file() {
+        let tmp = TempDir::new().unwrap();
+        let filter = DeleteFilter::new(Runtime::current());
+        let p_true = Some(Struct::from_iter([Some(Literal::bool(true))]));
+        let g = load_eq_delete(&filter, "s3://b/del-global.parquet", &[7], 10, 0, None).await;
+        let p = load_eq_delete(&filter, "s3://b/del-part.parquet", &[8], 10, 1, p_true.clone()).await;
+
+        let spec0 = data_task(tmp.path(), Some(5), None, vec![g.clone()]);
+        let probe0 = filter.build_equality_delete_groups(&spec0).await.unwrap().remove(0).indexed.unwrap();
+        assert!(probe0.deleted(&key(7)), "the global delete applies");
+        assert!(!probe0.deleted(&key(8)), "the partitioned delete does not reach a spec-0 file");
+
+        let spec1 = data_task(tmp.path(), Some(5), p_true, vec![g, p]);
+        let probe1 = filter.build_equality_delete_groups(&spec1).await.unwrap().remove(0).indexed.unwrap();
+        assert!(probe1.deleted(&key(7)) && probe1.deleted(&key(8)), "both apply in the partition");
+    }
+
+    // A task without a data sequence number falls back to the per-set path
+    // (every bound delete applies, which the index cannot express).
+    #[tokio::test]
+    async fn test_task_without_sequence_number_keeps_per_set_probing() {
+        let tmp = TempDir::new().unwrap();
+        let filter = DeleteFilter::new(Runtime::current());
+        let d = load_eq_delete(&filter, "s3://b/del-noseq.parquet", &[1], 10, 0, None).await;
+        let task = data_task(tmp.path(), None, None, vec![d]);
+        let groups = filter.build_equality_delete_groups(&task).await.unwrap();
+        assert!(groups[0].indexed.is_none());
+        assert_eq!(groups[0].sets.len(), 1);
     }
 
     #[tokio::test]

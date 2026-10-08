@@ -155,6 +155,13 @@ pub struct FileScanTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub row_selection_positions: Option<Arc<Vec<u64>>>,
+
+    /// The data file's data sequence number (its manifest entry), when
+    /// known. An equality delete applies to this file iff the delete's
+    /// sequence number is strictly greater (the delete index rule).
+    #[serde(default)]
+    #[builder(default)]
+    pub sequence_number: Option<i64>,
 }
 
 impl FileScanTask {
@@ -258,6 +265,11 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_referenced_data_file(ctx.manifest_entry.data_file().referenced_data_file())
             .with_content_offset(ctx.manifest_entry.data_file().content_offset())
             .with_content_size_in_bytes(ctx.manifest_entry.data_file().content_size_in_bytes())
+            .with_sequence_number(ctx.manifest_entry.sequence_number())
+            .with_partition({
+                let partition = ctx.manifest_entry.data_file().partition();
+                (!partition.fields().is_empty()).then(|| partition.clone())
+            })
             .with_key_metadata(
                 ctx.manifest_entry
                     .data_file
@@ -318,6 +330,22 @@ pub struct FileScanTaskDeleteFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub key_metadata: Option<Box<[u8]>>,
+
+    /// The delete file's data sequence number (its manifest entry), when
+    /// known. See `FileScanTask::sequence_number`.
+    #[serde(default)]
+    #[builder(default)]
+    pub sequence_number: Option<i64>,
+
+    /// The delete file's partition tuple; `None` for an unpartitioned
+    /// (global) delete. Scopes the equality-delete index: a partitioned
+    /// delete only ever applies to data files of its own partition.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_not_implemented")]
+    #[serde(deserialize_with = "deserialize_not_implemented")]
+    #[builder(default)]
+    pub partition: Option<Struct>,
 }
 
 #[cfg(test)]
