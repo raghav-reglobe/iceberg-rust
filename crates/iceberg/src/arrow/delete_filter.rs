@@ -679,8 +679,6 @@ pub(crate) mod tests {
         spec_id: i32,
         partition: Option<Struct>,
     ) -> FileScanTaskDeleteFile {
-                sequence_number: None,
-                partition: None,
         assert!(filter.try_start_eq_del_load(path).is_some());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(
@@ -734,7 +732,6 @@ pub(crate) mod tests {
         partition: Option<Struct>,
         deletes: Vec<FileScanTaskDeleteFile>,
     ) -> FileScanTask {
-            sequence_number: None,
         let mut task = setup(tmp).into_iter().next().expect("a fixture task");
         task.sequence_number = seq;
         task.partition = partition;
