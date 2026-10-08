@@ -105,6 +105,38 @@ impl EqDeleteKeys {
 
     /// Probe one key tuple. Union semantics across sets are the caller's
     /// job (`EqDeleteGroup`); this answers membership in ONE set.
+    /// Absorb every key of `other` into `self` (set union). Both sides must
+    /// use the same representation — a group of equality-delete files that
+    /// share one field layout always does, since the representation is
+    /// chosen from the field type — otherwise the caller keeps probing the
+    /// sets one by one.
+    pub(crate) fn merge_from(&mut self, other: &EqDeleteKeys) -> Result<()> {
+        match (self, other) {
+            (Self::Generic(keys), Self::Generic(other_keys)) => {
+                keys.extend(other_keys.iter().cloned());
+                Ok(())
+            }
+            (
+                Self::SingleInt {
+                    keys,
+                    contains_null,
+                },
+                Self::SingleInt {
+                    keys: other_keys,
+                    contains_null: other_null,
+                },
+            ) => {
+                keys.extend(other_keys.iter().copied());
+                *contains_null |= *other_null;
+                Ok(())
+            }
+            _ => Err(Error::new(
+                ErrorKind::Unexpected,
+                "cannot merge equality delete sets of different representations",
+            )),
+        }
+    }
+
     pub(crate) fn contains_tuple(&self, key: &EqDeleteKey) -> bool {
         match self {
             Self::Generic(keys) => keys.contains(key),
@@ -1968,5 +2000,41 @@ mod tests {
         // Verify that the delete vectors point to the same memory location,
         // confirming that the second load reused the result from the first.
         assert!(Arc::ptr_eq(&dv1, &dv2));
+    }
+
+    #[test]
+    fn eq_delete_keys_merge_from_unions_single_int_sets() {
+        use super::{EqDeleteKey, EqDeleteKeys};
+        use crate::spec::Datum;
+        let mut a = EqDeleteKeys::SingleInt {
+            keys: [1i64, 2].into_iter().collect(),
+            contains_null: false,
+        };
+        let b = EqDeleteKeys::SingleInt {
+            keys: [2i64, 3].into_iter().collect(),
+            contains_null: true,
+        };
+        a.merge_from(&b).unwrap();
+        assert_eq!(a.len(), 4, "{{1,2,3}} plus the null marker");
+        let k = |v: i64| EqDeleteKey(vec![Some(Datum::long(v))]);
+        assert!(a.contains_tuple(&k(1)) && a.contains_tuple(&k(3)));
+        assert!(!a.contains_tuple(&k(4)));
+        assert!(a.contains_tuple(&EqDeleteKey(vec![None])), "null absorbed");
+    }
+
+    #[test]
+    fn eq_delete_keys_merge_from_unions_generic_sets_and_refuses_mixed() {
+        use super::{EqDeleteKey, EqDeleteKeys};
+        use crate::spec::Datum;
+        let key = |v: &str| EqDeleteKey(vec![Some(Datum::string(v))]);
+        let mut a = EqDeleteKeys::Generic([key("x")].into_iter().collect());
+        let b = EqDeleteKeys::Generic([key("y")].into_iter().collect());
+        a.merge_from(&b).unwrap();
+        assert!(a.contains_tuple(&key("x")) && a.contains_tuple(&key("y")));
+        let single = EqDeleteKeys::SingleInt {
+            keys: [1i64].into_iter().collect(),
+            contains_null: false,
+        };
+        assert!(a.merge_from(&single).is_err(), "mixed representations are refused");
     }
 }

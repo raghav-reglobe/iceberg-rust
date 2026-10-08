@@ -37,8 +37,12 @@ enum EqDelState {
 
 /// A group of equality delete sets sharing one field layout, probed
 /// sequentially at read time. Rows are removed when their key is in ANY of
-/// the sets — identical semantics to the union of the sets, without ever
-/// materializing that union (see `build_equality_delete_groups`).
+/// the sets — identical semantics to the union of the sets. From
+/// `MERGE_SETS_FROM` bound sets on, the union IS materialized, once per
+/// distinct set of delete files and shared through the filter's cache (see
+/// `build_equality_delete_groups`): probing N sets per row made a task bound
+/// to ~1,700 equality-delete files cost N hash probes per row — hours for a
+/// few million rows — where one merged set costs one.
 #[derive(Debug, Clone)]
 pub(crate) struct EqDeleteGroup {
     /// Ordered `(field_name, field_id)` — identical across `sets`.
@@ -71,11 +75,24 @@ enum PosDelState {
 /// (Parquet pos-del stream), which keeps path-level identity.
 type PosDelKey = (String, Option<u64>);
 
+/// Identity of one merged equality-delete set: the field layout plus the
+/// sorted paths of the delete files it unions.
+type MergedEqKey = (Vec<(String, i32)>, Vec<String>);
+
+/// Bound sets per field layout from which a task's group materializes the
+/// union instead of probing each set per row.
+pub(crate) const MERGE_SETS_FROM: usize = 8;
+
+/// Distinct merged sets kept per filter; beyond this the cache is dropped
+/// (each merged set can be the size of every delete file it unions).
+const MERGED_EQ_CACHE_MAX: usize = 16;
+
 #[derive(Debug, Default)]
 struct DeleteFileFilterState {
     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
     equality_deletes: HashMap<String, EqDelState>,
     positional_deletes: HashMap<PosDelKey, PosDelState>,
+    merged_equality_sets: HashMap<MergedEqKey, Arc<EqDeleteSet>>,
 }
 
 #[derive(Clone, Debug)]
@@ -251,13 +268,12 @@ impl DeleteFilter {
         // Collect all applicable equality delete sets, reusing cached Arcs.
         // Group by field layout so batch key columns are converted once per
         // layout at probe time.
-        let mut groups: HashMap<Vec<(String, i32)>, Vec<Arc<EqDeleteSet>>> = HashMap::new();
-
+        let mut groups: HashMap<Vec<(String, i32)>, Vec<(String, Arc<EqDeleteSet>)>> =
+            HashMap::new();
         for delete in &file_scan_task.deletes {
             if !is_equality_delete(delete) {
                 continue;
             }
-
             let Some(eq_set) = self
                 .get_equality_delete_set_for_delete_file_path(&delete.file_path)
                 .await
@@ -270,19 +286,66 @@ impl DeleteFilter {
                     ),
                 ));
             };
-
             if !eq_set.is_empty() {
                 groups
                     .entry(eq_set.fields.clone())
                     .or_default()
-                    .push(eq_set);
+                    .push((delete.file_path.clone(), eq_set));
             }
         }
+        let mut out = Vec::with_capacity(groups.len());
+        for (fields, sets) in groups {
+            let sets = if sets.len() >= MERGE_SETS_FROM {
+                match self.merged_equality_set(&fields, &sets) {
+                    Some(merged) => vec![merged],
+                    None => sets.into_iter().map(|(_, s)| s).collect(),
+                }
+            } else {
+                sets.into_iter().map(|(_, s)| s).collect()
+            };
+            out.push(EqDeleteGroup { fields, sets });
+        }
+        Ok(out)
+    }
 
-        Ok(groups
-            .into_iter()
-            .map(|(fields, sets)| EqDeleteGroup { fields, sets })
-            .collect())
+    /// The union of `sets` (one field layout), built once per distinct set of
+    /// delete files and shared through the filter's cache. `None` when the
+    /// sets cannot be merged (mixed representations) — the caller then
+    /// probes them one by one, the old behaviour.
+    fn merged_equality_set(
+        &self,
+        fields: &[(String, i32)],
+        sets: &[(String, Arc<EqDeleteSet>)],
+    ) -> Option<Arc<EqDeleteSet>> {
+        let mut paths: Vec<String> = sets.iter().map(|(p, _)| p.clone()).collect();
+        paths.sort_unstable();
+        let key: MergedEqKey = (fields.to_vec(), paths);
+        if let Some(hit) = self.state.read().unwrap().merged_equality_sets.get(&key) {
+            return Some(hit.clone());
+        }
+        // Built outside the lock: a union of hundreds of sets takes seconds
+        // and must not block the other readers. A concurrent builder of the
+        // same key wins the insert below; the loser uses the winner's set.
+        let (_, first) = sets.first()?;
+        let mut merged = EqDeleteSet {
+            keys: first.keys.clone(),
+            fields: fields.to_vec(),
+        };
+        for (_, set) in &sets[1..] {
+            if merged.keys.merge_from(&set.keys).is_err() {
+                return None;
+            }
+        }
+        let merged = Arc::new(merged);
+        let mut state = self.state.write().unwrap();
+        if let Some(hit) = state.merged_equality_sets.get(&key) {
+            return Some(hit.clone());
+        }
+        if state.merged_equality_sets.len() >= MERGED_EQ_CACHE_MAX {
+            state.merged_equality_sets.clear();
+        }
+        state.merged_equality_sets.insert(key, merged.clone());
+        Some(merged)
     }
 
     pub(crate) fn upsert_delete_vector(
@@ -475,6 +538,75 @@ pub(crate) mod tests {
         assert!(
             filter.try_start_eq_del_load(path).is_some(),
             "the failed entry is cleared so the load can be retried"
+        );
+    }
+
+    // A task bound to many equality-delete files (same layout) gets ONE
+    // merged set; the merge is cached by the set of delete paths, and a task
+    // bound to fewer sets than the threshold keeps the per-set group.
+    #[tokio::test]
+    async fn test_many_bound_eq_delete_sets_are_merged_once_and_cached() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let fields = vec![("id".to_string(), 1)];
+        let n = MERGE_SETS_FROM + 2;
+        let mut deletes = Vec::new();
+        for i in 0..n {
+            let path = format!("s3://bucket/eq-{i}.parquet");
+            assert!(filter.try_start_eq_del_load(&path).is_some());
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            filter.insert_equality_delete(&path, receiver);
+            sender
+                .send(Arc::new(EqDeleteSet {
+                    keys: EqDeleteKeys::SingleInt {
+                        keys: [i as i64 * 10].into_iter().collect(),
+                        contains_null: false,
+                    },
+                    fields: fields.clone(),
+                }))
+                .unwrap();
+            deletes.push(FileScanTaskDeleteFile {
+                file_path: path,
+                file_size_in_bytes: 1,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+                file_format: DataFileFormat::Parquet,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                key_metadata: None,
+            });
+        }
+        for d in &deletes {
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    filter.get_equality_delete_set_for_delete_file_path(&d.file_path)
+                )
+                .await
+                .unwrap()
+                .is_some()
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut task = setup(tmp.path()).into_iter().next().expect("a fixture task");
+        task.deletes = deletes;
+        let groups = filter.build_equality_delete_groups(&task).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].sets.len(), 1, "merged into one set");
+        assert_eq!(groups[0].sets[0].keys.len(), n, "the union holds every key");
+        let again = filter.build_equality_delete_groups(&task).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&groups[0].sets[0], &again[0].sets[0]),
+            "the merged set is served from the cache"
+        );
+        let mut few = task.clone();
+        few.deletes.truncate(MERGE_SETS_FROM - 1);
+        let small = filter.build_equality_delete_groups(&few).await.unwrap();
+        assert_eq!(
+            small[0].sets.len(),
+            MERGE_SETS_FROM - 1,
+            "below the threshold: per-set probing"
         );
     }
 
