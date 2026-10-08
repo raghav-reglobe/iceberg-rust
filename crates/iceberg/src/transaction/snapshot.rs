@@ -367,6 +367,22 @@ impl<'a> SnapshotProducer<'a> {
 
         let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
 
+        // Nothing removed → nothing to rewrite: every live manifest is carried
+        // forward untouched WITHOUT being loaded. A pure add (a streaming
+        // append, a row delta that only adds data + delete files) never
+        // changes an existing manifest, and loading each one just to find no
+        // removed path was O(manifests) sequential object reads on EVERY
+        // commit — measured 2026-10-08: ~2,900 manifests / ~70 s of a 110-s
+        // upsert cycle on a 1,372-snapshot table.
+        if removed_data_files.is_empty() && removed_delete_files.is_empty() {
+            return Ok(manifest_list
+                .entries()
+                .iter()
+                .filter(|m| m.has_added_files() || m.has_existing_files())
+                .cloned()
+                .collect());
+        }
+
         let removed_data_paths: HashSet<&str> =
             removed_data_files.iter().map(|f| f.file_path()).collect();
         let removed_delete_paths: HashSet<&str> =

@@ -631,6 +631,61 @@ mod tests {
         table_with_snapshot(table, snap).await
     }
 
+
+    #[tokio::test]
+    async fn test_row_delta_without_removals_carries_parent_manifests_forward() {
+        // A row delta that only ADDS carries every live manifest of the parent
+        // snapshot forward BY REFERENCE (same manifest paths): nothing is
+        // rewritten and, by construction of
+        // `SnapshotProducer::rewrite_existing_manifests_removing`, nothing is
+        // loaded — the pre-fix path loaded every manifest to look for removed
+        // files it could not have (O(manifests) reads per commit).
+        let base = make_v2_minimal_table();
+        let t1 = append_snapshot(&base, &["test/a.parquet"]).await;
+        let t2 = append_snapshot(&t1, &["test/b.parquet"]).await;
+        let parent = t2.metadata().current_snapshot().unwrap().clone();
+        let parent_manifests: Vec<String> = t2
+            .manifest_list_reader(&parent)
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        assert_eq!(parent_manifests.len(), 2);
+
+        let mut c = Arc::new(
+            Transaction::new(&t2)
+                .row_delta()
+                .add_data_files(vec![make_data_file(&t2, "test/c.parquet", 100)]),
+        )
+        .commit(&t2)
+        .await
+        .unwrap();
+        let updates = c.take_updates();
+        let snap = if let TableUpdate::AddSnapshot { ref snapshot } = updates[0] {
+            snapshot.clone()
+        } else {
+            panic!("expected AddSnapshot");
+        };
+        let new_manifests: Vec<String> = t2
+            .manifest_list_reader(&Arc::new(snap))
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        assert_eq!(new_manifests.len(), 3, "two carried forward + one added");
+        for path in &parent_manifests {
+            assert!(
+                new_manifests.contains(path),
+                "parent manifest {path} must be carried forward by reference"
+            );
+        }
+    }
     #[tokio::test]
     async fn test_serializable_conflicts_on_concurrent_append_from_empty_base() {
         // Planned against an empty table; a concurrent append landed first.
