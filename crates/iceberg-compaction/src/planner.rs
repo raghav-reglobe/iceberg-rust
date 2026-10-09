@@ -1,7 +1,8 @@
 //! Compaction planner — mirrors iceberg-go's `Config.PlanCompaction`: group scan
 //! tasks by partition, classify each as candidate (undersized or delete-pressure)
 //! or skipped (optimal / oversized-without-deletes), bin-pack candidates to
-//! `target_file_size_bytes`, and drop bins below `min_input_files` — and, beyond
+//! `target_file_size_bytes`, and drop bins below `min_input_files` unless they
+//! carry delete pressure (the floor bounds FOLDING, never REABSORBING) — and, beyond
 //! iceberg-go, a lone file whose rewrite would remove nothing (iceberg-java's
 //! `group.size() > 1` rule; see `is_noop_bin`).
 
@@ -119,6 +120,21 @@ fn is_noop_bin(files: usize, bound_deletes: usize, cfg: &Config) -> bool {
     files == 1 && bound_deletes == 0 && !cfg.rewrite_all
 }
 
+/// `min_input_files` is a write-amplification floor for FOLDING (several
+/// small files into fewer); it must never stop REABSORBING. A bin that carries
+/// delete pressure (>= `delete_file_threshold` bound delete files) is planned
+/// however few files it holds — iceberg-java's rule (`anyTaskHasTooManyDeletes`
+/// rewrites the group regardless of `min-input-files`). Without this the
+/// delete-heavy file that bin-packs ALONE at target size — the exact file
+/// `is_candidate` admits "any size" — was dropped by the floor before
+/// [`is_noop_bin`] ever saw it, so `delete_file_threshold = 1` could not
+/// reabsorb it unless the caller also passed `min_input_files = 1` (observed
+/// on a bronze table carrying ~1,900 equality-delete files per 128 MB data
+/// file: 0 deletes reabsorbed at `min_input_files = 2`).
+fn below_input_floor(files: usize, bound_deletes: usize, cfg: &Config) -> bool {
+    files < cfg.min_input_files && bound_deletes < cfg.delete_file_threshold.max(1)
+}
+
 /// Call-site policy: `rewrite_all` bypasses candidacy (Spark `rewrite-all`
 /// parity); otherwise the iceberg-go candidate rules apply.
 fn should_rewrite(size: u64, delete_count: usize, cfg: &Config) -> bool {
@@ -188,17 +204,18 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
 
     let target = cfg.target_file_size_bytes.max(1);
     for (key, candidates) in buckets {
-        if candidates.len() < cfg.min_input_files {
-            plan.skipped_files += candidates.len(); // too few to justify a rewrite
+        let bucket_deletes: usize = candidates.iter().map(|t| t.deletes.len()).sum();
+        if below_input_floor(candidates.len(), bucket_deletes, cfg) {
+            plan.skipped_files += candidates.len(); // too few to fold, nothing to reabsorb
             continue;
         }
         for bin in bin_pack(candidates, target, |t| t.file_size_in_bytes) {
-            if bin.len() < cfg.min_input_files {
+            let delete_file_count: usize = bin.iter().map(|t| t.deletes.len()).sum();
+            if below_input_floor(bin.len(), delete_file_count, cfg) {
                 plan.skipped_files += bin.len();
                 continue;
             }
             let total_size_bytes: u64 = bin.iter().map(|t| t.file_size_in_bytes).sum();
-            let delete_file_count: usize = bin.iter().map(|t| t.deletes.len()).sum();
             if is_noop_bin(bin.len(), delete_file_count, cfg) {
                 plan.skipped_files += 1; // nothing to fold, nothing to reabsorb
                 continue;
@@ -218,7 +235,8 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::{
-        Group, Plan, bin_pack, is_candidate, is_noop_bin, objects_removed, should_rewrite,
+        Group, Plan, below_input_floor, bin_pack, is_candidate, is_noop_bin, objects_removed,
+        should_rewrite,
     };
     use crate::config::Config;
 
@@ -246,6 +264,38 @@ mod tests {
             ..aggressive
         };
         assert!(!is_noop_bin(1, 0, &all), "rewrite_all means every file");
+    }
+
+    // --- the input floor bounds folding, never reabsorbing ---
+
+    #[test]
+    fn input_floor_yields_to_delete_pressure() {
+        let cfg = Config {
+            min_input_files: 2,
+            delete_file_threshold: 1,
+            ..Config::default()
+        };
+        // a lone delete-free file: below the floor (and a noop besides)
+        assert!(below_input_floor(1, 0, &cfg));
+        // a lone file with ONE bound delete at threshold 1: planned —
+        // reabsorbing it is the point of delete_file_threshold = 1
+        assert!(!below_input_floor(1, 1, &cfg));
+        // two files always clear a floor of 2
+        assert!(!below_input_floor(2, 0, &cfg));
+        // a higher threshold keeps the floor for small delete counts
+        let high = Config {
+            delete_file_threshold: 1000,
+            ..cfg.clone()
+        };
+        assert!(below_input_floor(1, 999, &high));
+        assert!(!below_input_floor(1, 1000, &high));
+        // threshold 0 never makes every bin exempt
+        let zero = Config {
+            delete_file_threshold: 0,
+            ..cfg
+        };
+        assert!(below_input_floor(1, 0, &zero));
+        assert!(!below_input_floor(1, 1, &zero));
     }
 
     // --- execution order: most read cost removed first ---
