@@ -30,7 +30,10 @@
 //! end (delete the source, rename the target onto its name, one metadata
 //! commit through `UpdateSchemaAction::rename_column`), so a rollback at any
 //! point before that is a snapshot rollback and nothing is ever unreadable. No
-//! delete files are written. The base snapshot's summary properties that start
+//! delete files are written. A delete file the scan binds to a live data file refuses
+//! the table (rewriting its data files would leave it dangling or lose its rows); a
+//! delete file bound to NO live data file — every file it applied to was already
+//! rewritten under a higher sequence number — is removed in the same commit. The base snapshot's summary properties that start
 //! with `carry_summary_prefix` are copied onto the new snapshot (a producer's
 //! offsets-in-snapshot ledger keeps its home when older snapshots expire).
 //!
@@ -48,7 +51,7 @@
 //!
 //! MySQL `TIME` spans -838:59:59 .. 838:59:59; a parsed value outside that range is refused too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -343,6 +346,8 @@ pub struct RewriteOutcome {
     pub files_added: usize,
     /// 0 (unpartitioned) or 1 (one identity partition field).
     pub partition_fields: usize,
+    /// Delete files bound to no live data file, removed with the rewrite.
+    pub delete_files_removed: usize,
     /// How many values of each spelling the rewrite met.
     pub counts: ShapeCounts,
 }
@@ -451,9 +456,11 @@ pub async fn rewrite_time_columns(
         .get("total-records")
         .and_then(|v| v.parse::<u64>().ok());
 
-    // Every live data file of the base snapshot is replaced; delete files are not expected.
+    // Every live data file of the base snapshot is replaced. A delete file the scan
+    // binds to a live data file refuses the table; one bound to nothing is removed.
     let manifest_list = table.manifest_list_reader(&snapshot).load().await?;
     let mut old_files: Vec<DataFile> = Vec::new();
+    let mut delete_files: Vec<DataFile> = Vec::new();
     for manifest_file in manifest_list.entries() {
         let manifest = manifest_file.load_manifest(table.file_io()).await?;
         for entry in manifest.entries() {
@@ -462,13 +469,28 @@ pub async fn rewrite_time_columns(
             }
             match entry.content_type() {
                 DataContentType::Data => old_files.push(entry.data_file().clone()),
-                other => {
-                    return Err(Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!("{ident}: snapshot {s0} carries a {other:?} file — the rewrite expects a table without delete files"),
-                    ));
-                }
+                _ => delete_files.push(entry.data_file().clone()),
             }
+        }
+    }
+    let scan = table.scan().snapshot_id(s0).select_all().build()?;
+    if !delete_files.is_empty() {
+        let mut bound: HashSet<String> = HashSet::new();
+        let mut tasks = scan.plan_files().await?;
+        while let Some(task) = tasks.try_next().await? {
+            for d in &task.deletes {
+                bound.insert(d.file_path.clone());
+            }
+        }
+        if let Some(d) = delete_files.iter().find(|d| bound.contains(d.file_path())) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "{ident}: snapshot {s0} carries a {:?} file bound to live data ({}) — reabsorb it first",
+                    d.content_type(),
+                    d.file_path()
+                ),
+            ));
         }
     }
     let mut outcome = RewriteOutcome {
@@ -476,6 +498,7 @@ pub async fn rewrite_time_columns(
         records_before,
         files_deleted: old_files.len(),
         partition_fields: spec.fields().len(),
+        delete_files_removed: delete_files.len(),
         ..Default::default()
     };
     if old_files.is_empty() {
@@ -486,7 +509,6 @@ pub async fn rewrite_time_columns(
     let run = Uuid::now_v7();
     // one writer per partition key (a Vec: ≤ a handful of keys on an identity partition)
     let mut writers: Vec<(String, _)> = Vec::new();
-    let scan = table.scan().snapshot_id(s0).select_all().build()?;
     let mut stream = scan.to_arrow().await?;
     while let Some(batch) = stream.try_next().await? {
         if batch.num_rows() == 0 {
@@ -616,6 +638,7 @@ pub async fn rewrite_time_columns(
     let table = tx
         .rewrite_files()
         .delete_data_files(old_files)
+        .delete_delete_files(delete_files)
         .add_data_files(new_files)
         .validate_from_snapshot(s0)
         .set_snapshot_properties(props)
@@ -1017,6 +1040,65 @@ mod tests {
         assert_ne!(again.snapshot_after, Some(s1));
         let table = catalog.load_table(&ident).await.unwrap();
         assert_eq!(read_longs(&table, "t__us").await, vec![Some(us(10, 0, 0)), Some(us(10, 0, 0))]);
+    }
+
+    /// A pk-only equality-delete file for `ids` through the crate's own writer.
+    async fn write_eq_delete(table: &Table, ids: &[i64]) -> DataFile {
+        use crate::writer::base_writer::equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig};
+        let pk_id = table.metadata().current_schema().field_id_by_name("id").unwrap();
+        let config = EqualityDeleteWriterConfig::new(vec![pk_id], table.metadata().current_schema().clone()).unwrap();
+        let delete_schema = Arc::new(crate::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap());
+        let batch = RecordBatch::try_new(config.projected_arrow_schema_ref().clone(), vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef]).unwrap();
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(writer_properties(table), delete_schema),
+            table.file_io().clone(),
+            DefaultLocationGenerator::new(table.metadata()).unwrap(),
+            DefaultFileNameGenerator::new("eqdel".to_string(), None, DataFileFormat::Parquet),
+        );
+        let mut w = EqualityDeleteFileWriterBuilder::new(rolling, config).build(None).await.unwrap();
+        w.write(batch).await.unwrap();
+        w.close().await.unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bound_delete_file_refuses_and_a_dangling_one_is_removed_with_the_rewrite() {
+        let (_wh, catalog, ident, table) = setup().await;
+        let f1 = write_strings(&table, "f1", vec![Some("10:00:00"), Some("36000000")], vec![Some("1:00:00"), None]).await;
+        let table = append(catalog.as_ref(), &table, f1.clone(), HashMap::new()).await;
+        // an equality delete on id=2, committed after the data file: the scan binds it to f1
+        let del = write_eq_delete(&table, &[2]).await;
+        let tx = Transaction::new(&table);
+        let table = tx.row_delta().add_delete_files(vec![del]).apply(tx).unwrap().commit(catalog.as_ref()).await.unwrap();
+        let s_bound = table.metadata().current_snapshot_id().unwrap();
+        add_long_targets(catalog.as_ref(), &table, &[("t", "t__us")]).await;
+        let res = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s_bound), false, HashMap::new(), None).await;
+        assert!(res.is_err(), "a delete file bound to live data refuses the table");
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().current_snapshot_id(), Some(s_bound), "nothing committed");
+        // replace f1 by an identical file under a higher sequence number: the delete now binds to nothing
+        let f1b = write_strings(&table, "f1b", vec![Some("10:00:00"), Some("36000000")], vec![Some("1:00:00"), None]).await;
+        let tx = Transaction::new(&table);
+        let table = tx.rewrite_files().delete_data_files(vec![f1]).add_data_files(vec![f1b]).apply(tx).unwrap().commit(catalog.as_ref()).await.unwrap();
+        let s_dangling = table.metadata().current_snapshot_id().unwrap();
+        let out = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s_dangling), false, HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(out.delete_files_removed, 1);
+        assert_eq!(out.rows, 2, "the dangling delete removed nothing");
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_longs(&table, "t__us").await, vec![Some(us(10, 0, 0)), Some(us(10, 0, 0))]);
+        let snapshot = table.metadata().current_snapshot().unwrap().clone();
+        let ml = table.manifest_list_reader(&snapshot).load().await.unwrap();
+        let mut live_deletes = 0;
+        for mf in ml.entries() {
+            let m = mf.load_manifest(table.file_io()).await.unwrap();
+            for e in m.entries() {
+                if e.status() != ManifestStatus::Deleted && e.content_type() != DataContentType::Data {
+                    live_deletes += 1;
+                }
+            }
+        }
+        assert_eq!(live_deletes, 0, "the dangling delete file is gone from the live manifests");
     }
 
     #[tokio::test]

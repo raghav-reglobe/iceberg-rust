@@ -113,6 +113,7 @@ fn rewrite_time_columns(
                 ("partition_fields".to_string(), out.partition_fields.to_string()),
                 ("files_deleted".to_string(), out.files_deleted.to_string()),
                 ("files_added".to_string(), out.files_added.to_string()),
+                ("delete_files_removed".to_string(), out.delete_files_removed.to_string()),
                 ("digits".to_string(), out.counts.digits.to_string()),
                 ("dated".to_string(), out.counts.dated.to_string()),
                 ("clock".to_string(), out.counts.clock.to_string()),
