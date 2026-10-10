@@ -109,6 +109,8 @@ fn rewrite_time_columns(
                     out.snapshot_after.map(|s| s.to_string()).unwrap_or_default(),
                 ),
                 ("rows".to_string(), out.rows.to_string()),
+                ("records_before".to_string(), out.records_before.map(|n| n.to_string()).unwrap_or_default()),
+                ("partition_fields".to_string(), out.partition_fields.to_string()),
                 ("files_deleted".to_string(), out.files_deleted.to_string()),
                 ("files_added".to_string(), out.files_added.to_string()),
                 ("digits".to_string(), out.counts.digits.to_string()),

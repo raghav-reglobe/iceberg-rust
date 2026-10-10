@@ -370,6 +370,85 @@ fn schema_of(
         .map_err(|e| format!("schema of snapshot {snapshot_id}: {e}"))
 }
 
+/// One snapshot's record as JSON — the current snapshot, or `snapshot_id`
+/// when given: `{"snapshot-id", "sequence-number", "timestamp-ms",
+/// "schema-id", "summary": {"operation", ...the summary's properties}}`.
+/// `None` when the table has no snapshot; a `snapshot_id` the metadata does
+/// not hold (unknown or expired) is an error. One loadTable, no manifest IO —
+/// the reader for a tool that gates on `total-records` or on a producer's
+/// summary keys without a Python metadata library.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, snapshot_id=None))]
+fn snapshot_summary_json(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    snapshot_id: Option<i64>,
+) -> PyResult<Option<String>> {
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            let metadata = t.metadata();
+            let snapshot = match snapshot_id {
+                None => metadata.current_snapshot().cloned(),
+                Some(id) => Some(metadata.snapshot_by_id(id).cloned().ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "{fqn}: snapshot {id} is not in the table's metadata (unknown or expired)"
+                    ))
+                })?),
+            };
+            let Some(s) = snapshot else {
+                return Ok(None);
+            };
+            let summary = serde_json::to_value(s.summary())
+                .map_err(|e| PyValueError::new_err(format!("serializing summary: {e}")))?;
+            let doc = serde_json::json!({
+                "snapshot-id": s.snapshot_id(),
+                "sequence-number": s.sequence_number(),
+                "timestamp-ms": s.timestamp_ms(),
+                "schema-id": s.schema_id(),
+                "summary": summary,
+            });
+            serde_json::to_string(&doc)
+                .map(Some)
+                .map_err(|e| PyValueError::new_err(format!("serializing snapshot: {e}")))
+        })
+    })
+}
+
+/// The table's DEFAULT partition spec as JSON (`{"spec-id", "fields": [{"source-id",
+/// "field-id", "name", "transform"}]}`) — the document `create_table(partition_spec_json=)`
+/// accepts, so a twin of a table can be created with the same partitioning without a
+/// Python metadata library.
+#[pyfunction]
+fn table_partition_spec_json(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+) -> PyResult<String> {
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            serde_json::to_string(t.metadata().default_partition_spec().as_ref())
+                .map_err(|e| PyValueError::new_err(format!("serializing partition spec: {e}")))
+        })
+    })
+}
+
 /// Drop a table (metadata-only — never a purge; orphaned files are the
 /// maintenance sweep's job).
 #[pyfunction]
@@ -428,12 +507,13 @@ fn table_properties(
 /// preserves their physical layout byte-for-byte, which no engine rewrite
 /// can do.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, files_json))]
+#[pyo3(signature = (catalog_props, fqn, files_json, snapshot_properties=None))]
 fn add_data_files(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
     fqn: String,
     files_json: String,
+    snapshot_properties: Option<HashMap<String, String>>,
 ) -> PyResult<i64> {
     use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, Type};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -555,6 +635,7 @@ fn add_data_files(
             let updated = tx
                 .fast_append()
                 .add_data_files(data_files)
+                .set_snapshot_properties(snapshot_properties.unwrap_or_default())
                 .apply(tx)
                 .map_err(|e| PyValueError::new_err(format!("fast_append: {e}")))?
                 .commit(catalog.as_ref())
@@ -578,6 +659,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(set_properties, &this)?)?;
     this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;
     this.add_function(wrap_pyfunction!(table_schema_json, &this)?)?;
+    this.add_function(wrap_pyfunction!(snapshot_summary_json, &this)?)?;
+    this.add_function(wrap_pyfunction!(table_partition_spec_json, &this)?)?;
     this.add_function(wrap_pyfunction!(drop_table, &this)?)?;
     this.add_function(wrap_pyfunction!(table_properties, &this)?)?;
     m.add_submodule(&this)?;
