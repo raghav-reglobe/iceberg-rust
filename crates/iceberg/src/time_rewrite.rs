@@ -801,14 +801,18 @@ mod tests {
         let arrow = Arc::new(schema_to_arrow_schema(&schema).unwrap());
         let n = t.len();
         let ids: Vec<i64> = (1..=n as i64).collect();
-        let batch = RecordBatch::try_new(arrow, vec![
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(ids)) as ArrayRef,
             // the crate maps `string` to 64-bit-offset LargeUtf8
             Arc::new(LargeStringArray::from(t)) as ArrayRef,
             Arc::new(LargeStringArray::from(k)) as ArrayRef,
             Arc::new(BooleanArray::from(vec![backfill; n])) as ArrayRef,
-        ])
-        .unwrap();
+        ];
+        // fields added to the schema after the base four (long targets) are written NULL
+        for f in arrow.fields().iter().skip(4) {
+            columns.push(arrow_array::new_null_array(f.data_type(), n));
+        }
+        let batch = RecordBatch::try_new(arrow, columns).unwrap();
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             ParquetWriterBuilder::new(writer_properties(table), schema),
             table.file_io().clone(),
@@ -1002,6 +1006,23 @@ mod tests {
         assert_eq!(after_ids, before_ids, "the rename keeps the field ids");
         assert_eq!(read_longs(&table, "t").await, t_want);
         assert_eq!(read_longs(&table, "k").await, k_want);
+        // the swap created no snapshot: the head still RECORDS the pre-swap schema — a reader that
+        // binds the snapshot's schema would see the string. An empty append ("touch") records the current one.
+        assert_ne!(table.metadata().current_snapshot().unwrap().schema_id(), Some(table.metadata().current_schema_id()));
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([("note".to_string(), "touch".to_string())]))
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+        let head = table.metadata().current_snapshot().unwrap().clone();
+        assert_ne!(head.snapshot_id(), s1);
+        assert_eq!(head.schema_id(), Some(table.metadata().current_schema_id()));
+        assert_eq!(head.summary().additional_properties.get("total-records").map(String::as_str), Some("5"));
+        assert_eq!(read_longs(&table, "t").await, t_want);
 
         // a second run finds no string source
         let again = rewrite_time_columns(catalog.as_ref(), &ident, &pairs(), None, true, HashMap::new(), None).await;

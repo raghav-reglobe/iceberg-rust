@@ -488,6 +488,48 @@ fn rollback_to_snapshot(
     })
 }
 
+/// Commit an EMPTY append: a new snapshot with the same files that records
+/// the table's CURRENT schema id. A schema change creates no snapshot, so a
+/// reader that binds the schema a snapshot recorded (a pinned read) keeps
+/// seeing the pre-change column set until a snapshot made after the change
+/// exists; this is that snapshot. `snapshot_properties` land on its summary.
+/// Returns the new snapshot id.
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, snapshot_properties=None))]
+fn touch_snapshot(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    snapshot_properties: Option<HashMap<String, String>>,
+) -> PyResult<i64> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            let tx = Transaction::new(&t);
+            let updated = tx
+                .fast_append()
+                .set_snapshot_properties(snapshot_properties.unwrap_or_default())
+                .apply(tx)
+                .map_err(|e| PyValueError::new_err(format!("touch {fqn}: {e}")))?
+                .commit(catalog.as_ref())
+                .await
+                .map_err(|e| PyValueError::new_err(format!("touch {fqn}: {e}")))?;
+            updated
+                .metadata()
+                .current_snapshot_id()
+                .ok_or_else(|| PyValueError::new_err("touch produced no snapshot".to_string()))
+        })
+    })
+}
+
 /// Drop a table (metadata-only — never a purge; orphaned files are the
 /// maintenance sweep's job).
 #[pyfunction]
@@ -701,6 +743,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(snapshot_summary_json, &this)?)?;
     this.add_function(wrap_pyfunction!(table_partition_spec_json, &this)?)?;
     this.add_function(wrap_pyfunction!(rollback_to_snapshot, &this)?)?;
+    this.add_function(wrap_pyfunction!(touch_snapshot, &this)?)?;
     this.add_function(wrap_pyfunction!(drop_table, &this)?)?;
     this.add_function(wrap_pyfunction!(table_properties, &this)?)?;
     m.add_submodule(&this)?;
