@@ -1413,7 +1413,7 @@ fn json_strings_to_variant(array: &ArrayRef, target: &Field) -> Result<ArrayRef>
 /// Writer properties honoring the table's `write.parquet.compression-codec`
 /// (defaulting to ZSTD, the iceberg convention — parquet-rs's own default is
 /// UNCOMPRESSED, which would silently inflate output ~20x).
-fn writer_properties(table: &Table) -> parquet::file::properties::WriterProperties {
+pub(crate) fn writer_properties(table: &Table) -> parquet::file::properties::WriterProperties {
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     let codec = table
         .metadata()

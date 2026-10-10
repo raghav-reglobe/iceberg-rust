@@ -28,6 +28,7 @@ mod merge;
 mod metadata;
 mod progress;
 mod replace;
+mod rewrite;
 mod runtime;
 mod schema;
 mod transform;
@@ -62,6 +63,7 @@ fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     compaction::register_module(py, m)?;
     merge::register_module(py, m)?;
     replace::register_module(py, m)?;
+    rewrite::register_module(py, m)?;
     catalog::register_module(py, m)?;
     variant_schema::register_module(py, m)?;
     schema::register_module(py, m)?;
