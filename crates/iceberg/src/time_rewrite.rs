@@ -602,7 +602,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, LargeStringArray, RecordBatch, StringArray};
     use futures::TryStreamExt;
     use tempfile::TempDir;
 
@@ -694,8 +694,9 @@ mod tests {
         let ids: Vec<i64> = (1..=n as i64).collect();
         let batch = RecordBatch::try_new(arrow, vec![
             Arc::new(Int64Array::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(t)) as ArrayRef,
-            Arc::new(StringArray::from(k)) as ArrayRef,
+            // the crate maps `string` to 64-bit-offset LargeUtf8
+            Arc::new(LargeStringArray::from(t)) as ArrayRef,
+            Arc::new(LargeStringArray::from(k)) as ArrayRef,
             Arc::new(BooleanArray::from(vec![backfill; n])) as ArrayRef,
         ])
         .unwrap();
@@ -816,7 +817,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(batch) = stream.try_next().await.unwrap() {
             let idx = batch.schema().index_of(col).unwrap();
-            let a = batch.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let a = batch.column(idx).as_any().downcast_ref::<LargeStringArray>().unwrap();
             out.extend(a.iter().map(|v| v.map(|x| x.to_string())));
         }
         out
