@@ -79,19 +79,28 @@ const MAX_ABS_US: i64 = (838 * 3600 + 59 * 60 + 59) * US_PER_SEC + 999_999;
 /// Which historical spelling a value carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeShape {
+    /// Milliseconds since midnight as digits, optionally signed.
     Digits,
+    /// A clock on the epoch date, `1970-01-01 H:MM:SS[.f]`.
     Dated,
+    /// A clock, `[-]H:MM:SS[.f]`, hours never wrapped.
     Clock,
+    /// Python's `timedelta` text, `[-]N day[s], H:MM:SS[.f]`.
     Days,
 }
 
 /// How many values of each spelling a rewrite met.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShapeCounts {
+    /// Values spelled as milliseconds since midnight.
     pub digits: u64,
+    /// Values spelled as a clock on the epoch date.
     pub dated: u64,
+    /// Values spelled as a plain clock.
     pub clock: u64,
+    /// Values spelled as `timedelta` text.
     pub days: u64,
+    /// NULL or empty values.
     pub nulls: u64,
 }
 
@@ -293,17 +302,22 @@ pub fn time_text_array_to_us(array: &ArrayRef) -> Result<(Int64Array, ShapeCount
 /// What a rewrite did.
 #[derive(Debug, Clone, Default)]
 pub struct RewriteOutcome {
+    /// The snapshot the rewrite read (and replaced).
     pub snapshot_before: i64,
     /// `None` on a dry run (nothing written, nothing committed).
     pub snapshot_after: Option<i64>,
+    /// Rows scanned (and, unless a dry run, rewritten).
     pub rows: u64,
     /// The base snapshot's `total-records`, when its summary carries it — the
     /// scan must meet it exactly before anything is committed.
     pub records_before: Option<u64>,
+    /// Live data files of the base snapshot, all replaced.
     pub files_deleted: usize,
+    /// Data files the rewrite wrote.
     pub files_added: usize,
     /// 0 (unpartitioned) or 1 (one identity partition field).
     pub partition_fields: usize,
+    /// How many values of each spelling the rewrite met.
     pub counts: ShapeCounts,
 }
 
