@@ -127,6 +127,7 @@ pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
     type_updates: Vec<(String, Type)>,
+    renames: Vec<(String, String)>,
 }
 
 impl UpdateSchemaAction {
@@ -136,6 +137,7 @@ impl UpdateSchemaAction {
             additions: Vec::new(),
             deletes: Vec::new(),
             type_updates: Vec::new(),
+            renames: Vec::new(),
         }
     }
 
@@ -167,6 +169,15 @@ impl UpdateSchemaAction {
     /// column, a nested path, or any non-promotion type change.
     pub fn update_column_type(mut self, name: impl ToString, new_type: Type) -> Self {
         self.type_updates.push((name.to_string(), new_type));
+        self
+    }
+
+    /// Rename a ROOT-level column. The field id is kept, so every data file keeps
+    /// resolving the column by id; only the name readers see changes. A rename may
+    /// share a commit with a delete of the name it moves onto (the "swap a typed
+    /// replacement under the original name" step of a column rewrite).
+    pub fn rename_column(mut self, name: impl ToString, new_name: impl ToString) -> Self {
+        self.renames.push((name.to_string(), new_name.to_string()));
         self
     }
 }
@@ -536,6 +547,43 @@ impl TransactionAction for UpdateSchemaAction {
             }
         }
 
+        // --- 4c. Rename ROOT-level survivors (ids kept; a deleted name may be reused) ---
+        for (name, new_name) in &self.renames {
+            let field = base_schema.field_by_name(name).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("Cannot rename missing column: {name}"),
+                )
+            })?;
+            if delete_ids.contains(&field.id) {
+                return Err(Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("Cannot rename a column deleted in the same commit: {name}"),
+                ));
+            }
+            if new_fields.iter().any(|f| f.name == *new_name && f.id != field.id) {
+                return Err(Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("Cannot rename {name} to {new_name}: a column with that name exists"),
+                ));
+            }
+            let mut applied = false;
+            for f in new_fields.iter_mut() {
+                if f.id == field.id {
+                    let mut updated = f.as_ref().clone();
+                    updated.name = new_name.clone();
+                    *f = Arc::new(updated);
+                    applied = true;
+                    break;
+                }
+            }
+            if !applied {
+                return Err(Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("Cannot rename non-root column: {name}"),
+                ));
+            }
+        }
         // --- 5. Build the new schema ---
         let schema = Schema::builder()
             .with_fields(new_fields)

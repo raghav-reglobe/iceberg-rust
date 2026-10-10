@@ -57,9 +57,11 @@ fn mysql_time_text_to_us(s: &str) -> PyResult<Option<i64>> {
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Rewrite `columns` of `table` (`catalog.namespace.table`) from their string
-/// spellings into signed microseconds, copy-on-write, in ONE replace snapshot.
-/// The schema must already carry each column as `long` (evolve first). With
+/// Fill each `(source, target)` pair of `table` (`catalog.namespace.table`) —
+/// `source` a string column of spellings, `target` an existing `long` column —
+/// with signed microseconds, copy-on-write, in ONE replace snapshot; the source
+/// is kept. Add the targets first (`schema.update_schema(add_columns=...)`); swap
+/// the names at the end (`drop_columns=[source], rename_columns=[(target, source)]`). With
 /// `dry_run` nothing is written or committed — the counts say what a run would
 /// meet, and an unknown spelling raises. `base_snapshot` pins the plan to the
 /// current snapshot; `carry_summary_prefix` copies the base snapshot's summary
@@ -70,7 +72,7 @@ fn rewrite_time_columns(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
     table: String,
-    columns: Vec<String>,
+    columns: Vec<(String, String)>,
     base_snapshot: Option<i64>,
     dry_run: bool,
     snapshot_properties: Option<HashMap<String, String>>,

@@ -80,7 +80,8 @@ fn parse_type(s: &str) -> PyResult<Type> {
 
 /// Evolve an existing Iceberg table's schema in ONE metadata-only commit:
 /// optionally add nullable columns (`add_columns` = list of `(name, type_keyword)`)
-/// and/or drop columns (`drop_columns`). Both happen in a single
+/// and/or drop columns (`drop_columns`) and/or rename root columns (`rename_columns` =
+/// list of `(name, new_name)`, ids kept; a rename may take a name dropped in the same call). All happen in a single
 /// `UpdateSchemaAction` -> `Transaction::commit`.
 ///
 /// VARIANT-SAFE: goes through the same iceberg-rust path that creates VARIANT
@@ -93,7 +94,7 @@ fn parse_type(s: &str) -> PyResult<Type> {
 /// `catalog.namespace.table`. Blocks until the commit lands; raises
 /// `ValueError` on failure. A no-op (both lists empty) returns immediately.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new(), update_columns=Vec::new()))]
+#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new(), update_columns=Vec::new(), rename_columns=Vec::new()))]
 fn update_schema(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -101,6 +102,7 @@ fn update_schema(
     add_columns: Vec<(String, String)>,
     drop_columns: Vec<String>,
     update_columns: Vec<(String, String)>,
+    rename_columns: Vec<(String, String)>,
 ) -> PyResult<()> {
     let parts: Vec<&str> = fqn.split('.').collect();
     if parts.len() < 3 {
@@ -115,7 +117,7 @@ fn update_schema(
         .map(|s| s.to_string())
         .collect();
 
-    if add_columns.is_empty() && drop_columns.is_empty() && update_columns.is_empty() {
+    if add_columns.is_empty() && drop_columns.is_empty() && update_columns.is_empty() && rename_columns.is_empty() {
         return Ok(());
     }
     // Parse types up-front so a bad keyword errors before we touch the catalog.
@@ -171,6 +173,9 @@ fn update_schema(
             }
             for (name, ty) in updates {
                 action = action.update_column_type(name, ty);
+            }
+            for (name, new_name) in rename_columns {
+                action = action.rename_column(name, new_name);
             }
             let tx = action
                 .apply(tx)

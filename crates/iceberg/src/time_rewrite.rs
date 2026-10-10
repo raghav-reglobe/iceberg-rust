@@ -22,14 +22,17 @@
 //! backfill that wrote Python's `timedelta` text) wrote the same column their
 //! own way.
 //!
-//! The caller first evolves the table's schema (delete the string column, add a
-//! `long` column under the same name); this module then reads the base snapshot
-//! under ITS schema (the string is still physically there), converts, writes new
-//! data files under the current schema and commits a single `Replace` snapshot
-//! that removes every old data file. No delete files are written. The base
-//! snapshot's summary properties that start with `carry_summary_prefix` are
-//! copied onto the new snapshot (a producer's offsets-in-snapshot ledger keeps
-//! its home when older snapshots expire).
+//! The caller first ADDS a `long` target column beside each string source (one
+//! metadata commit); this module then reads the current snapshot, fills every
+//! target from its source, writes new data files that carry BOTH columns and
+//! commits a single `Replace` snapshot that removes every old data file. The
+//! string source stays readable throughout — the caller swaps the names at the
+//! end (delete the source, rename the target onto its name, one metadata
+//! commit through `UpdateSchemaAction::rename_column`), so a rollback at any
+//! point before that is a snapshot rollback and nothing is ever unreadable. No
+//! delete files are written. The base snapshot's summary properties that start
+//! with `carry_summary_prefix` are copied onto the new snapshot (a producer's
+//! offsets-in-snapshot ledger keeps its home when older snapshots expire).
 //!
 //! Spellings — the only transformation, pinned by tests:
 //!   * `^-?[0-9]+$`                          milliseconds since midnight → × 1000
@@ -273,16 +276,16 @@ pub struct RewriteOutcome {
     pub counts: ShapeCounts,
 }
 
-/// Rewrite `columns` of `ident` from their string spellings into signed
-/// microseconds, copy-on-write, in one `Replace` snapshot. The current schema
-/// must already carry each column as `long` and the current snapshot's schema
-/// must still carry it as a string; `base_snapshot`, when given, must be the
-/// current snapshot (optimistic concurrency, enforced again at commit). With
-/// `dry_run` the data is parsed and counted but nothing is written or committed.
+/// Fill each `(source, target)` pair of `ident` — `source` a string column of
+/// spellings, `target` an existing `long` column — with signed microseconds,
+/// copy-on-write, in one `Replace` snapshot; the source is kept as it was.
+/// `base_snapshot`, when given, must be the current snapshot (optimistic
+/// concurrency, enforced again at commit). With `dry_run` the data is parsed
+/// and counted but nothing is written or committed.
 pub async fn rewrite_time_columns(
     catalog: &dyn Catalog,
     ident: &TableIdent,
-    columns: &[String],
+    columns: &[(String, String)],
     base_snapshot: Option<i64>,
     dry_run: bool,
     snapshot_properties: HashMap<String, String>,
@@ -306,22 +309,24 @@ pub async fn rewrite_time_columns(
             ));
         }
     }
-    let old_schema = snapshot.schema(table.metadata())?;
     let cur_schema = table.metadata().current_schema().clone();
-    for col in columns {
-        match cur_schema.field_by_name(col).map(|f| f.field_type.as_ref()) {
-            Some(Type::Primitive(PrimitiveType::Long)) => {}
-            other => {
-                return Err(invalid(format!(
-                    "{ident}: the current schema must carry `{col}` as long before the rewrite (found {other:?}) — evolve the schema first"
-                )));
-            }
+    for (src, tgt) in columns {
+        if src == tgt {
+            return Err(invalid(format!("{ident}: `{src}` cannot be its own target — add a long column first")));
         }
-        match old_schema.field_by_name(col).map(|f| f.field_type.as_ref()) {
+        match cur_schema.field_by_name(src).map(|f| f.field_type.as_ref()) {
             Some(Type::Primitive(PrimitiveType::String)) => {}
             other => {
                 return Err(invalid(format!(
-                    "{ident}: snapshot {s0}'s schema does not carry `{col}` as a string (found {other:?}) — nothing to convert"
+                    "{ident}: source `{src}` must be a string column (found {other:?})"
+                )));
+            }
+        }
+        match cur_schema.field_by_name(tgt).map(|f| f.field_type.as_ref()) {
+            Some(Type::Primitive(PrimitiveType::Long)) => {}
+            other => {
+                return Err(invalid(format!(
+                    "{ident}: target `{tgt}` must be a long column (found {other:?}) — evolve the schema first"
                 )));
             }
         }
@@ -393,14 +398,17 @@ pub async fn rewrite_time_columns(
             .map(|f| f.as_ref().clone())
             .collect();
         let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-        for col in columns {
-            let idx = batch.schema().index_of(col).map_err(|_| {
-                invalid(format!("{ident}: scanned batch lacks column `{col}`"))
+        for (src, tgt) in columns {
+            let si = batch.schema().index_of(src).map_err(|_| {
+                invalid(format!("{ident}: scanned batch lacks column `{src}`"))
             })?;
-            let (converted, counts) = time_text_array_to_us(&cols[idx])?;
+            let ti = batch.schema().index_of(tgt).map_err(|_| {
+                invalid(format!("{ident}: scanned batch lacks column `{tgt}`"))
+            })?;
+            let (converted, counts) = time_text_array_to_us(&cols[si])?;
             outcome.counts.add(counts);
-            fields[idx] = Field::new(col, DataType::Int64, true);
-            cols[idx] = Arc::new(converted);
+            fields[ti] = Field::new(tgt, DataType::Int64, true);
+            cols[ti] = Arc::new(converted);
         }
         outcome.rows += batch.num_rows() as u64;
         if let Some(w) = writer.as_mut() {
@@ -424,7 +432,10 @@ pub async fn rewrite_time_columns(
             }
         }
     }
-    props.insert("time-rewrite.columns".to_string(), columns.join(","));
+    props.insert(
+        "time-rewrite.columns".to_string(),
+        columns.iter().map(|(a, b)| format!("{a}->{b}")).collect::<Vec<_>>().join(","),
+    );
     props.insert("time-rewrite.base-snapshot".to_string(), s0.to_string());
 
     let tx = Transaction::new(&table);
@@ -596,19 +607,22 @@ mod tests {
             .unwrap()
     }
 
-    /// delete + re-add under the same name, as TWO commits (the schema action is
-    /// not relied on to order a delete before an add of the same name).
-    async fn retype_to_long(catalog: &dyn Catalog, table: &Table, cols: &[&str]) -> Table {
+    async fn add_long_targets(catalog: &dyn Catalog, table: &Table, pairs: &[(&str, &str)]) -> Table {
         let tx = Transaction::new(table);
         let mut action = tx.update_schema();
-        for c in cols {
-            action = action.delete_column(*c);
+        for (_src, tgt) in pairs {
+            action = action.add_column(AddColumn::optional(*tgt, Type::Primitive(PrimitiveType::Long)));
         }
-        let table = action.apply(tx).unwrap().commit(catalog).await.unwrap();
-        let tx = Transaction::new(&table);
+        action.apply(tx).unwrap().commit(catalog).await.unwrap()
+    }
+
+    /// The final swap: drop the string source and move the long target onto its
+    /// name — ONE metadata commit, ids kept.
+    async fn swap_names(catalog: &dyn Catalog, table: &Table, pairs: &[(&str, &str)]) -> Table {
+        let tx = Transaction::new(table);
         let mut action = tx.update_schema();
-        for c in cols {
-            action = action.add_column(AddColumn::optional(*c, Type::Primitive(PrimitiveType::Long)));
+        for (src, tgt) in pairs {
+            action = action.delete_column(*src).rename_column(*tgt, *src);
         }
         action.apply(tx).unwrap().commit(catalog).await.unwrap()
     }
@@ -625,8 +639,24 @@ mod tests {
         out
     }
 
+    async fn read_strings(table: &Table, col: &str) -> Vec<Option<String>> {
+        let scan = table.scan().select_all().build().unwrap();
+        let mut stream = scan.to_arrow().await.unwrap();
+        let mut out = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let idx = batch.schema().index_of(col).unwrap();
+            let a = batch.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            out.extend(a.iter().map(|v| v.map(|x| x.to_string())));
+        }
+        out
+    }
+
+    fn pairs() -> Vec<(String, String)> {
+        vec![("t".to_string(), "t__us".to_string()), ("k".to_string(), "k__us".to_string())]
+    }
+
     #[tokio::test]
-    async fn rewrite_converges_four_spellings_in_one_replace_snapshot() {
+    async fn rewrite_fills_the_targets_keeps_the_sources_and_the_final_swap_keeps_the_ids() {
         let (_wh, catalog, ident, table) = setup().await;
         let file = write_strings(
             &table,
@@ -643,11 +673,11 @@ mod tests {
         )
         .await;
         let s0 = table.metadata().current_snapshot_id().unwrap();
-        let table = retype_to_long(catalog.as_ref(), &table, &["t", "k"]).await;
+        let table = add_long_targets(catalog.as_ref(), &table, &[("t", "t__us"), ("k", "k__us")]).await;
         assert_eq!(table.metadata().current_snapshot_id(), Some(s0), "schema evolution adds no snapshot");
 
         // dry run: counts, no commit
-        let dry = rewrite_time_columns(catalog.as_ref(), &ident, &["t".to_string(), "k".to_string()], Some(s0), true, HashMap::new(), Some("pulse."))
+        let dry = rewrite_time_columns(catalog.as_ref(), &ident, &pairs(), Some(s0), true, HashMap::new(), Some("pulse."))
             .await
             .unwrap();
         assert_eq!(dry.snapshot_after, None);
@@ -656,7 +686,7 @@ mod tests {
         let table = catalog.load_table(&ident).await.unwrap();
         assert_eq!(table.metadata().current_snapshot_id(), Some(s0));
 
-        let out = rewrite_time_columns(catalog.as_ref(), &ident, &["t".to_string(), "k".to_string()], Some(s0), false, HashMap::from([("note".to_string(), "test".to_string())]), Some("pulse."))
+        let out = rewrite_time_columns(catalog.as_ref(), &ident, &pairs(), Some(s0), false, HashMap::from([("note".to_string(), "test".to_string())]), Some("pulse."))
             .await
             .unwrap();
         assert_eq!(out.files_deleted, 1);
@@ -666,22 +696,32 @@ mod tests {
         let s1 = table.metadata().current_snapshot_id().unwrap();
         assert_eq!(out.snapshot_after, Some(s1));
         assert_ne!(s1, s0);
-        assert_eq!(
-            read_longs(&table, "t").await,
-            vec![Some(us(10, 0, 0)), Some(us(10, 0, 0) + 250_000), Some(34 * US_PER_DAY + us(22, 59, 59)), Some(-35 * US_PER_DAY + us(1, 0, 1)), None]
-        );
-        assert_eq!(
-            read_longs(&table, "k").await,
-            vec![Some(us(10, 0, 0)), Some(-US_PER_SEC), Some(us(838, 59, 59)), None, Some(us(9, 0, 0))]
-        );
+        let t_want = vec![Some(us(10, 0, 0)), Some(us(10, 0, 0) + 250_000), Some(34 * US_PER_DAY + us(22, 59, 59)), Some(-35 * US_PER_DAY + us(1, 0, 1)), None];
+        let k_want = vec![Some(us(10, 0, 0)), Some(-US_PER_SEC), Some(us(838, 59, 59)), None, Some(us(9, 0, 0))];
+        assert_eq!(read_longs(&table, "t__us").await, t_want);
+        assert_eq!(read_longs(&table, "k__us").await, k_want);
+        // the sources are untouched — readable until the swap
+        assert_eq!(read_strings(&table, "t").await[0].as_deref(), Some("36000000"));
+        assert_eq!(read_strings(&table, "k").await[2].as_deref(), Some("838:59:59"));
         let summary = &table.metadata().current_snapshot().unwrap().summary().additional_properties;
         assert_eq!(summary.get("pulse.kafka.offset.topic-a").map(String::as_str), Some("77"), "the ledger key is carried forward");
         assert_eq!(summary.get("other"), None, "only the prefix is carried");
         assert_eq!(summary.get("note").map(String::as_str), Some("test"));
-        assert_eq!(summary.get("time-rewrite.columns").map(String::as_str), Some("t,k"));
+        assert_eq!(summary.get("time-rewrite.columns").map(String::as_str), Some("t->t__us,k->k__us"));
 
-        // a second run finds no string column to convert
-        let again = rewrite_time_columns(catalog.as_ref(), &ident, &["t".to_string()], None, true, HashMap::new(), None).await;
+        // the swap: drop the strings, move the longs onto their names — one metadata commit, no snapshot
+        let before_ids: Vec<i32> = ["t__us", "k__us"].iter().map(|n| table.metadata().current_schema().field_by_name(n).unwrap().id).collect();
+        let table = swap_names(catalog.as_ref(), &table, &[("t", "t__us"), ("k", "k__us")]).await;
+        assert_eq!(table.metadata().current_snapshot_id(), Some(s1));
+        let schema = table.metadata().current_schema();
+        assert!(schema.field_by_name("t__us").is_none() && schema.field_by_name("k__us").is_none());
+        let after_ids: Vec<i32> = ["t", "k"].iter().map(|n| schema.field_by_name(n).unwrap().id).collect();
+        assert_eq!(after_ids, before_ids, "the rename keeps the field ids");
+        assert_eq!(read_longs(&table, "t").await, t_want);
+        assert_eq!(read_longs(&table, "k").await, k_want);
+
+        // a second run finds no string source
+        let again = rewrite_time_columns(catalog.as_ref(), &ident, &pairs(), None, true, HashMap::new(), None).await;
         assert!(again.is_err());
     }
 
@@ -691,21 +731,24 @@ mod tests {
         let file = write_strings(&table, "f1", vec![Some("10:00:00"), Some("noon")], vec![Some("1"), Some("2")]).await;
         let table = append(catalog.as_ref(), &table, file, HashMap::new()).await;
         let s0 = table.metadata().current_snapshot_id().unwrap();
-        retype_to_long(catalog.as_ref(), &table, &["t"]).await;
-        let res = rewrite_time_columns(catalog.as_ref(), &ident, &["t".to_string()], Some(s0), false, HashMap::new(), None).await;
+        add_long_targets(catalog.as_ref(), &table, &[("t", "t__us")]).await;
+        let res = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s0), false, HashMap::new(), None).await;
         assert!(res.is_err());
         let table = catalog.load_table(&ident).await.unwrap();
         assert_eq!(table.metadata().current_snapshot_id(), Some(s0), "nothing committed");
     }
 
     #[tokio::test]
-    async fn a_stale_base_snapshot_is_refused() {
+    async fn a_missing_target_or_a_stale_base_snapshot_is_refused() {
         let (_wh, catalog, ident, table) = setup().await;
         let file = write_strings(&table, "f1", vec![Some("10:00:00")], vec![Some("1")]).await;
         let table = append(catalog.as_ref(), &table, file, HashMap::new()).await;
         let s0 = table.metadata().current_snapshot_id().unwrap();
-        retype_to_long(catalog.as_ref(), &table, &["t"]).await;
-        let res = rewrite_time_columns(catalog.as_ref(), &ident, &["t".to_string()], Some(s0 + 1), false, HashMap::new(), None).await;
+        // no long target yet
+        let res = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s0), false, HashMap::new(), None).await;
+        assert!(res.is_err());
+        add_long_targets(catalog.as_ref(), &table, &[("t", "t__us")]).await;
+        let res = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s0 + 1), false, HashMap::new(), None).await;
         assert!(res.is_err());
     }
 }
