@@ -42,6 +42,10 @@
 //!   * NULL or empty                         NULL
 //!   * anything else                         the rewrite REFUSES the table before any commit.
 //!
+//! A source may also be a `timestamp`/`timestamptz` column that holds the dated clock as a real
+//! timestamp (`1970-01-01 HH:MM:SS`): its microseconds since the epoch ARE the microseconds since
+//! midnight when, and only when, the value lies within the epoch day — any other date is refused.
+//!
 //! MySQL `TIME` spans -838:59:59 .. 838:59:59; a parsed value outside that range is refused too.
 
 use std::collections::HashMap;
@@ -49,8 +53,9 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit};
 use arrow_select::filter::filter_record_batch;
 use futures::TryStreamExt;
 use uuid::Uuid;
@@ -289,10 +294,31 @@ pub fn time_text_array_to_us(array: &ArrayRef) -> Result<(Int64Array, ShapeCount
                 push(if a.is_null(i) { None } else { Some(a.value(i)) })?;
             }
         }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| invalid("Timestamp downcast".to_string()))?;
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    counts.nulls += 1;
+                    out.push(None);
+                    continue;
+                }
+                let v = a.value(i);
+                if !(0..US_PER_DAY).contains(&v) {
+                    return Err(invalid(format!(
+                        "timestamp TIME value {v} µs is not a time of day on the epoch date (1970-01-01) — refused"
+                    )));
+                }
+                counts.note(TimeShape::Dated);
+                out.push(Some(v));
+            }
+        }
         other => {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
-                format!("TIME rewrite expects a string column, found {other}"),
+                format!("TIME rewrite expects a string or microsecond-timestamp column, found {other}"),
             ));
         }
     }
@@ -343,7 +369,8 @@ fn partition_literal(array: &ArrayRef, row: usize) -> Result<Option<Literal>> {
 }
 
 /// Fill each `(source, target)` pair of `ident` — `source` a string column of
-/// spellings, `target` an existing `long` column — with signed microseconds,
+/// spellings (or a microsecond timestamp column holding the dated clock), `target`
+/// an existing `long` column — with signed microseconds,
 /// copy-on-write, in one `Replace` snapshot; the source is kept as it was.
 /// Unpartitioned tables and tables with ONE identity partition field are
 /// supported (every row is written under its own partition). `base_snapshot`,
@@ -384,10 +411,12 @@ pub async fn rewrite_time_columns(
             return Err(invalid(format!("{ident}: `{src}` cannot be its own target — add a long column first")));
         }
         match cur_schema.field_by_name(src).map(|f| f.field_type.as_ref()) {
-            Some(Type::Primitive(PrimitiveType::String)) => {}
+            Some(Type::Primitive(PrimitiveType::String))
+            | Some(Type::Primitive(PrimitiveType::Timestamp))
+            | Some(Type::Primitive(PrimitiveType::Timestamptz)) => {}
             other => {
                 return Err(invalid(format!(
-                    "{ident}: source `{src}` must be a string column (found {other:?})"
+                    "{ident}: source `{src}` must be a string or timestamp column (found {other:?})"
                 )));
             }
         }
@@ -674,6 +703,63 @@ mod tests {
         );
         let bad: ArrayRef = Arc::new(StringArray::from(vec![Some("10:00:00"), Some("nope")]));
         assert!(time_text_array_to_us(&bad).is_err());
+        // a microsecond timestamp on the epoch date is the time of day itself
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(us(10, 0, 0)), None, Some(0)]).with_timezone("UTC"));
+        let (out, counts) = time_text_array_to_us(&ts).unwrap();
+        assert_eq!(out.iter().collect::<Vec<_>>(), vec![Some(us(10, 0, 0)), None, Some(0)]);
+        assert_eq!(counts, ShapeCounts { digits: 0, dated: 2, clock: 0, days: 0, nulls: 1 });
+        let next_day: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(US_PER_DAY)]));
+        assert!(time_text_array_to_us(&next_day).is_err(), "a value past the epoch day is refused");
+        let negative: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(-1)]));
+        assert!(time_text_array_to_us(&negative).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_timestamptz_source_holding_the_dated_clock_converges_too() {
+        let (_wh, catalog, ident, _table) = setup().await;
+        // add a timestamptz column, write a file with it through the table's current schema
+        let table = {
+            let t = catalog.load_table(&ident).await.unwrap();
+            let tx = Transaction::new(&t);
+            tx.update_schema()
+                .add_column(AddColumn::optional("shift", Type::Primitive(PrimitiveType::Timestamptz)))
+                .apply(tx)
+                .unwrap()
+                .commit(catalog.as_ref())
+                .await
+                .unwrap()
+        };
+        let schema = table.metadata().current_schema().clone();
+        let arrow = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let batch = RecordBatch::try_new(arrow, vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![Some("10:00:00"), None, Some("1:00:00")])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![None::<&str>, None, None])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![false, false, false])) as ArrayRef,
+            // timestamptz maps to a microsecond timestamp in the "+00:00" zone
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(us(13, 0, 0)), None, Some(us(21, 30, 0))]).with_timezone("+00:00")) as ArrayRef,
+        ])
+        .unwrap();
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(writer_properties(&table), schema),
+            table.file_io().clone(),
+            DefaultLocationGenerator::new(table.metadata()).unwrap(),
+            DefaultFileNameGenerator::new("ts".to_string(), None, DataFileFormat::Parquet),
+        );
+        let mut writer = DataFileWriterBuilder::new(rolling).build(None).await.unwrap();
+        writer.write(batch).await.unwrap();
+        let file = writer.close().await.unwrap().into_iter().next().unwrap();
+        let table = append(catalog.as_ref(), &table, file, HashMap::new()).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        add_long_targets(catalog.as_ref(), &table, &[("shift", "shift__us")]).await;
+        let out = rewrite_time_columns(catalog.as_ref(), &ident, &[("shift".to_string(), "shift__us".to_string())], Some(s0), false, HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(out.counts, ShapeCounts { digits: 0, dated: 2, clock: 0, days: 0, nulls: 1 });
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_longs(&table, "shift__us").await, vec![Some(us(13, 0, 0)), None, Some(us(21, 30, 0))]);
+        let table = swap_names(catalog.as_ref(), &table, &[("shift", "shift__us")]).await;
+        assert_eq!(read_longs(&table, "shift").await, vec![Some(us(13, 0, 0)), None, Some(us(21, 30, 0))]);
     }
 
     async fn write_strings(table: &Table, name: &str, t: Vec<Option<&str>>, k: Vec<Option<&str>>) -> DataFile {
