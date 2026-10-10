@@ -743,19 +743,26 @@ mod tests {
             .build()
             .unwrap();
         let ident = TableIdent::new(ns.clone(), "times".to_string());
-        let mut creation = TableCreation::builder()
-            .name("times".to_string())
-            .schema(schema)
-            .format_version(FormatVersion::V2);
-        if partitioned {
-            creation = creation.partition_spec(
-                UnboundPartitionSpec::builder()
-                    .add_partition_field(4, "_is_backfill", Transform::Identity)
-                    .unwrap()
-                    .build(),
-            );
-        }
-        let table = catalog.create_table(&ns, creation.build()).await.unwrap();
+        let creation = if partitioned {
+            TableCreation::builder()
+                .name("times".to_string())
+                .schema(schema)
+                .format_version(FormatVersion::V2)
+                .partition_spec(
+                    UnboundPartitionSpec::builder()
+                        .add_partition_field(4, "_is_backfill", Transform::Identity)
+                        .unwrap()
+                        .build(),
+                )
+                .build()
+        } else {
+            TableCreation::builder()
+                .name("times".to_string())
+                .schema(schema)
+                .format_version(FormatVersion::V2)
+                .build()
+        };
+        let table = catalog.create_table(&ns, creation).await.unwrap();
         (warehouse, catalog, ident, table)
     }
 
