@@ -900,6 +900,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rewrite_rolls_back_to_its_base_snapshot_in_one_metadata_commit() {
+        let (_wh, catalog, ident, table) = setup().await;
+        let file = write_strings(&table, "f1", vec![Some("10:00:00"), Some("36000000")], vec![Some("1:00:00"), None]).await;
+        let table = append(catalog.as_ref(), &table, file, HashMap::new()).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = add_long_targets(catalog.as_ref(), &table, &[("t", "t__us")]).await;
+        let out = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s0), false, HashMap::new(), None)
+            .await
+            .unwrap();
+        let s1 = out.snapshot_after.unwrap();
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_longs(&table, "t__us").await, vec![Some(us(10, 0, 0)), Some(us(10, 0, 0))]);
+        // roll back: main moves to s0, s1 stays in the metadata, the long column reads NULL (the old files)
+        let tx = Transaction::new(&table);
+        let table = tx.rollback_to_snapshot(s0).apply(tx).unwrap().commit(catalog.as_ref()).await.unwrap();
+        assert_eq!(table.metadata().current_snapshot_id(), Some(s0));
+        assert!(table.metadata().snapshot_by_id(s1).is_some(), "the rewrite snapshot is kept, not expired");
+        assert_eq!(read_longs(&table, "t__us").await, vec![None, None]);
+        assert_eq!(read_strings(&table, "t").await, vec![Some("10:00:00".to_string()), Some("36000000".to_string())]);
+        // rolling back to the current snapshot or to an unknown id is refused
+        let tx = Transaction::new(&table);
+        assert!(tx.rollback_to_snapshot(s0).apply(tx).unwrap().commit(catalog.as_ref()).await.is_err());
+        let tx = Transaction::new(&table);
+        assert!(tx.rollback_to_snapshot(s0 + 7).apply(tx).unwrap().commit(catalog.as_ref()).await.is_err());
+        // the rewrite can run again from s0 (the targets are still there)
+        let again = rewrite_time_columns(catalog.as_ref(), &ident, &[("t".to_string(), "t__us".to_string())], Some(s0), false, HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_ne!(again.snapshot_after, Some(s1));
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read_longs(&table, "t__us").await, vec![Some(us(10, 0, 0)), Some(us(10, 0, 0))]);
+    }
+
+    #[tokio::test]
     async fn an_unknown_spelling_refuses_the_table_before_any_commit() {
         let (_wh, catalog, ident, table) = setup().await;
         let file = write_strings(&table, "f1", vec![Some("10:00:00"), Some("noon")], vec![Some("1"), Some("2")]).await;

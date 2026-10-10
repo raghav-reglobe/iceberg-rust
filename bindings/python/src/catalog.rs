@@ -449,6 +449,45 @@ fn table_partition_spec_json(
     })
 }
 
+/// Move the table's main branch back to `snapshot_id` (an id the metadata
+/// still holds): one metadata commit, nothing written, nothing expired — the
+/// later snapshots stay reachable by id until an expiry removes them. Refused
+/// when the id is unknown or already current, and when `main` moved meanwhile.
+/// Returns the new current snapshot id.
+#[pyfunction]
+fn rollback_to_snapshot(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    snapshot_id: i64,
+) -> PyResult<i64> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let (catalog_name, ns, table) = split_table_fqn(&fqn)?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = build_catalog(catalog_name, catalog_props).await?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let t = catalog
+                .load_table(&iceberg::TableIdent::new(namespace, table))
+                .await
+                .map_err(|e| PyValueError::new_err(format!("loading {fqn}: {e}")))?;
+            let tx = Transaction::new(&t);
+            let updated = tx
+                .rollback_to_snapshot(snapshot_id)
+                .apply(tx)
+                .map_err(|e| PyValueError::new_err(format!("rollback {fqn}: {e}")))?
+                .commit(catalog.as_ref())
+                .await
+                .map_err(|e| PyValueError::new_err(format!("rollback {fqn}: {e}")))?;
+            updated
+                .metadata()
+                .current_snapshot_id()
+                .ok_or_else(|| PyValueError::new_err("rollback left no current snapshot".to_string()))
+        })
+    })
+}
+
 /// Drop a table (metadata-only — never a purge; orphaned files are the
 /// maintenance sweep's job).
 #[pyfunction]
@@ -661,6 +700,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(table_schema_json, &this)?)?;
     this.add_function(wrap_pyfunction!(snapshot_summary_json, &this)?)?;
     this.add_function(wrap_pyfunction!(table_partition_spec_json, &this)?)?;
+    this.add_function(wrap_pyfunction!(rollback_to_snapshot, &this)?)?;
     this.add_function(wrap_pyfunction!(drop_table, &this)?)?;
     this.add_function(wrap_pyfunction!(table_properties, &this)?)?;
     m.add_submodule(&this)?;

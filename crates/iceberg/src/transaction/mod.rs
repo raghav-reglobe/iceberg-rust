@@ -57,6 +57,7 @@ mod append;
 mod expire_snapshots;
 mod rewrite_files;
 mod rewrite_manifests;
+mod rollback;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -80,6 +81,7 @@ use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
 use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+use crate::transaction::rollback::RollbackToSnapshotAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -200,6 +202,12 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Move the main branch back to an existing snapshot (nothing written,
+    /// nothing expired; the commit requires `main` unchanged meanwhile).
+    pub fn rollback_to_snapshot(&self, snapshot_id: i64) -> RollbackToSnapshotAction {
+        RollbackToSnapshotAction::new(snapshot_id)
     }
 
     /// Commit transaction.
