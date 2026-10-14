@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::spec::{PrimitiveType, Type, VariantType};
+use iceberg::spec::{Literal, PrimitiveType, Type, VariantType};
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
@@ -87,14 +87,15 @@ fn parse_type(s: &str) -> PyResult<Type> {
 /// VARIANT-SAFE: goes through the same iceberg-rust path that creates VARIANT
 /// tables, so (a) it never turns VARIANT into `unknown` on load/write, and (b)
 /// it CAN add a VARIANT column (a nested document field). Added columns are always
-/// optional/nullable (a new column is undefined for existing rows).
+/// optional/nullable (a new column is undefined for existing rows) — except through
+/// `add_columns_with_default`, which carries an Iceberg initial/write default (the DDL-default class).
 ///
 /// `catalog_props` are standard Iceberg REST catalog properties (`uri`,
 /// `warehouse`, `credential`, `oauth2-server-uri`, `scope`, ...); `fqn` is
 /// `catalog.namespace.table`. Blocks until the commit lands; raises
 /// `ValueError` on failure. A no-op (both lists empty) returns immediately.
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new(), update_columns=Vec::new(), rename_columns=Vec::new()))]
+#[pyo3(signature = (catalog_props, fqn, add_columns=Vec::new(), drop_columns=Vec::new(), update_columns=Vec::new(), rename_columns=Vec::new(), add_columns_with_default=Vec::new()))]
 fn update_schema(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -103,6 +104,7 @@ fn update_schema(
     drop_columns: Vec<String>,
     update_columns: Vec<(String, String)>,
     rename_columns: Vec<(String, String)>,
+    add_columns_with_default: Vec<(String, String, String, bool)>,
 ) -> PyResult<()> {
     let parts: Vec<&str> = fqn.split('.').collect();
     if parts.len() < 3 {
@@ -117,13 +119,33 @@ fn update_schema(
         .map(|s| s.to_string())
         .collect();
 
-    if add_columns.is_empty() && drop_columns.is_empty() && update_columns.is_empty() && rename_columns.is_empty() {
+    if add_columns.is_empty() && drop_columns.is_empty() && update_columns.is_empty() && rename_columns.is_empty() && add_columns_with_default.is_empty() {
         return Ok(());
     }
     // Parse types up-front so a bad keyword errors before we touch the catalog.
     let adds: Vec<(String, Type)> = add_columns
         .into_iter()
         .map(|(n, t)| parse_type(&t).map(|ty| (n, ty)))
+        .collect::<PyResult<_>>()?;
+    // DEFAULTED adds (the DDL-default class, 2026-10-14): `add_columns_with_default` =
+    // list of `(name, type_keyword, default_json, required)`. The default is the
+    // Iceberg INITIAL default (returned for rows written before the column
+    // existed — never applied to a later explicit NULL) and the WRITE default;
+    // `required=true` mirrors a source `NOT NULL DEFAULT x` (Iceberg refuses a
+    // required add without an initial default). The literal is parsed from JSON
+    // text against the column type (`0`, `"x"`, `true`) before the catalog is touched.
+    let defaulted: Vec<(String, Type, Literal, bool)> = add_columns_with_default
+        .into_iter()
+        .map(|(n, t, d, req)| {
+            let ty = parse_type(&t)?;
+            let json: serde_json::Value = serde_json::from_str(&d).map_err(|e| {
+                PyValueError::new_err(format!("default for `{n}` is not JSON (`{d}`): {e}"))
+            })?;
+            let lit = Literal::try_from_json(json, &ty)
+                .map_err(|e| PyValueError::new_err(format!("default for `{n}`: {e}")))?
+                .ok_or_else(|| PyValueError::new_err(format!("default for `{n}` must not be null")))?;
+            Ok((n, ty, lit, req))
+        })
         .collect::<PyResult<_>>()?;
     // SAFE promotions on existing root-level columns (int->long, float->double,
     // decimal precision widen — validated at commit by the action).
@@ -167,6 +189,20 @@ fn update_schema(
                         action = action.add_column(AddColumn::optional(name, ty));
                     }
                 }
+            }
+            for (name, ty, lit, req) in defaulted {
+                let col = if req {
+                    AddColumn::required(name, ty, lit)
+                } else {
+                    AddColumn::builder()
+                        .name(name)
+                        .field_type(ty)
+                        .required(false)
+                        .initial_default(lit.clone())
+                        .write_default(lit)
+                        .build()
+                };
+                action = action.add_column(col);
             }
             for name in drop_columns {
                 action = action.delete_column(name);
