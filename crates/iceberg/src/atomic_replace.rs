@@ -691,6 +691,46 @@ pub async fn atomic_partition_replace_prefix(
     .await
 }
 
+/// [`atomic_partition_replace_prefix`] with `snapshot_properties` riding the
+/// commit — the repair-through-the-stream shape for a PREFIX chunk (the mongo
+/// ObjectId-hex chunk): the lane's offsets ledger (`pulse.kafka.offset.<topic>`)
+/// lands on the snapshot summary exactly like the key-set upsert's, while the
+/// delete scope is `starts_with(key_column, key_prefix)` — a file-stat-pruned
+/// plan over the backfill partition instead of a thousands-of-keys set scanned
+/// against every file (2026-10-15: ~70 s per 24K-key commit on a ~950-file
+/// partition; the prefix plan touches the files whose key range overlaps).
+#[allow(clippy::too_many_arguments)]
+pub async fn atomic_partition_replace_prefix_with_props(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    partition_value: bool,
+    key_column: &str,
+    key_prefix: &str,
+    op_column: Option<&str>,
+    op_values: &[String],
+    input: impl Into<ReplaceInput>,
+    snapshot_properties: HashMap<String, String>,
+    max_attempts: u32,
+    dry_run: bool,
+) -> Result<ReplaceOutcome> {
+    atomic_partition_replace_scan(
+        catalog,
+        ident,
+        partition_column,
+        partition_value,
+        key_column,
+        &KeyMatcher::Prefix(key_prefix.to_string()),
+        op_column,
+        op_values,
+        input,
+        snapshot_properties,
+        max_attempts,
+        dry_run,
+    )
+    .await
+}
+
 /// Atomically UPSERT an exact KEY SET of an identity partition — the
 /// repair-through-the-stream primitive
 /// (`.claude/plans/bronze-repair-through-stream.md`): prior rows whose

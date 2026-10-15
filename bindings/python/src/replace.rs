@@ -29,6 +29,7 @@ use std::io::Cursor;
 use arrow::array::RecordBatch;
 use iceberg::atomic_replace::{
     ReplaceInput, atomic_partition_append, atomic_partition_replace_key_set,
+    atomic_partition_replace_prefix_with_props,
     atomic_partition_replace_with_props,
 };
 use iceberg::spec::Literal;
@@ -326,10 +327,113 @@ fn bronze_replace_keys(
     })
 }
 
+/// Atomically UPSERT a KEY PREFIX of an identity partition — the
+/// repair-through-the-stream primitive for a PREFIX chunk (the mongo
+/// ObjectId-hex chunk shape, `.claude/plans/bronze-repair-through-stream.md`):
+/// prior rows whose (stringified) key column `starts_with(key_prefix)` (and
+/// `op_column IN op_values` when given) are deleted via a file-stat-pruned scan
+/// + consolidated V3 deletion vectors, and the input rows appended, as ONE
+/// `RowDelta` snapshot at snapshot isolation with rescan-retry; `summary_props`
+/// (the lane's offsets ledger) land on the snapshot summary exactly like
+/// `bronze_replace_keys`. 2026-10-15: a 24K-key set scanned every one of a
+/// ~950-file backfill partition per commit (~70 s); the prefix plan touches the
+/// files whose key range overlaps the prefix.
+///
+/// Defensive no-ops: an EMPTY `key_prefix` or a ZERO-ROW input returns the
+/// current snapshot with `attempts=0` and commits NOTHING (an upsert with
+/// nothing to upsert must not delete, and the caller's ledger must never ride a
+/// phantom commit).
+///
+/// Returns `{snapshot_id, rows_appended, delete_tuples_est, attempts}`.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, batches_ipc, key_prefix, summary_props, key_column="_cdc.key".to_string(), op_column=Some("_cdc.op".to_string()), op_values=vec!["R".to_string(), "r".to_string()], partition_column="_is_backfill".to_string(), partition_value=true, max_retries=6, parquet_path=None))]
+#[allow(clippy::too_many_arguments)]
+fn bronze_replace_prefix(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    batches_ipc: Vec<u8>,
+    key_prefix: String,
+    summary_props: HashMap<String, String>,
+    key_column: String,
+    op_column: Option<String>,
+    op_values: Vec<String>,
+    partition_column: String,
+    partition_value: bool,
+    max_retries: u32,
+    parquet_path: Option<String>,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    let input = replace_input(&batches_ipc, parquet_path)?;
+    let zero_rows = match &input {
+        ReplaceInput::Batches(b) => b.iter().map(|x| x.num_rows()).sum::<usize>() == 0,
+        ReplaceInput::LocalParquet(_) => false,
+    };
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let outcome = if key_prefix.is_empty() || zero_rows {
+                let t = catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("atomic prefix replace: {e}")))?;
+                iceberg::atomic_replace::ReplaceOutcome {
+                    snapshot_id: t.metadata().current_snapshot_id(),
+                    rows_appended: 0,
+                    delete_tuples: 0,
+                    attempts: 0,
+                }
+            } else {
+                atomic_partition_replace_prefix_with_props(
+                    catalog.as_ref(),
+                    &ident,
+                    &partition_column,
+                    partition_value,
+                    &key_column,
+                    &key_prefix,
+                    op_column.as_deref(),
+                    &op_values,
+                    input,
+                    summary_props,
+                    max_retries,
+                    false,
+                )
+                .await
+                .map_err(|e| PyValueError::new_err(format!("atomic prefix replace: {e}")))?
+            };
+            Ok(HashMap::from([
+                (
+                    "snapshot_id".to_string(),
+                    outcome
+                        .snapshot_id
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "rows_appended".to_string(),
+                    outcome.rows_appended.to_string(),
+                ),
+                (
+                    "delete_tuples_est".to_string(),
+                    outcome.delete_tuples.to_string(),
+                ),
+                ("attempts".to_string(), outcome.attempts.to_string()),
+            ]))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "replace")?;
     this.add_function(wrap_pyfunction!(bronze_replace, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_keys, &this)?)?;
+    this.add_function(wrap_pyfunction!(bronze_replace_prefix, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_append, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
