@@ -6,8 +6,11 @@
 //! read→sort→write that produces the new files is this module's own work
 //! (sort + bloom).
 
+use std::collections::HashMap;
+
 use anyhow::Result;
-use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt32Array};
+use arrow_schema::DataType;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::{ArrowReader, RecordBatchPartitionSplitter};
@@ -27,7 +30,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
-use crate::config::Config;
+use crate::config::{Config, KeyBucket};
 use crate::planner::Group;
 use crate::variant_shred;
 
@@ -106,6 +109,9 @@ pub(crate) async fn read_sort_write(
     group: &Group,
     cfg: &Config,
 ) -> Result<Vec<DataFile>> {
+    if let Some(kb) = &cfg.key_bucket {
+        return read_route_write(table, reader, group, cfg, kb).await;
+    }
     // Shred-preserving layout is derived once per group (first input file's
     // footer); the writer itself is built lazily on the first non-empty
     // slice (so an all-deleted group writes nothing) with the ACTUAL
@@ -148,6 +154,119 @@ pub(crate) async fn read_sort_write(
     }
 }
 
+/// The KEY-BUCKET rewrite of one group ([`Config::key_bucket`]): read the
+/// group's files (DVs applied), route every row by its key bucket into that
+/// bucket's own sink (today's writer chain, built lazily on the bucket's
+/// first row), close every sink — the output files partition the key space,
+/// each carrying its bucket's key range as its min/max stats. No chunk sort:
+/// the bracket a key-range reader prunes on is the per-FILE range, which the
+/// routing fixes; the row order inside a file is immaterial.
+///
+/// Memory: one input batch + its per-bucket `take` slices + every open
+/// writer's parquet buffer (bounded by `KeyBucket::row_group_rows`).
+pub(crate) async fn read_route_write(
+    table: &Table,
+    reader: &ArrowReader,
+    group: &Group,
+    cfg: &Config,
+    kb: &KeyBucket,
+) -> Result<Vec<DataFile>> {
+    let shred_plain = if cfg.shred_variants {
+        variant_shred::input_shred_types(table, group).await?
+    } else {
+        HashMap::new()
+    };
+    let mut stream = read_group(reader, group.tasks.clone()).await?;
+    let mut sinks: HashMap<String, CompactSink> = HashMap::new();
+    while let Some(batch) = stream.try_next().await? {
+        check_deadline(cfg, "reading input")?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let (batch, overrides) = if shred_plain.is_empty() {
+            (batch, HashMap::new())
+        } else {
+            let (mut shredded, overrides) = variant_shred::shred_batches(vec![batch], &shred_plain)?;
+            (shredded.pop().expect("one batch in, one out"), overrides)
+        };
+        let keys = key_leaf_strings(&batch, &kb.leaf)?;
+        let mut by_bucket: HashMap<String, Vec<u32>> = HashMap::new();
+        for row in 0..batch.num_rows() {
+            let key = keys.is_valid(row).then(|| keys.value(row));
+            by_bucket
+                .entry(kb.bucket_of(key))
+                .or_default()
+                .push(u32::try_from(row).expect("batch rows fit u32"));
+        }
+        for (bucket, rows) in by_bucket {
+            check_deadline(cfg, "routing a batch")?;
+            let indices = UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|c| arrow_select::take::take(c.as_ref(), &indices, None))
+                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
+            let slice = RecordBatch::try_new(batch.schema(), columns)?;
+            if !sinks.contains_key(&bucket) {
+                sinks.insert(
+                    bucket.clone(),
+                    CompactSink::build(
+                        table,
+                        cfg.target_file_size_bytes,
+                        overrides.clone(),
+                        Some(kb.row_group_rows),
+                    )
+                    .await?,
+                );
+            }
+            sinks
+                .get_mut(&bucket)
+                .expect("just inserted")
+                .write(slice)
+                .await?;
+        }
+    }
+    let mut added = Vec::new();
+    for (_, sink) in sinks {
+        added.extend(sink.close().await?);
+    }
+    Ok(added)
+}
+
+/// The string values of a (possibly nested, dotted) column of `batch`:
+/// `_cdc.key` walks the `_cdc` struct to its `key` leaf. Utf8 / LargeUtf8 /
+/// Utf8View leaves are accepted (cast to Utf8); anything else is an error.
+fn key_leaf_strings(batch: &RecordBatch, dotted: &str) -> Result<StringArray> {
+    let mut parts = dotted.split('.');
+    let root = parts.next().unwrap_or_default();
+    let root_idx = batch
+        .schema()
+        .index_of(root)
+        .map_err(|e| anyhow::anyhow!("key leaf `{dotted}`: column `{root}`: {e}"))?;
+    let mut current: ArrayRef = batch.column(root_idx).clone();
+    for part in parts {
+        let s = current
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| anyhow::anyhow!("key leaf `{dotted}`: `{part}`'s parent is not a struct"))?;
+        current = s
+            .column_by_name(part)
+            .ok_or_else(|| anyhow::anyhow!("key leaf `{dotted}`: struct field `{part}` not found"))?
+            .clone();
+    }
+    if !matches!(
+        current.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        anyhow::bail!("key leaf `{dotted}` must be a string column, got {:?}", current.data_type());
+    }
+    let utf8 = arrow_cast::cast(current.as_ref(), &DataType::Utf8)?;
+    utf8.as_any()
+        .downcast_ref::<StringArray>()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("key leaf `{dotted}`: not a Utf8 array after cast"))
+}
+
 /// Sort one buffered chunk and stream its bounded slices into the (lazily
 /// created) group sink.
 async fn flush_chunk(
@@ -176,7 +295,7 @@ async fn flush_chunk(
             (shredded.pop().expect("one batch in, one out"), overrides)
         };
         if sink.is_none() {
-            *sink = Some(CompactSink::build(table, cfg.target_file_size_bytes, overrides).await?);
+            *sink = Some(CompactSink::build(table, cfg.target_file_size_bytes, overrides, None).await?);
         }
         sink.as_mut().expect("just built").write(slice).await?;
     }
@@ -213,10 +332,11 @@ impl CompactSink {
         table: &Table,
         target_file_size_bytes: u64,
         variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
+        row_group_rows: Option<usize>,
     ) -> Result<Self> {
         let schema = table.metadata().current_schema().clone();
         let rolling = RollingFileWriterBuilder::new(
-            ParquetWriterBuilder::new(bloom_writer_properties(table), schema.clone())
+            ParquetWriterBuilder::new(bloom_writer_properties(table, row_group_rows), schema.clone())
                 .with_variant_shred_types(variant_shred_types),
             // OUTPUT rolling must honor the configured target: the planner's
             // input bin-packing bounds what a group READS, not what it
@@ -277,7 +397,7 @@ impl CompactSink {
 /// NDV/fpp; the parquet-mr adaptive-sizing flag
 /// (`write.parquet.bloom-filter-adaptive-enabled`) has no rust equivalent and is
 /// ignored.
-fn bloom_writer_properties(table: &Table) -> WriterProperties {
+fn bloom_writer_properties(table: &Table, row_group_rows: Option<usize>) -> WriterProperties {
     use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
     const ENABLED: &str = "write.parquet.bloom-filter-enabled.column.";
     const FPP: &str = "write.parquet.bloom-filter-fpp.column.";
@@ -316,6 +436,11 @@ fn bloom_writer_properties(table: &Table) -> WriterProperties {
         ),
     };
     let mut builder = WriterProperties::builder().set_compression(compression);
+    // The key-bucket rewrite keeps hundreds of writers open at once: a small
+    // row group bounds each writer's buffer (the default row group is 1M rows).
+    if let Some(rows) = row_group_rows {
+        builder = builder.set_max_row_group_size(rows.max(1));
+    }
     for (key, val) in props {
         let Some(col) = key.strip_prefix(ENABLED) else {
             continue;

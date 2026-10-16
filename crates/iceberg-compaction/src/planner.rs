@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
+use iceberg::spec::{Literal, Struct};
 
 use crate::config::Config;
 
@@ -188,14 +189,33 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
         ..Default::default()
     };
 
+    // `partition_filter`: only that identity partition's files are planned —
+    // the expected key is the same Debug rendering `partition_key` uses, built
+    // from the same `Struct` shape a single-field identity spec carries.
+    let partition_filter_key = cfg.partition_filter.as_ref().map(|(_, v)| {
+        format!(
+            "{:?}",
+            Some(Struct::from_iter(vec![Some(Literal::bool(*v))]))
+        )
+    });
+    // The key-bucket rewrite plans EVERY file of the partition (rewrite_all
+    // semantics): the point is the layout, not the size.
+    let bucket_mode = cfg.key_bucket.is_some();
+
     // Group candidates by partition (preserve order); non-candidates are skipped.
     let mut buckets: Vec<(String, Vec<FileScanTask>)> = Vec::new();
     for t in tasks {
-        if !should_rewrite(t.file_size_in_bytes, t.deletes.len(), cfg) {
+        let key = partition_key(&t);
+        if let Some(want) = &partition_filter_key
+            && key != *want
+        {
             plan.skipped_files += 1;
             continue;
         }
-        let key = partition_key(&t);
+        if !bucket_mode && !should_rewrite(t.file_size_in_bytes, t.deletes.len(), cfg) {
+            plan.skipped_files += 1;
+            continue;
+        }
         match buckets.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(t),
             None => buckets.push((key, vec![t])),
@@ -203,6 +223,26 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
     }
 
     let target = cfg.target_file_size_bytes.max(1);
+    if bucket_mode {
+        // ONE group per partition holding every file: the rewrite routes rows
+        // by key bucket, so bin-packing by input size would only scatter one
+        // bucket's keys over several groups' outputs.
+        for (key, candidates) in buckets {
+            if candidates.is_empty() {
+                continue;
+            }
+            let delete_file_count: usize = candidates.iter().map(|t| t.deletes.len()).sum();
+            let total_size_bytes: u64 = candidates.iter().map(|t| t.file_size_in_bytes).sum();
+            plan.est_output_files += total_size_bytes.div_ceil(target).max(1) as usize;
+            plan.groups.push(Group {
+                partition_key: key,
+                tasks: candidates,
+                total_size_bytes,
+                delete_file_count,
+            });
+        }
+        return plan;
+    }
     for (key, candidates) in buckets {
         let bucket_deletes: usize = candidates.iter().map(|t| t.deletes.len()).sum();
         if below_input_floor(candidates.len(), bucket_deletes, cfg) {

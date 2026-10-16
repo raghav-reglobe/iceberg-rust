@@ -69,7 +69,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None, max_concurrent_groups=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None, max_concurrent_groups=None, partition_filter=None, key_bucket_leaf=None, key_bucket_skip=None, key_bucket_hex=None, key_bucket_row_group_rows=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -83,6 +83,11 @@ fn compact(
     timeout_s: Option<u64>,
     budget_s: Option<f64>,
     max_concurrent_groups: Option<usize>,
+    partition_filter: Option<(String, bool)>,
+    key_bucket_leaf: Option<String>,
+    key_bucket_skip: Option<usize>,
+    key_bucket_hex: Option<usize>,
+    key_bucket_row_group_rows: Option<usize>,
 ) -> PyResult<HashMap<String, i64>> {
     // FQN = catalog . namespace[.namespace...] . table
     let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
@@ -132,6 +137,20 @@ fn compact(
     // Plan every live data file (Spark `rewrite-all` parity). See `Config::rewrite_all`.
     if let Some(v) = rewrite_all {
         cfg.rewrite_all = v;
+    }
+    // Rewrite ONLY one identity partition's files. See `Config::partition_filter`.
+    if partition_filter.is_some() {
+        cfg.partition_filter = partition_filter;
+    }
+    // KEY-BUCKET rewrite (2026-10-16): route rows by a hex run of the key leaf
+    // so the output files partition the key space. See `Config::key_bucket`.
+    if let Some(leaf) = key_bucket_leaf {
+        cfg.key_bucket = Some(iceberg_compaction::config::KeyBucket {
+            leaf,
+            skip: key_bucket_skip.unwrap_or(10),
+            hex_len: key_bucket_hex.unwrap_or(3),
+            row_group_rows: key_bucket_row_group_rows.unwrap_or(32_768),
+        });
     }
     // Wide-row memory bounds, env-tunable per pod (see Config docs):
     // - ICEBERG_COMPACT_CHUNK_MB       — sort-chunk budget (default 1024).

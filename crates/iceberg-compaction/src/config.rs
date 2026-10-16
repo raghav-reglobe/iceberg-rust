@@ -49,6 +49,21 @@ pub struct Config {
     /// size/delete candidacy policy (Spark `rewrite-all` parity). Grouping
     /// and bin-packing still apply.
     pub rewrite_all: bool,
+    /// Rewrite ONLY the files of this single-field IDENTITY partition
+    /// `(column, bool value)`; every other partition's files are left as they
+    /// are (planned as skipped). 2026-10-16: the bronze backfill partition
+    /// (`_is_backfill = true`) — the CDC partition must never be read or
+    /// rewritten by the key-bucket pass.
+    pub partition_filter: Option<(String, bool)>,
+    /// KEY-BUCKET rewrite ([`KeyBucket`]): route every row by a hex run of a
+    /// (nested) string key into one output stream per hex value, so the output
+    /// files PARTITION THE KEY SPACE and a key-range plan (the bronze repair
+    /// doorway's `[min(keys), max(keys)]` bracket on the key leaf's file
+    /// stats) prunes to the one or two files whose bounds it overlaps. With
+    /// it the planner emits ONE group per partition holding every candidate
+    /// (`rewrite_all` semantics, no bin-pack) and the rewrite routes instead
+    /// of chunk-sorting.
+    pub key_bucket: Option<KeyBucket>,
     /// Cooperative deadline. Checked between groups, between read batches
     /// and between sort-chunk flushes; when exceeded the pass aborts with a
     /// "compaction deadline exceeded" error BEFORE the commit — the commit
@@ -113,10 +128,54 @@ impl Default for Config {
             shred_variants: false,
             sort_column: None,
             rewrite_all: false,
+            partition_filter: None,
+            key_bucket: None,
             deadline: None,
             budget: None,
             max_concurrent_groups: 1,
         }
+    }
+}
+
+/// The key-bucket rewrite's routing rule (see [`Config::key_bucket`]).
+///
+/// The bucket of a row = the `hex_len` characters at byte offset `skip` of the
+/// stringified key leaf, lower-cased, when they are all hex digits; a NULL key,
+/// a key too short, or non-hex characters there route to the `other` bucket.
+/// For the mongo bronze key `{"$oid": "<24-hex>"}` the hex run starts at byte
+/// 10 (`{"$oid": "` is 10 bytes), and `hex_len = 3` is the chunk unit the
+/// repair stream uses (an ObjectId's leading 8 hex are its creation epoch, so
+/// a collection's keys span ~340 three-hex prefixes over its life, ~16 live
+/// per year; 2 hex would give ~20 very uneven buckets).
+#[derive(Debug, Clone)]
+pub struct KeyBucket {
+    /// Dotted path of the string key (`_cdc.key`: a struct leaf).
+    pub leaf: String,
+    /// Byte offset of the hex run inside the stringified key.
+    pub skip: usize,
+    /// Hex characters per bucket (1..=6).
+    pub hex_len: usize,
+    /// Parquet row-group bound (rows) for the many concurrently open bucket
+    /// writers — ~340 writers × a 32,768-row group ≈ a few GB buffered.
+    pub row_group_rows: usize,
+}
+
+impl KeyBucket {
+    /// The bucket name of one key value (see the struct doc).
+    pub fn bucket_of(&self, key: Option<&str>) -> String {
+        let Some(k) = key else {
+            return "other".to_string();
+        };
+        let bytes = k.as_bytes();
+        let end = self.skip + self.hex_len;
+        if bytes.len() < end {
+            return "other".to_string();
+        }
+        let run = &bytes[self.skip..end];
+        if !run.iter().all(u8::is_ascii_hexdigit) {
+            return "other".to_string();
+        }
+        String::from_utf8_lossy(run).to_ascii_lowercase()
     }
 }
 
@@ -126,6 +185,17 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.max_file_size_bytes == 0 {
             bail!("max_file_size_bytes must be positive");
+        }
+        if let Some(kb) = &self.key_bucket {
+            if kb.leaf.is_empty() {
+                bail!("key_bucket.leaf must name the key column");
+            }
+            if kb.hex_len == 0 || kb.hex_len > 6 {
+                bail!("key_bucket.hex_len must be 1..=6 (got {})", kb.hex_len);
+            }
+            if kb.row_group_rows == 0 {
+                bail!("key_bucket.row_group_rows must be positive");
+            }
         }
         if self.min_file_size_bytes >= self.max_file_size_bytes {
             bail!(
@@ -153,7 +223,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, instant_after};
+    use super::{Config, KeyBucket, instant_after};
 
     #[test]
     fn instant_after_never_panics_on_extreme_seconds() {
@@ -181,6 +251,30 @@ mod tests {
         assert_eq!(c.min_input_files, 5);
         assert_eq!(c.delete_file_threshold, 5);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn key_bucket_routes_by_the_hex_run_at_the_offset() {
+        let kb = KeyBucket {
+            leaf: "_cdc.key".to_string(),
+            skip: 10,
+            hex_len: 3,
+            row_group_rows: 32_768,
+        };
+        // the mongo bronze key: `{"$oid": "` (10 bytes) then the 24-hex ObjectId
+        assert_eq!(kb.bucket_of(Some("{\"$oid\": \"69c1a2b3c4d5e6f708091a2b\"}")), "69c");
+        assert_eq!(kb.bucket_of(Some("{\"$oid\": \"6A2FFF00000000000000000a\"}")), "6a2"); // lower-cased
+        assert_eq!(kb.bucket_of(None), "other");
+        assert_eq!(kb.bucket_of(Some("{\"$oid\": \"69\"}")), "other"); // too short
+        assert_eq!(kb.bucket_of(Some("{\"$numberLong\": \"12345\"}")), "other"); // not hex at the offset
+        assert_eq!(kb.bucket_of(Some("")), "other");
+        let mut c = Config::default();
+        c.key_bucket = Some(kb.clone());
+        c.validate().unwrap();
+        c.key_bucket = Some(KeyBucket { hex_len: 0, ..kb.clone() });
+        assert!(c.validate().is_err());
+        c.key_bucket = Some(KeyBucket { row_group_rows: 0, ..kb });
+        assert!(c.validate().is_err());
     }
 
     #[test]

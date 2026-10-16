@@ -32,6 +32,7 @@ repository = { workspace = true }
 [dependencies]
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
