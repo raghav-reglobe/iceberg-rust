@@ -490,6 +490,56 @@ fn expire_snapshots(
 ///  "total_input_bytes": int, "est_output_files": int,
 ///  "delete_applicability_len": int}
 /// ```
+/// DROP one identity partition `(partition_column, value)` as a metadata-only `RewriteFiles`
+/// commit (every live data file of the partition + the delete files scoped to it removed,
+/// nothing added; the bytes stay for the orphan sweep). Returns `{data_files, delete_files,
+/// rows, bytes, snapshot_id}` — `snapshot_id` is -1 when the partition held nothing and no
+/// snapshot was committed. 2026-10-16: the bronze backfill partition of the 17 recreatable
+/// mongo collections ("drop those 17 and recreate").
+#[pyfunction]
+#[pyo3(signature = (catalog_props, fqn, partition_column, value))]
+fn drop_partition(
+    py: Python<'_>,
+    catalog_props: HashMap<String, String>,
+    fqn: String,
+    partition_column: String,
+    value: bool,
+) -> PyResult<HashMap<String, i64>> {
+    let (catalog_name, ns, table_name) = split_fqn(&fqn)?;
+    crate::progress::install();
+    py.detach(|| {
+        runtime().block_on(async move {
+            let builder = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .with_object_bytes_cache(crate::runtime::global_object_cache().await);
+            let catalog = builder
+                .load(catalog_name.clone(), catalog_props)
+                .await
+                .map_err(|e| {
+                    PyValueError::new_err(format!("build catalog `{catalog_name}`: {e}"))
+                })?;
+            let namespace =
+                NamespaceIdent::from_vec(ns).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let ident = TableIdent::new(namespace, table_name);
+            let out = iceberg_compaction::engine::drop_partition(
+                &catalog,
+                &ident,
+                &partition_column,
+                value,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("drop_partition {fqn}: {e}")))?;
+            Ok(HashMap::from([
+                ("data_files".to_string(), out.data_files as i64),
+                ("delete_files".to_string(), out.delete_files as i64),
+                ("rows".to_string(), out.rows as i64),
+                ("bytes".to_string(), out.bytes as i64),
+                ("snapshot_id".to_string(), out.snapshot_id.unwrap_or(-1)),
+            ]))
+        })
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, rewrite_all=None))]
 fn plan_inspect(
@@ -603,6 +653,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     let this = PyModule::new(py, "compaction")?;
     this.add_function(wrap_pyfunction!(compact, &this)?)?;
     this.add_function(wrap_pyfunction!(plan_inspect, &this)?)?;
+    this.add_function(wrap_pyfunction!(drop_partition, &this)?)?;
     this.add_function(wrap_pyfunction!(rewrite_manifests, &this)?)?;
     this.add_function(wrap_pyfunction!(remove_orphan_files, &this)?)?;
     this.add_function(wrap_pyfunction!(expire_snapshots, &this)?)?;

@@ -9,11 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataContentType, DataFile, ManifestContentType, ManifestList};
+use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, ManifestList, Struct};
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 
@@ -32,6 +32,80 @@ pub async fn plan_table(table: &Table, cfg: &Config) -> Result<Plan> {
         .try_collect()
         .await?;
     Ok(plan_compaction(tasks, cfg))
+}
+
+/// Outcome of [`drop_partition`].
+#[derive(Debug, Default, Clone)]
+pub struct DropPartitionOutcome {
+    /// Data files removed from the partition.
+    pub data_files: usize,
+    /// Delete files (DVs / partition-scoped equality deletes) removed with them.
+    pub delete_files: usize,
+    /// Rows of the removed data files (manifest record counts).
+    pub rows: u64,
+    /// Bytes of the removed data files (they stay on S3 for the orphan sweep).
+    pub bytes: u64,
+    /// The committed snapshot; `None` when the partition held no live file (nothing committed).
+    pub snapshot_id: Option<i64>,
+}
+
+/// DROP one single-field IDENTITY partition `(column, bool value)` as a METADATA-ONLY commit
+/// (2026-10-16, operator: "drop those 17 and recreate" — a bronze backfill partition whose
+/// loader-era baseline is re-read from the source): every live data file whose partition
+/// struct equals the value, plus every delete file scoped to that partition (a DV or an
+/// equality delete written inside it binds only to its data), is REMOVED in ONE
+/// `RewriteFiles` snapshot that adds nothing — the remove-only shape `compact_table`
+/// already commits for fully-superseded groups. Other partitions are untouched; the
+/// removed files' bytes remain on S3 until the orphan sweep. The commit is rebase-validated
+/// from the planning snapshot like every rewrite (a concurrent writer touching the inputs
+/// aborts it; an append elsewhere rebases).
+pub async fn drop_partition(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    partition_column: &str,
+    value: bool,
+) -> Result<DropPartitionOutcome> {
+    let table = catalog.load_table(ident).await?;
+    let spec = table.metadata().default_partition_spec();
+    if spec.fields().len() != 1 || spec.fields()[0].name != partition_column {
+        bail!(
+            "drop_partition requires a single-field IDENTITY partition on `{partition_column}`; the table's default spec is {spec:?}"
+        );
+    }
+    let want = Struct::from_iter(vec![Some(Literal::bool(value))]);
+    let removed: Vec<DataFile> = current_data_files(&table)
+        .await?
+        .into_values()
+        .filter(|f| *f.partition() == want)
+        .collect();
+    if removed.is_empty() {
+        return Ok(DropPartitionOutcome::default());
+    }
+    let removed_deletes: Vec<DataFile> = current_delete_files(&table)
+        .await?
+        .into_values()
+        .filter(|d| *d.partition() == want)
+        .collect();
+    let outcome = DropPartitionOutcome {
+        data_files: removed.len(),
+        delete_files: removed_deletes.len(),
+        rows: removed.iter().map(|f| f.record_count()).sum(),
+        bytes: removed.iter().map(|f| f.file_size_in_bytes()).sum(),
+        snapshot_id: None,
+    };
+    tracing::info!(
+        target: PROGRESS_TARGET,
+        table = %ident,
+        phase = "drop-partition",
+        data_files = outcome.data_files,
+        delete_files = outcome.delete_files,
+        rows = outcome.rows
+    );
+    let new_table = commit_rewrite(&table, catalog, removed, removed_deletes, Vec::new()).await?;
+    Ok(DropPartitionOutcome {
+        snapshot_id: new_table.metadata().current_snapshot_id(),
+        ..outcome
+    })
 }
 
 /// Enumerate the table's current-snapshot DATA files, keyed by file path.
