@@ -1754,11 +1754,19 @@ async fn put_chunk(
                 // the chain is read BEFORE `without_url` consumes the error (reqwest::Error is neither Copy nor
                 // Clone); never echo the URL's credentials — the url carries none, but be strict
                 let chain = error_chain(&e);
+                // the REDIRECT target (host:port of the URL the failing request was sent to — the FE, or the BE it
+                // handed us; the stream-load URL carries no credential, auth rides the headers) names WHICH host
+                // dropped the connect; read before `without_url` consumes the error
+                let target = e
+                    .url()
+                    .map(|u| format!("{}:{}", u.host_str().unwrap_or("?"), u.port_or_known_default().unwrap_or(0)))
+                    .unwrap_or_else(|| "?".to_string());
                 return Err(PyValueError::new_err(format!(
-                    "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {}",
+                    "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {} — target: {}",
                     attempt + 1,
                     e.without_url(),
-                    chain
+                    chain,
+                    target
                 )));
             }
         }
