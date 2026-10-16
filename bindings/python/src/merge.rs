@@ -1715,7 +1715,7 @@ fn spread_enabled() -> bool {
     !matches!(std::env::var("PULSE_STREAM_LOAD_SPREAD").ok().as_deref().map(str::trim), Some("0") | Some("false") | Some("off"))
 }
 
-static SPREAD_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// The URL to PUT to for this attempt: `url` with its host replaced by one of the name's IPv4 addresses, chosen
 /// round-robin (`turn + attempt` over the sorted address list). Any failure to parse / resolve → the URL unchanged.
@@ -1768,7 +1768,7 @@ async fn put_chunk(
     let max_retries = put_send_retries();
     let conn_close = conn_close_enabled();
     let spread = spread_enabled();
-    let turn = SPREAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let turn = SPREAD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut attempt: usize = 0;
     let mut label_used = label.to_string();
     loop {
