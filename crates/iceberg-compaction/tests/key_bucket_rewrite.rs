@@ -22,14 +22,15 @@
 //! file and a deletion vector on one backfill file. After the rewrite:
 //!   - the CDC-partition file is untouched (partition filter);
 //!   - the backfill partition holds one file per bucket (`69c`, `69e`, `6a1`,
-//!     `other` for the NULL key), every file's key bounds sharing its prefix —
-//!     the bracket a key-range reader prunes on;
+//!     and `other` for the NULL key and the non-hex `$numberLong` key), every
+//!     prefix file carrying key min/max stats that share its prefix — the
+//!     bracket a key-range reader prunes on;
 //!   - the DV'd row is gone and the DV reabsorbed; every other row survives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, Int32Array, LargeStringArray, RecordBatch, StructArray};
+use arrow_array::{Array, BooleanArray, Int32Array, LargeStringArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use iceberg::delete_vector::DeleteVector;
@@ -265,6 +266,7 @@ async fn key_bucket_rewrite_partitions_the_key_space_of_one_partition() {
             mk(9, "69e"),
             (10, "p", "r", None, Some(true)), // NULL key -> the `other` bucket
             mk(11, "69c"),
+            (14, "p", "r", Some("{\"$numberLong\": \"5\"}".to_string()), Some(true)), // non-hex at byte 10 -> `other`
         ]),
     )
     .await;
@@ -317,7 +319,7 @@ async fn key_bucket_rewrite_partitions_the_key_space_of_one_partition() {
         .commit(&catalog)
         .await
         .unwrap();
-    assert_eq!(read_rows(&table).await.len(), 12, "11 backfill (one DV'd) + 2 CDC rows live");
+    assert_eq!(read_rows(&table).await.len(), 13, "12 backfill (one DV'd) + 2 CDC rows live");
     assert_eq!(current_delete_files(&table).await.unwrap().len(), 1);
 
     let cfg = Config {
@@ -345,36 +347,43 @@ async fn key_bucket_rewrite_partitions_the_key_space_of_one_partition() {
     assert!(!files.contains_key(&a_path), "the rewritten input is gone");
     assert_eq!(current_delete_files(&table).await.unwrap().len(), 0, "the DV is reabsorbed");
 
-    // Every backfill output file's key bounds share ONE 3-hex prefix at byte 10.
+    // Every PREFIX output file carries key min/max stats (the doorway brackets on them) that share ONE
+    // 3-hex prefix at byte 10; the `other` file (NULL + non-hex keys) is the one whose bounds are absent
+    // or not hex at byte 10.
     let key_field = table
         .metadata()
         .current_schema()
         .field_id_by_name("_cdc.key")
         .expect("the key leaf has a field id");
     let backfill_partition = Struct::from_iter(vec![Some(Literal::bool(true))]);
-    let mut prefixes: Vec<String> = Vec::new();
-    let mut other_files = 0usize;
+    let hex3 = |s: &str| s.len() >= 13 && s.as_bytes()[10..13].iter().all(u8::is_ascii_hexdigit);
+    let mut prefixes: Vec<(String, u64)> = Vec::new();
+    let mut other: Vec<u64> = Vec::new();
     for f in files.values() {
         if *f.partition() != backfill_partition {
             continue;
         }
         match (key_bound(f, key_field, true), key_bound(f, key_field, false)) {
-            (Some(lo), Some(hi)) => {
+            (Some(lo), Some(hi)) if hex3(&lo) && hex3(&hi) => {
                 assert_eq!(&lo[10..13], &hi[10..13], "file {} spans prefixes {lo}..{hi}", f.file_path());
-                prefixes.push(lo[10..13].to_string());
+                prefixes.push((lo[10..13].to_string(), f.record_count()));
             }
-            (None, None) => other_files += 1, // the NULL-key file carries no key bounds
-            (lo, hi) => panic!("half-bounded key stats on {}: {lo:?}..{hi:?}", f.file_path()),
+            _ => other.push(f.record_count()),
         }
     }
     prefixes.sort();
-    assert_eq!(prefixes, vec!["69c", "69e", "6a1"], "one output file per prefix");
-    assert_eq!(other_files, 1, "the NULL-key row has its own file");
+    assert_eq!(
+        prefixes,
+        vec![("69c".to_string(), 3), ("69e".to_string(), 3), ("6a1".to_string(), 3)],
+        "one output file per prefix, with key stats, 3 live rows each (id=1 was DV'd out of 69c)"
+    );
+    assert_eq!(other, vec![2], "ONE `other` file holding the NULL-key and the non-hex-key rows");
 
     // Rows: the DV'd id=1 stays gone, everything else survives, keys intact.
     let rows = read_rows(&table).await;
     let ids: Vec<i32> = rows.iter().map(|r| r.0).collect();
-    assert_eq!(ids, (2..=13).collect::<Vec<i32>>());
+    assert_eq!(ids, (2..=14).collect::<Vec<i32>>());
     assert_eq!(rows[8].1, None, "id=10 keeps its NULL key");
     assert_eq!(rows[0].1.as_deref(), Some(oid_key("69e", 2).as_str()));
+    assert_eq!(rows[12].1.as_deref(), Some("{\"$numberLong\": \"5\"}"), "id=14 keeps its non-hex key");
 }
