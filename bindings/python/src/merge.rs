@@ -1746,12 +1746,14 @@ async fn put_chunk(
                     label_used = format!("{label}-r{}", retry_suffix());
                     continue;
                 }
-                // never echo the URL's credentials; the url carries none, but be strict
+                // the chain is read BEFORE `without_url` consumes the error (reqwest::Error is neither Copy nor
+                // Clone); never echo the URL's credentials — the url carries none, but be strict
+                let chain = error_chain(&e);
                 return Err(PyValueError::new_err(format!(
                     "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {}",
                     attempt + 1,
                     e.without_url(),
-                    error_chain(&e)
+                    chain
                 )));
             }
         }
