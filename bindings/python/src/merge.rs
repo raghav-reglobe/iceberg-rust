@@ -1660,36 +1660,101 @@ fn chunk_label(label_prefix: &str, chunk_ix: usize, target: &LoadTarget) -> Stri
     format!("{label_prefix}{chunk_ix}{}", target.label_suffix)
 }
 
+/// The error's SOURCE chain, innermost last (`hyper: connection closed <- Broken pipe (os error 32)`) —
+/// `reqwest::Error`'s Display stops at "error sending request"; the cause lives in the chain.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
+    while let Some(src) = cur {
+        let t = src.to_string();
+        if parts.last().map(|p| p != &t).unwrap_or(true) {
+            parts.push(t);
+        }
+        cur = src.source();
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" <- ")
+    }
+}
+
+/// ONE more PUT is allowed when the previous one failed on SEND before any response (`is_request`, not a
+/// timeout: a timed-out send already spent the whole budget) and the attempt count is under the cap. A failure
+/// AFTER a response (status / decode / body) is never retried — the BE may have opened the txn.
+fn send_retry_allowed(is_request: bool, is_timeout: bool, attempt: usize, max_retries: usize) -> bool {
+    is_request && !is_timeout && attempt < max_retries
+}
+
+/// `PULSE_STREAM_LOAD_PUT_RETRIES` (default 1): retries of a PUT that failed on send.
+fn put_send_retries() -> usize {
+    std::env::var("PULSE_STREAM_LOAD_PUT_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+}
+
+/// `PULSE_STREAM_LOAD_CONN_CLOSE` (default off): `Connection: close` on every PUT — no keep-alive reuse between
+/// chunks (a stale pooled connection to a BE dies on the next write; a fresh connection per PUT rules it out).
+fn conn_close_enabled() -> bool {
+    matches!(std::env::var("PULSE_STREAM_LOAD_CONN_CLOSE").ok().as_deref().map(str::trim),
+             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on"))
+}
+
+/// PUT one chunk to one target; returns (the label actually used, the BE's reply). A send failure before any
+/// response is retried once (fresh label — the BE never opened a txn for the half-sent body: it cancels it as
+/// "sender is gone"); the final error text carries the attempt count and the error's source chain.
 async fn put_chunk(
     client: &reqwest::Client,
     target: &LoadTarget,
     label: &str,
     body: bytes::Bytes,
-) -> PyResult<serde_json::Value> {
-    let mut req = client
-        .put(&target.url)
-        .basic_auth(&target.user, Some(&target.password))
-        .header("Expect", "100-continue")
-        .header("label", label)
-        .timeout(std::time::Duration::from_secs(target.timeout_s));
-    for (k, v) in &target.headers {
-        if k.eq_ignore_ascii_case("label") {
-            continue;
+) -> PyResult<(String, serde_json::Value)> {
+    let max_retries = put_send_retries();
+    let conn_close = conn_close_enabled();
+    let mut attempt: usize = 0;
+    let mut label_used = label.to_string();
+    loop {
+        let mut req = client
+            .put(&target.url)
+            .basic_auth(&target.user, Some(&target.password))
+            .header("Expect", "100-continue")
+            .header("label", label_used.as_str())
+            .timeout(std::time::Duration::from_secs(target.timeout_s));
+        if conn_close {
+            req = req.header("Connection", "close");
         }
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req.body(body).send().await.map_err(|e| {
-        // never echo the URL's credentials; the url carries none, but be strict
-        PyValueError::new_err(format!("stream load PUT failed for label {label}: {}", e.without_url()))
-    })?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(serde_json::json!({
-            "Status": "NO_JSON", "HttpStatus": status.as_u16(),
-            "Message": text.chars().take(300).collect::<String>()
-        })),
+        for (k, v) in &target.headers {
+            if k.eq_ignore_ascii_case("label") {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.body(body.clone()).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::json!({
+                        "Status": "NO_JSON", "HttpStatus": status.as_u16(),
+                        "Message": text.chars().take(300).collect::<String>()
+                    }),
+                };
+                return Ok((label_used, v));
+            }
+            Err(e) => {
+                if send_retry_allowed(e.is_request(), e.is_timeout(), attempt, max_retries) {
+                    attempt += 1;
+                    label_used = format!("{label}-r{}", retry_suffix());
+                    continue;
+                }
+                // never echo the URL's credentials; the url carries none, but be strict
+                return Err(PyValueError::new_err(format!(
+                    "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {}",
+                    attempt + 1,
+                    e.without_url(),
+                    error_chain(&e)
+                )));
+            }
+        }
     }
 }
 
@@ -1749,11 +1814,12 @@ async fn flush_chunk(
         let bytes = bytes.clone();
         let client = &ctx.client;
         async move {
-            let mut final_label = label.clone();
-            let mut reply = put_chunk(client, target, &final_label, bytes.clone()).await?;
+            let (mut final_label, mut reply) = put_chunk(client, target, label, bytes.clone()).await?;
             if reply.get("Status").and_then(|s| s.as_str()) == Some("Label Already Exists") {
-                final_label = format!("{label}-r{}", retry_suffix());
-                reply = put_chunk(client, target, &final_label, bytes).await?;
+                let retry = format!("{label}-r{}", retry_suffix());
+                let (l2, r2) = put_chunk(client, target, &retry, bytes).await?;
+                final_label = l2;
+                reply = r2;
             }
             Ok::<(String, String), PyErr>((final_label, serde_json::to_string(&reply).unwrap_or_default()))
         }
@@ -1994,6 +2060,62 @@ fn stream_load_impl(
         d.set_item("targets", n_targets)?;
         Ok(d.into_any().unbind())
     })
+}
+
+#[cfg(test)]
+mod put_chunk_send_retry_tests {
+    //! Roll 99 (2026-10-16): product_quote's chunk PUTs died "error sending request" with the cause hidden
+    //! (reqwest's Display stops at the request phase) on turbulent AND whole write groups; the doorway now names
+    //! the cause, retries a pre-response send failure once with a fresh label, and can close the connection
+    //! per PUT. These pin the pure rules.
+    use super::*;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn the_error_chain_names_every_cause_innermost_last_and_dedups_repeats() {
+        let e = Layer("error sending request", Some(Box::new(Layer("connection closed before message completed",
+                      Some(Box::new(Layer("Broken pipe (os error 32)", None)))))));
+        assert_eq!(error_chain(&e), "connection closed before message completed <- Broken pipe (os error 32)");
+        let same = Layer("x", Some(Box::new(Layer("reset", Some(Box::new(Layer("reset", None)))))));
+        assert_eq!(error_chain(&same), "reset");
+        assert_eq!(error_chain(&Layer("alone", None)), "none");
+    }
+
+    #[test]
+    fn a_pre_response_send_failure_retries_once_but_timeouts_and_post_response_failures_never() {
+        assert!(send_retry_allowed(true, false, 0, 1));          // the first send failure → one more PUT
+        assert!(!send_retry_allowed(true, false, 1, 1));         // the retry failed too → surface it
+        assert!(!send_retry_allowed(true, true, 0, 1));          // a timed-out send spent the budget
+        assert!(!send_retry_allowed(false, false, 0, 1));        // status / decode / body = after a response
+        assert!(!send_retry_allowed(true, false, 0, 0));         // PULSE_STREAM_LOAD_PUT_RETRIES=0 = the old behaviour
+        assert!(send_retry_allowed(true, false, 2, 3));
+    }
+
+    #[test]
+    fn the_knobs_default_to_one_retry_and_keep_alive() {
+        std::env::remove_var("PULSE_STREAM_LOAD_PUT_RETRIES");
+        std::env::remove_var("PULSE_STREAM_LOAD_CONN_CLOSE");
+        assert_eq!(put_send_retries(), 1);
+        assert!(!conn_close_enabled());
+        std::env::set_var("PULSE_STREAM_LOAD_PUT_RETRIES", "0");
+        std::env::set_var("PULSE_STREAM_LOAD_CONN_CLOSE", "1");
+        assert_eq!(put_send_retries(), 0);
+        assert!(conn_close_enabled());
+        std::env::remove_var("PULSE_STREAM_LOAD_PUT_RETRIES");
+        std::env::remove_var("PULSE_STREAM_LOAD_CONN_CLOSE");
+    }
 }
 
 #[cfg(test)]
