@@ -1691,6 +1691,17 @@ fn send_retry_allowed(is_request: bool, is_timeout: bool, is_connect: bool, atte
     is_request && (is_connect || !is_timeout) && attempt < max_retries
 }
 
+/// The cause chain of a failed send names an OS-level TRANSPORT death — `… (os error N)` (ETIMEDOUT on a stalled
+/// socket, ECONNRESET, EPIPE) or hyper's "connection error" — as opposed to reqwest's own request timer
+/// ("operation timed out", no os error). 2026-10-16 10:11/10:22Z: product_quote's chunks died in hyper's
+/// SendRequest phase (the socket was open, the body stalled) with `Connection timed out (os error 110)` — reqwest
+/// says `is_timeout()` and NOT `is_connect()`, so the gate above refused the retry; the BE never got the whole
+/// body (no txn), so a retry is exactly right there too.
+fn chain_is_transport_death(chain: &str) -> bool {
+    chain.contains("os error") || chain.contains("connection error") || chain.contains("reset by peer")
+        || chain.contains("broken pipe")
+}
+
 /// `PULSE_STREAM_LOAD_PUT_RETRIES` (default 1): retries of a PUT that failed on send.
 fn put_send_retries() -> usize {
     std::env::var("PULSE_STREAM_LOAD_PUT_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
@@ -1803,7 +1814,8 @@ async fn put_chunk(
                 return Ok((label_used, v));
             }
             Err(e) => {
-                if send_retry_allowed(e.is_request(), e.is_timeout(), e.is_connect(), attempt, max_retries) {
+                let transport = chain_is_transport_death(&error_chain(&e));
+                if send_retry_allowed(e.is_request(), e.is_timeout(), e.is_connect() || transport, attempt, max_retries) {
                     // a send failure in a BE's restart window (reset by peer / connect timeout while the pod IP
                     // moves) repeats within milliseconds — 2026-10-16 09:01Z: four tables' retries hit the same
                     // reset; wait before the retry (PULSE_STREAM_LOAD_RETRY_DELAY_MS, default 3000)
@@ -2184,6 +2196,11 @@ mod put_chunk_send_retry_tests {
         assert!(!send_retry_allowed(true, false, false, 0, 0));         // PULSE_STREAM_LOAD_PUT_RETRIES=0 = the old behaviour
         assert!(send_retry_allowed(true, false, false, 2, 3));
         assert!(!send_retry_allowed(true, true, true, 1, 1));           // the cap still binds a connect retry
+        // the transport-death reading of a cause chain (10-16: SendRequest-phase ETIMEDOUT = retry; reqwest's own timer = not)
+        assert!(chain_is_transport_death("client error (SendRequest) <- connection error <- Connection timed out (os error 110)"));
+        assert!(chain_is_transport_death("client error (SendRequest) <- connection error <- Connection reset by peer (os error 104)"));
+        assert!(!chain_is_transport_death("operation timed out"));
+        assert!(!chain_is_transport_death("none"));
     }
 
     #[test]
