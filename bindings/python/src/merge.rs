@@ -1679,11 +1679,16 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     }
 }
 
-/// ONE more PUT is allowed when the previous one failed on SEND before any response (`is_request`, not a
-/// timeout: a timed-out send already spent the whole budget) and the attempt count is under the cap. A failure
+/// ONE more PUT is allowed when the previous one failed on SEND before any response (`is_request`; a CONNECT
+/// failure always qualifies, a request-level timeout never — it spent the whole budget) and the attempt count is under the cap. A failure
 /// AFTER a response (status / decode / body) is never retried — the BE may have opened the txn.
-fn send_retry_allowed(is_request: bool, is_timeout: bool, attempt: usize, max_retries: usize) -> bool {
-    is_request && !is_timeout && attempt < max_retries
+fn send_retry_allowed(is_request: bool, is_timeout: bool, is_connect: bool, attempt: usize, max_retries: usize) -> bool {
+    // A CONNECT failure spent nothing (the socket never opened) even when the OS reports it as a timeout
+    // (`Connection timed out (os error 110)` — reqwest flags that `is_timeout()`): a fresh connection, possibly a
+    // different redirect target, is exactly the retry (2026-10-16: the write BEs' pod IPs change under Karpenter
+    // consolidation and the FE redirect hands the stale FQDN for ~1–2 min). Only the REQUEST-level timeout — the
+    // whole budget spent on an opened connection — stays non-retried.
+    is_request && (is_connect || !is_timeout) && attempt < max_retries
 }
 
 /// `PULSE_STREAM_LOAD_PUT_RETRIES` (default 1): retries of a PUT that failed on send.
@@ -1741,7 +1746,7 @@ async fn put_chunk(
                 return Ok((label_used, v));
             }
             Err(e) => {
-                if send_retry_allowed(e.is_request(), e.is_timeout(), attempt, max_retries) {
+                if send_retry_allowed(e.is_request(), e.is_timeout(), e.is_connect(), attempt, max_retries) {
                     attempt += 1;
                     label_used = format!("{label}-r{}", retry_suffix());
                     continue;
@@ -2097,12 +2102,15 @@ mod put_chunk_send_retry_tests {
 
     #[test]
     fn a_pre_response_send_failure_retries_once_but_timeouts_and_post_response_failures_never() {
-        assert!(send_retry_allowed(true, false, 0, 1));          // the first send failure → one more PUT
-        assert!(!send_retry_allowed(true, false, 1, 1));         // the retry failed too → surface it
-        assert!(!send_retry_allowed(true, true, 0, 1));          // a timed-out send spent the budget
-        assert!(!send_retry_allowed(false, false, 0, 1));        // status / decode / body = after a response
-        assert!(!send_retry_allowed(true, false, 0, 0));         // PULSE_STREAM_LOAD_PUT_RETRIES=0 = the old behaviour
-        assert!(send_retry_allowed(true, false, 2, 3));
+        assert!(send_retry_allowed(true, false, false, 0, 1));          // the first send failure → one more PUT
+        assert!(!send_retry_allowed(true, false, false, 1, 1));         // the retry failed too → surface it
+        assert!(!send_retry_allowed(true, true, false, 0, 1));          // a timed-out REQUEST spent the budget
+        assert!(send_retry_allowed(true, true, true, 0, 1));            // a CONNECT timeout (os error 110) spent nothing → retry
+        assert!(send_retry_allowed(true, false, true, 0, 1));           // connection refused / reset → retry
+        assert!(!send_retry_allowed(false, false, false, 0, 1));        // status / decode / body = after a response
+        assert!(!send_retry_allowed(true, false, false, 0, 0));         // PULSE_STREAM_LOAD_PUT_RETRIES=0 = the old behaviour
+        assert!(send_retry_allowed(true, false, false, 2, 3));
+        assert!(!send_retry_allowed(true, true, true, 1, 1));           // the cap still binds a connect retry
     }
 
     #[test]
