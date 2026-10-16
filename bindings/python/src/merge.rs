@@ -1698,6 +1698,14 @@ fn put_send_retries() -> usize {
 
 /// `PULSE_STREAM_LOAD_CONN_CLOSE` (default off): `Connection: close` on every PUT — no keep-alive reuse between
 /// chunks (a stale pooled connection to a BE dies on the next write; a fresh connection per PUT rules it out).
+/// `PULSE_STREAM_LOAD_RETRY_DELAY_MS` (default 3000): the pause before the one send retry.
+fn put_retry_delay_ms() -> u64 {
+    std::env::var("PULSE_STREAM_LOAD_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3000)
+}
+
 fn conn_close_enabled() -> bool {
     matches!(std::env::var("PULSE_STREAM_LOAD_CONN_CLOSE").ok().as_deref().map(str::trim),
              Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on"))
@@ -1747,6 +1755,10 @@ async fn put_chunk(
             }
             Err(e) => {
                 if send_retry_allowed(e.is_request(), e.is_timeout(), e.is_connect(), attempt, max_retries) {
+                    // a send failure in a BE's restart window (reset by peer / connect timeout while the pod IP
+                    // moves) repeats within milliseconds — 2026-10-16 09:01Z: four tables' retries hit the same
+                    // reset; wait before the retry (PULSE_STREAM_LOAD_RETRY_DELAY_MS, default 3000)
+                    tokio::time::sleep(std::time::Duration::from_millis(put_retry_delay_ms())).await;
                     attempt += 1;
                     label_used = format!("{label}-r{}", retry_suffix());
                     continue;
@@ -2125,8 +2137,13 @@ mod put_chunk_send_retry_tests {
     fn the_knobs_default_to_one_retry_and_keep_alive() {
         std::env::remove_var("PULSE_STREAM_LOAD_PUT_RETRIES");
         std::env::remove_var("PULSE_STREAM_LOAD_CONN_CLOSE");
+        std::env::remove_var("PULSE_STREAM_LOAD_RETRY_DELAY_MS");
         assert_eq!(put_send_retries(), 1);
         assert!(!conn_close_enabled());
+        assert_eq!(put_retry_delay_ms(), 3000);
+        std::env::set_var("PULSE_STREAM_LOAD_RETRY_DELAY_MS", "250");
+        assert_eq!(put_retry_delay_ms(), 250);
+        std::env::remove_var("PULSE_STREAM_LOAD_RETRY_DELAY_MS");
         std::env::set_var("PULSE_STREAM_LOAD_PUT_RETRIES", "0");
         std::env::set_var("PULSE_STREAM_LOAD_CONN_CLOSE", "1");
         assert_eq!(put_send_retries(), 0);
