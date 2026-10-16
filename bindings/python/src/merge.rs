@@ -1740,6 +1740,7 @@ async fn put_chunk(
             }
             req = req.header(k.as_str(), v.as_str());
         }
+        let sent_at = std::time::Instant::now();
         match req.body(body.clone()).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -1773,12 +1774,16 @@ async fn put_chunk(
                     .url()
                     .map(|u| format!("{}:{}", u.host_str().unwrap_or("?"), u.port_or_known_default().unwrap_or(0)))
                     .unwrap_or_else(|| "?".to_string());
+                // how long the failed send took: a kernel SYN timeout is 63–127 s, an immediate reset < 1 s, a stall
+                // mid-body anything in between — the number that separates the classes (2026-10-16: deaths at 36–60 s)
+                let after_s = sent_at.elapsed().as_secs_f64();
                 return Err(PyValueError::new_err(format!(
-                    "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {} — target: {}",
+                    "stream load PUT failed for label {label_used} (attempt {}): {} — cause: {} — target: {} — after {:.1}s",
                     attempt + 1,
                     e.without_url(),
                     chain,
-                    target
+                    target,
+                    after_s
                 )));
             }
         }
