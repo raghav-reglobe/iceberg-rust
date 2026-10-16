@@ -439,7 +439,7 @@ fn bloom_writer_properties(table: &Table, row_group_rows: Option<usize>) -> Writ
     // The key-bucket rewrite keeps hundreds of writers open at once: a small
     // row group bounds each writer's buffer (the default row group is 1M rows).
     if let Some(rows) = row_group_rows {
-        builder = builder.set_max_row_group_row_count(rows.max(1));
+        builder = builder.set_max_row_group_row_count(Some(rows.max(1)));
     }
     for (key, val) in props {
         let Some(col) = key.strip_prefix(ENABLED) else {
