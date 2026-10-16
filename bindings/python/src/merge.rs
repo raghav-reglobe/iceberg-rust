@@ -1706,6 +1706,51 @@ fn put_retry_delay_ms() -> u64 {
         .unwrap_or(3000)
 }
 
+/// `PULSE_STREAM_LOAD_SPREAD` (default on; `0` = off): the PUT's host name is resolved per call and the chunks ROTATE
+/// over its addresses (a process-wide counter + the attempt), so a headless service name spreads the loads over every
+/// BE behind it instead of hyper's first-address-every-time (2026-10-16: write-0 took every stream load of the D
+/// windows and the leg and ran CPU-throttled in 99.7 % of periods while the spot BEs idled); a retry moves to the
+/// NEXT address. An IP-literal or single-address host is used as is.
+fn spread_enabled() -> bool {
+    !matches!(std::env::var("PULSE_STREAM_LOAD_SPREAD").ok().as_deref().map(str::trim), Some("0") | Some("false") | Some("off"))
+}
+
+static SPREAD_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The URL to PUT to for this attempt: `url` with its host replaced by one of the name's IPv4 addresses, chosen
+/// round-robin (`turn + attempt` over the sorted address list). Any failure to parse / resolve → the URL unchanged.
+async fn spread_target(url: &str, turn: usize, attempt: usize) -> String {
+    let mut parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return url.to_string(),
+    };
+    let host = match parsed.host_str() {
+        Some(h) if h.parse::<std::net::IpAddr>().is_err() => h.to_string(),
+        _ => return url.to_string(),
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        let mut v: Vec<std::net::Ipv4Addr> = (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.filter_map(|a| match a { std::net::SocketAddr::V4(v4) => Some(*v4.ip()), _ => None }).collect())
+            .unwrap_or_default();
+        v.sort();
+        v.dedup();
+        v
+    })
+    .await
+    .unwrap_or_default();
+    if addrs.len() < 2 {
+        return url.to_string();
+    }
+    let ip = addrs[(turn + attempt) % addrs.len()];
+    if parsed.set_ip_host(std::net::IpAddr::V4(ip)).is_err() {
+        return url.to_string();
+    }
+    parsed.to_string()
+}
+
 fn conn_close_enabled() -> bool {
     matches!(std::env::var("PULSE_STREAM_LOAD_CONN_CLOSE").ok().as_deref().map(str::trim),
              Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on"))
@@ -1722,11 +1767,14 @@ async fn put_chunk(
 ) -> PyResult<(String, serde_json::Value)> {
     let max_retries = put_send_retries();
     let conn_close = conn_close_enabled();
+    let spread = spread_enabled();
+    let turn = SPREAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut attempt: usize = 0;
     let mut label_used = label.to_string();
     loop {
+        let url = if spread { spread_target(&target.url, turn, attempt).await } else { target.url.clone() };
         let mut req = client
-            .put(&target.url)
+            .put(&url)
             .basic_auth(&target.user, Some(&target.password))
             .header("Expect", "100-continue")
             .header("label", label_used.as_str())
@@ -2146,6 +2194,11 @@ mod put_chunk_send_retry_tests {
         assert_eq!(put_send_retries(), 1);
         assert!(!conn_close_enabled());
         assert_eq!(put_retry_delay_ms(), 3000);
+        std::env::remove_var("PULSE_STREAM_LOAD_SPREAD");
+        assert!(spread_enabled());
+        std::env::set_var("PULSE_STREAM_LOAD_SPREAD", "0");
+        assert!(!spread_enabled());
+        std::env::remove_var("PULSE_STREAM_LOAD_SPREAD");
         std::env::set_var("PULSE_STREAM_LOAD_RETRY_DELAY_MS", "250");
         assert_eq!(put_retry_delay_ms(), 250);
         std::env::remove_var("PULSE_STREAM_LOAD_RETRY_DELAY_MS");
