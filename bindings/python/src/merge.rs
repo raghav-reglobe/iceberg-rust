@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, Fields, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Schema, TimeUnit};
 use datafusion::common::resources_datafusion_err;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{
@@ -1447,7 +1447,7 @@ impl DerivedPlan {
     /// column (the document column of the SELECT), a derived name must not collide with a projected column.
     fn build(
         specs: Option<Vec<(String, String, String, String)>>,
-        schema: &datafusion::arrow::datatypes::Schema,
+        schema: &Schema,
     ) -> PyResult<DerivedPlan> {
         let mut plan = DerivedPlan::default();
         for (col, src, path, dt) in specs.unwrap_or_default() {
@@ -2354,7 +2354,7 @@ mod stream_load_encoder_tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, Some(1)])), Arc::new(StringArray::from(vec![Some("x"), Some("y")]))]).unwrap();
         let (_, pks) = enc_batch(&batch, &[], &["id"]);
         assert!(pks[0].is_none() && pks[1].is_some());
-        assert!(col_encoder(&DataType::Struct(Fields::empty()), false).is_err());
+        assert!(col_encoder(&DataType::Struct(datafusion::arrow::datatypes::Fields::empty()), false).is_err());
     }
 
     #[test]
