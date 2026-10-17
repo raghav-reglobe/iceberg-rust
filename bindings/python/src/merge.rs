@@ -1435,6 +1435,41 @@ fn timestamp_text(v: i64, unit: &TimeUnit) -> Option<String> {
 /// Encode row `i` of `batch` as one JSON object line into `out`; returns the
 /// pk tuple (as JSON-encoded scalars, for the distinct set) or None when a pk
 /// component is null.
+/// The hot columns derived at encode time (hot_derive): per SOURCE column index of the projection, the specs
+/// read from that document. Empty = the pre-2026-10-17 line, byte for byte.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DerivedPlan {
+    pub(crate) by_src: Vec<(usize, Vec<iceberg::hot_derive::Spec>)>,
+}
+
+impl DerivedPlan {
+    /// From the Python specs `(column, source_column, dotted_path, doris_type)`: the source must be a projected
+    /// column (the document column of the SELECT), a derived name must not collide with a projected column.
+    fn build(
+        specs: Option<Vec<(String, String, String, String)>>,
+        schema: &datafusion::arrow::datatypes::Schema,
+    ) -> PyResult<DerivedPlan> {
+        let mut plan = DerivedPlan::default();
+        for (col, src, path, dt) in specs.unwrap_or_default() {
+            if schema.index_of(&col).is_ok() {
+                return Err(PyValueError::new_err(format!(
+                    "derived column `{col}` is also a column of the SELECT projection"
+                )));
+            }
+            let idx = schema.index_of(&src).map_err(|_| {
+                PyValueError::new_err(format!("derived column `{col}`: source `{src}` is not in the SELECT projection"))
+            })?;
+            let spec = iceberg::hot_derive::Spec::new(&col, &src, &path, &dt);
+            match plan.by_src.iter_mut().find(|(i, _)| *i == idx) {
+                Some((_, v)) => v.push(spec),
+                None => plan.by_src.push((idx, vec![spec])),
+            }
+        }
+        Ok(plan)
+    }
+}
+
+#[cfg(test)]
 fn encode_row(
     batch: &RecordBatch,
     i: usize,
@@ -1442,6 +1477,20 @@ fn encode_row(
     encs: &[ColEnc],
     pk_idx: &[usize],
     out: &mut Vec<u8>,
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    encode_row_derived(batch, i, keys, encs, pk_idx, out, &DerivedPlan::default())
+}
+
+/// `encode_row` + the derived hot columns: the source document (a projected VARIANT-as-text column) is parsed
+/// ONCE per row and every spec's value is appended as a plain field — the BE never derives.
+fn encode_row_derived(
+    batch: &RecordBatch,
+    i: usize,
+    keys: &[Vec<u8>],
+    encs: &[ColEnc],
+    pk_idx: &[usize],
+    out: &mut Vec<u8>,
+    derived: &DerivedPlan,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
     use datafusion::arrow::array::*;
     use DataType as T;
@@ -1576,6 +1625,22 @@ fn encode_row(
             let _ = k;
             pk.push(out[start..].to_vec());
         }
+    }
+    for (src_idx, specs) in &derived.by_src {
+        use datafusion::arrow::array::*;
+        let col = &batch.columns()[*src_idx];
+        let doc: Option<serde_json::Value> = if col.is_null(i) {
+            None
+        } else {
+            let text: &str = match col.data_type() {
+                DataType::Utf8 => col.as_string::<i32>().value(i),
+                DataType::LargeUtf8 => col.as_string::<i64>().value(i),
+                DataType::Utf8View => col.as_string_view().value(i),
+                _ => "",
+            };
+            serde_json::from_str::<serde_json::Value>(text).ok()
+        };
+        iceberg::hot_derive::append_fields(out, doc.as_ref(), specs, json_str);
     }
     out.push(b'}');
     out.push(b'\n');
@@ -1952,7 +2017,7 @@ async fn await_flush(h: tokio::task::JoinHandle<PyResult<bool>>) -> PyResult<boo
 /// reply is still delivered — the executor decides. `Label Already Exists` is
 /// retried once with `-r<8hex>` and the final label reported.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files, load, headers, chunk_rows, pk_cols, variant_cols, label_prefix, label_suffix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None))]
+#[pyo3(signature = (catalogs, sql, scan_files, load, headers, chunk_rows, pk_cols, variant_cols, label_prefix, label_suffix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None, derived=None))]
 #[allow(clippy::too_many_arguments)]
 fn stream_load_file(
     py: Python<'_>,
@@ -1970,12 +2035,13 @@ fn stream_load_file(
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
     snapshot_ids: Option<HashMap<String, i64>>,
+    derived: Option<Vec<(String, String, String, String)>>,
 ) -> PyResult<Py<PyAny>> {
     let mut load = load;
     load.insert("label_suffix".to_string(), label_suffix);
     let targets = vec![build_load_target(&load, &headers)?];
     stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
-                     on_chunk, scoped_tables, local_tables, snapshot_ids, false)
+                     on_chunk, scoped_tables, local_tables, snapshot_ids, false, derived)
 }
 
 /// The multi-target form of `stream_load_file`: ONE bronze read and ONE
@@ -1989,7 +2055,7 @@ fn stream_load_file(
 /// Pass `pk_cols=[]` when the executor needs no keys (v2 has no routing) —
 /// the pk tuple set is then empty and costs nothing.
 #[pyfunction]
-#[pyo3(signature = (catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None))]
+#[pyo3(signature = (catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix, on_chunk, scoped_tables=None, local_tables=None, snapshot_ids=None, derived=None))]
 #[allow(clippy::too_many_arguments)]
 fn stream_load_file_multi(
     py: Python<'_>,
@@ -2005,10 +2071,11 @@ fn stream_load_file_multi(
     scoped_tables: Option<HashMap<String, Vec<String>>>,
     local_tables: Option<HashMap<String, String>>,
     snapshot_ids: Option<HashMap<String, i64>>,
+    derived: Option<Vec<(String, String, String, String)>>,
 ) -> PyResult<Py<PyAny>> {
     let targets = build_load_targets(&targets)?;
     stream_load_impl(py, catalogs, sql, scan_files, targets, chunk_rows, pk_cols, variant_cols, label_prefix,
-                     on_chunk, scoped_tables, local_tables, snapshot_ids, true)
+                     on_chunk, scoped_tables, local_tables, snapshot_ids, true, derived)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2027,6 +2094,7 @@ fn stream_load_impl(
     local_tables: Option<HashMap<String, String>>,
     snapshot_ids: Option<HashMap<String, i64>>,
     multi: bool,
+    derived: Option<Vec<(String, String, String, String)>>,
 ) -> PyResult<Py<PyAny>> {
     use datafusion::logical_expr::LogicalPlan;
     use futures::StreamExt;
@@ -2072,6 +2140,7 @@ fn stream_load_impl(
                 .iter()
                 .map(|f| col_encoder(f.data_type(), variant_cols.iter().any(|v| v == f.name())))
                 .collect::<PyResult<_>>()?;
+            let derived_plan = DerivedPlan::build(derived.clone(), &schema)?;
             let pk_idx: Vec<usize> = pk_cols
                 .iter()
                 .map(|c| {
@@ -2110,7 +2179,7 @@ fn stream_load_impl(
             while let Some(batch) = stream.next().await {
                 let batch = batch.map_err(|e| PyValueError::new_err(format!("reading batch: {e}")))?;
                 for i in 0..batch.num_rows() {
-                    if let Some(pk) = encode_row(&batch, i, &keys, &encs, &pk_idx, &mut body)? {
+                    if let Some(pk) = encode_row_derived(&batch, i, &keys, &encs, &pk_idx, &mut body, &derived_plan)? {
                         pks.insert(pk);
                     }
                     n_rows += 1;
@@ -2341,8 +2410,24 @@ mod stream_load_encoder_tests {
     }
 }
 
+/// The derived fields of ONE document as the encoder would append them (`{"col": value, …}`), for the referee of
+/// the encode-time derivation against the header path (scripts/warehouse/m1_hot_header_probe.py --encoder-derive):
+/// `specs` = `(column, source_column, dotted_path, doris_type)`; an unparseable document = every field null.
+#[pyfunction]
+fn derive_fields_json(doc_json: String, specs: Vec<(String, String, String, String)>) -> PyResult<String> {
+    let doc = serde_json::from_str::<serde_json::Value>(&doc_json).ok();
+    let specs: Vec<iceberg::hot_derive::Spec> =
+        specs.iter().map(|(c, s, p, t)| iceberg::hot_derive::Spec::new(c, s, p, t)).collect();
+    let mut out = Vec::new();
+    iceberg::hot_derive::append_fields(&mut out, doc.as_ref(), &specs, json_str);
+    let body = String::from_utf8(out).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(format!("{{{}}}", body.strip_prefix(',').unwrap_or(&body)))
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "merge")?;
+    this.add("STREAM_LOAD_DERIVED", true)?;   // the wheel carries encode-time hot columns (doris_scd4_v2 feature-detects)
+    this.add_function(wrap_pyfunction!(derive_fields_json, &this)?)?;
     this.add_function(wrap_pyfunction!(merge_into, &this)?)?;
     this.add_function(wrap_pyfunction!(merge_into_window, &this)?)?;
     this.add_function(wrap_pyfunction!(dry_run_inspect, &this)?)?;
