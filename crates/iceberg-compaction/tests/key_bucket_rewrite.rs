@@ -572,13 +572,19 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_rows_by_op_stamp() 
         s0_a.iter().chain(s0_b.iter()).map(|f| f.file_path().to_string()).collect();
     let a_path = s0_a[0].file_path().to_string();
 
-    // Evolve: the `_is_backfill` identity partition becomes the default spec (spec 1).
+    // Evolve: the `_is_backfill` identity partition becomes the default spec (spec 1). The catalog assigns fresh
+    // field ids at create (top-level fields first, nested after), so the spec names the column's LIVE id.
+    let bf_id = table
+        .metadata()
+        .current_schema()
+        .field_id_by_name("_is_backfill")
+        .expect("the column has a field id");
     let evolve = TableCommit::builder()
         .ident(ident.clone())
         .updates(vec![
             TableUpdate::AddSpec {
                 spec: UnboundPartitionSpec::builder()
-                    .add_partition_field(6, "_is_backfill", Transform::Identity)
+                    .add_partition_field(bf_id, "_is_backfill", Transform::Identity)
                     .unwrap()
                     .build(),
             },
