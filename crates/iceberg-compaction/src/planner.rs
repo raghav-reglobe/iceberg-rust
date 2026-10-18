@@ -198,6 +198,18 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
             Some(Struct::from_iter(vec![Some(Literal::bool(*v))]))
         )
     });
+    // `partition_filter_unpartitioned`: only the files whose partition struct
+    // is EMPTY (written under an unpartitioned spec) are planned — the loader
+    // era of a table that evolved an identity partition later. Both renderings
+    // a task may carry for "no partition" are accepted.
+    let unpartitioned_keys: Vec<String> = if cfg.partition_filter_unpartitioned {
+        vec![
+            format!("{:?}", Some(Struct::empty())),
+            format!("{:?}", None::<Struct>),
+        ]
+    } else {
+        Vec::new()
+    };
     // The key-bucket rewrite plans EVERY file of the partition (rewrite_all
     // semantics): the point is the layout, not the size.
     let bucket_mode = cfg.key_bucket.is_some();
@@ -209,6 +221,10 @@ pub fn plan_compaction(tasks: Vec<FileScanTask>, cfg: &Config) -> Plan {
         if let Some(want) = &partition_filter_key
             && key != *want
         {
+            plan.skipped_files += 1;
+            continue;
+        }
+        if !unpartitioned_keys.is_empty() && !unpartitioned_keys.contains(&key) {
             plan.skipped_files += 1;
             continue;
         }

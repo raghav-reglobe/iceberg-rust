@@ -15,7 +15,7 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::{ArrowReader, RecordBatchPartitionSplitter};
 use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::spec::{DataFile, DataFileFormat, Literal, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -215,6 +215,7 @@ pub(crate) async fn read_route_write(
                         cfg.target_file_size_bytes,
                         overrides.clone(),
                         Some(kb.row_group_rows),
+                        cfg.partition_override.as_ref(),
                     )
                     .await?,
                 );
@@ -295,7 +296,16 @@ async fn flush_chunk(
             (shredded.pop().expect("one batch in, one out"), overrides)
         };
         if sink.is_none() {
-            *sink = Some(CompactSink::build(table, cfg.target_file_size_bytes, overrides, None).await?);
+            *sink = Some(
+                CompactSink::build(
+                    table,
+                    cfg.target_file_size_bytes,
+                    overrides,
+                    None,
+                    cfg.partition_override.as_ref(),
+                )
+                .await?,
+            );
         }
         sink.as_mut().expect("just built").write(slice).await?;
     }
@@ -333,6 +343,7 @@ impl CompactSink {
         target_file_size_bytes: u64,
         variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
         row_group_rows: Option<usize>,
+        partition_override: Option<&(String, bool)>,
     ) -> Result<Self> {
         let schema = table.metadata().current_schema().clone();
         let rolling = RollingFileWriterBuilder::new(
@@ -359,6 +370,31 @@ impl CompactSink {
         );
         let data_file_builder = DataFileWriterBuilder::new(rolling);
         let spec = table.metadata().default_partition_spec();
+        if let Some((col, value)) = partition_override {
+            // Every output row under ONE identity partition value (see
+            // `Config::partition_override`): the spec must be exactly that
+            // single identity field, or the override would mislabel data.
+            let fields = spec.fields();
+            let ok = fields.len() == 1
+                && fields[0].name == *col
+                && matches!(fields[0].transform, iceberg::spec::Transform::Identity);
+            if !ok {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!(
+                        "partition_override on `{col}` needs a single identity partition field of that name; the \
+                         default spec has {:?}",
+                        fields.iter().map(|f| (&f.name, &f.transform)).collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            let pk = PartitionKey::new(
+                spec.as_ref().clone(),
+                schema.clone(),
+                Struct::from_iter(vec![Some(Literal::bool(*value))]),
+            );
+            return Ok(Self::Plain(Box::new(data_file_builder.build(Some(pk)).await?)));
+        }
         if spec.is_unpartitioned() {
             Ok(Self::Plain(Box::new(data_file_builder.build(None).await?)))
         } else {

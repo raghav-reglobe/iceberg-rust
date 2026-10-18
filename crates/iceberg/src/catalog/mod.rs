@@ -369,8 +369,13 @@ pub struct TableCreation {
 /// The builder is marked as private since it's dangerous and error-prone to construct
 /// [`TableCommit`] directly.
 /// Users are supposed to use [`crate::transaction::Transaction`] to update table.
+///
+/// Fork (2026-10-18): the builder's `build` is public so an out-of-crate test
+/// (iceberg-compaction's key-bucket rewrite) can evolve a table's partition
+/// spec through `Catalog::update_table` — the loader-era re-home case needs a
+/// table that was unpartitioned first.
 #[derive(Debug, TypedBuilder)]
-#[builder(build_method(vis = "pub(crate)"))]
+#[builder(build_method(vis = "pub"))]
 pub struct TableCommit {
     /// The table ident.
     ident: TableIdent,

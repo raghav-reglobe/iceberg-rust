@@ -55,6 +55,19 @@ pub struct Config {
     /// (`_is_backfill = true`) — the CDC partition must never be read or
     /// rewritten by the key-bucket pass.
     pub partition_filter: Option<(String, bool)>,
+    /// Plan ONLY the files written under an UNPARTITIONED spec (their partition
+    /// struct is empty): the loader-era files of a bronze table that evolved an
+    /// identity partition later. Default false. 2026-10-18: device's 480
+    /// spec-0 files were every repair commit's candidate set (≈ 6 GiB read
+    /// per commit) because no partition predicate can exclude them.
+    pub partition_filter_unpartitioned: bool,
+    /// Write EVERY output row of this pass under one identity partition value
+    /// — `(column, value)` on the table's single-field identity spec — instead
+    /// of the value computed from the row's own column. The only honest way to
+    /// re-home unpartitioned loader-era rows INTO the partition a repair doorway
+    /// predicates on (`_is_backfill = true`) when the rows' column says false.
+    /// None (default) = computed values, today's behaviour.
+    pub partition_override: Option<(String, bool)>,
     /// KEY-BUCKET rewrite ([`KeyBucket`]): route every row by a hex run of a
     /// (nested) string key into one output stream per hex value, so the output
     /// files PARTITION THE KEY SPACE and a key-range plan (the bronze repair
@@ -129,6 +142,8 @@ impl Default for Config {
             sort_column: None,
             rewrite_all: false,
             partition_filter: None,
+            partition_filter_unpartitioned: false,
+            partition_override: None,
             key_bucket: None,
             deadline: None,
             budget: None,
