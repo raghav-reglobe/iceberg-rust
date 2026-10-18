@@ -61,13 +61,17 @@ pub struct Config {
     /// spec-0 files were every repair commit's candidate set (≈ 6 GiB read
     /// per commit) because no partition predicate can exclude them.
     pub partition_filter_unpartitioned: bool,
-    /// Write EVERY output row of this pass under one identity partition value
-    /// — `(column, value)` on the table's single-field identity spec — instead
-    /// of the value computed from the row's own column. The only honest way to
-    /// re-home unpartitioned loader-era rows INTO the partition a repair doorway
-    /// predicates on (`_is_backfill = true`) when the rows' column says false.
-    /// None (default) = computed values, today's behaviour.
-    pub partition_override: Option<(String, bool)>,
+    /// Set a top-level BOOLEAN column to `true` on every rewritten row whose
+    /// string source column holds one of the listed values ([`ColumnStamp`]);
+    /// every other row keeps the value it was read with (NULL when the file
+    /// predates the column). Applied BEFORE the output partition is computed,
+    /// so an identity partition on that column is derived from the stamped
+    /// value and the column and the partition agree on every row — the way to
+    /// re-home rows written under an unpartitioned spec into the partition a
+    /// reader predicates on, one row class at a time, without mislabelling
+    /// the other classes in the same file. None (default) = rows are written
+    /// as read.
+    pub column_stamp: Option<ColumnStamp>,
     /// KEY-BUCKET rewrite ([`KeyBucket`]): route every row by a hex run of a
     /// (nested) string key into one output stream per hex value, so the output
     /// files PARTITION THE KEY SPACE and a key-range plan (the bronze repair
@@ -143,7 +147,7 @@ impl Default for Config {
             rewrite_all: false,
             partition_filter: None,
             partition_filter_unpartitioned: false,
-            partition_override: None,
+            column_stamp: None,
             key_bucket: None,
             deadline: None,
             budget: None,
@@ -162,6 +166,18 @@ impl Default for Config {
 /// repair stream uses (an ObjectId's leading 8 hex are its creation epoch, so
 /// a collection's keys span ~340 three-hex prefixes over its life, ~16 live
 /// per year; 2 hex would give ~20 very uneven buckets).
+/// [`Config::column_stamp`]: `column = true` on the rows whose `source_column`
+/// value is one of `values`; every other row keeps the value it was read with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnStamp {
+    /// A top-level BOOLEAN column of the table.
+    pub column: String,
+    /// Dotted path of a string column (a struct leaf is fine, e.g. `meta.op`).
+    pub source_column: String,
+    /// The `source_column` values whose rows are stamped `true`.
+    pub values: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyBucket {
     /// Dotted path of the string key (`_cdc.key`: a struct leaf).

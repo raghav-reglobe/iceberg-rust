@@ -9,13 +9,15 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, Scalar, StringArray, StructArray, UInt32Array,
+};
 use arrow_schema::DataType;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::{ArrowReader, RecordBatchPartitionSplitter};
 use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use iceberg::spec::{DataFile, DataFileFormat, Literal, PartitionKey, Struct};
+use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -30,7 +32,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
-use crate::config::{Config, KeyBucket};
+use crate::config::{ColumnStamp, Config, KeyBucket};
 use crate::planner::Group;
 use crate::variant_shred;
 
@@ -183,6 +185,10 @@ pub(crate) async fn read_route_write(
         if batch.num_rows() == 0 {
             continue;
         }
+        let batch = match &cfg.column_stamp {
+            Some(stamp) => stamp_batch(batch, stamp)?,
+            None => batch,
+        };
         let (batch, overrides) = if shred_plain.is_empty() {
             (batch, HashMap::new())
         } else {
@@ -215,7 +221,6 @@ pub(crate) async fn read_route_write(
                         cfg.target_file_size_bytes,
                         overrides.clone(),
                         Some(kb.row_group_rows),
-                        cfg.partition_override.as_ref(),
                     )
                     .await?,
                 );
@@ -268,6 +273,33 @@ fn key_leaf_strings(batch: &RecordBatch, dotted: &str) -> Result<StringArray> {
         .ok_or_else(|| anyhow::anyhow!("key leaf `{dotted}`: not a Utf8 array after cast"))
 }
 
+/// [`Config::column_stamp`]: `column = true` on every row whose source leaf
+/// holds one of the stamp's values; every other row keeps the value it was
+/// read with (a file that predates the column reads it as NULL). The output
+/// partition is computed AFTER this, from the stamped column.
+fn stamp_batch(batch: RecordBatch, stamp: &ColumnStamp) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let idx = schema.index_of(&stamp.column).map_err(|_| {
+        anyhow::anyhow!("column_stamp: `{}` is not a top-level column", stamp.column)
+    })?;
+    if schema.field(idx).data_type() != &DataType::Boolean {
+        anyhow::bail!(
+            "column_stamp: `{}` is {:?}, not Boolean",
+            stamp.column,
+            schema.field(idx).data_type()
+        );
+    }
+    let source = key_leaf_strings(&batch, &stamp.source_column)?;
+    let mask = BooleanArray::from_iter((0..batch.num_rows()).map(|row| {
+        Some(source.is_valid(row) && stamp.values.iter().any(|v| v == source.value(row)))
+    }));
+    let truthy = Scalar::new(BooleanArray::from(vec![true]));
+    let stamped = arrow_select::zip::zip(&mask, &truthy, batch.column(idx))?;
+    let mut columns = batch.columns().to_vec();
+    columns[idx] = stamped;
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 /// Sort one buffered chunk and stream its bounded slices into the (lazily
 /// created) group sink.
 async fn flush_chunk(
@@ -286,6 +318,10 @@ async fn flush_chunk(
         if slice.num_rows() == 0 {
             continue;
         }
+        let slice = match &cfg.column_stamp {
+            Some(stamp) => stamp_batch(slice, stamp)?,
+            None => slice,
+        };
         // Shred-preserving mode: re-shred each (canonical, post-fold) slice
         // to the input files' layout; the first slice's actual shredded
         // types become the writer's schema overrides.
@@ -302,7 +338,6 @@ async fn flush_chunk(
                     cfg.target_file_size_bytes,
                     overrides,
                     None,
-                    cfg.partition_override.as_ref(),
                 )
                 .await?,
             );
@@ -343,7 +378,6 @@ impl CompactSink {
         target_file_size_bytes: u64,
         variant_shred_types: std::collections::HashMap<String, arrow_schema::DataType>,
         row_group_rows: Option<usize>,
-        partition_override: Option<&(String, bool)>,
     ) -> Result<Self> {
         let schema = table.metadata().current_schema().clone();
         let rolling = RollingFileWriterBuilder::new(
@@ -370,31 +404,6 @@ impl CompactSink {
         );
         let data_file_builder = DataFileWriterBuilder::new(rolling);
         let spec = table.metadata().default_partition_spec();
-        if let Some((col, value)) = partition_override {
-            // Every output row under ONE identity partition value (see
-            // `Config::partition_override`): the spec must be exactly that
-            // single identity field, or the override would mislabel data.
-            let fields = spec.fields();
-            let ok = fields.len() == 1
-                && fields[0].name == *col
-                && matches!(fields[0].transform, iceberg::spec::Transform::Identity);
-            if !ok {
-                return Err(iceberg::Error::new(
-                    iceberg::ErrorKind::DataInvalid,
-                    format!(
-                        "partition_override on `{col}` needs a single identity partition field of that name; the \
-                         default spec has {:?}",
-                        fields.iter().map(|f| (&f.name, &f.transform)).collect::<Vec<_>>()
-                    ),
-                ));
-            }
-            let pk = PartitionKey::new(
-                spec.as_ref().clone(),
-                schema.clone(),
-                Struct::from_iter(vec![Some(Literal::bool(*value))]),
-            );
-            return Ok(Self::Plain(Box::new(data_file_builder.build(Some(pk)).await?)));
-        }
         if spec.is_unpartitioned() {
             Ok(Self::Plain(Box::new(data_file_builder.build(None).await?)))
         } else {

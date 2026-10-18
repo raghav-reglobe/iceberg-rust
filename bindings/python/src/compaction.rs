@@ -69,7 +69,7 @@ fn env_mb(name: &str) -> Option<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None, max_concurrent_groups=None, partition_filter=None, partition_unpartitioned=None, partition_override=None, key_bucket_leaf=None, key_bucket_skip=None, key_bucket_hex=None, key_bucket_row_group_rows=None))]
+#[pyo3(signature = (catalog_props, fqn, target_file_size_bytes=None, min_input_files=None, delete_file_threshold=None, shred_variants=None, sort_column=None, rewrite_all=None, timeout_s=None, budget_s=None, max_concurrent_groups=None, partition_filter=None, partition_unpartitioned=None, column_stamp=None, key_bucket_leaf=None, key_bucket_skip=None, key_bucket_hex=None, key_bucket_row_group_rows=None))]
 fn compact(
     py: Python<'_>,
     catalog_props: HashMap<String, String>,
@@ -85,7 +85,7 @@ fn compact(
     max_concurrent_groups: Option<usize>,
     partition_filter: Option<(String, bool)>,
     partition_unpartitioned: Option<bool>,
-    partition_override: Option<(String, bool)>,
+    column_stamp: Option<(String, String, Vec<String>)>,
     key_bucket_leaf: Option<String>,
     key_bucket_skip: Option<usize>,
     key_bucket_hex: Option<usize>,
@@ -144,14 +144,18 @@ fn compact(
     if partition_filter.is_some() {
         cfg.partition_filter = partition_filter;
     }
-    // Plan ONLY the files written under an unpartitioned spec, and/or write
-    // every output row under one identity partition value. See the Config
-    // docs (2026-10-18, the device loader-era re-home).
+    // Plan ONLY the files written under an unpartitioned spec, and/or stamp a
+    // boolean column from a string leaf before the output partition is
+    // computed: `(column, source_column, values)`. See the Config docs.
     if let Some(v) = partition_unpartitioned {
         cfg.partition_filter_unpartitioned = v;
     }
-    if partition_override.is_some() {
-        cfg.partition_override = partition_override;
+    if let Some((column, source_column, values)) = column_stamp {
+        cfg.column_stamp = Some(iceberg_compaction::config::ColumnStamp {
+            column,
+            source_column,
+            values,
+        });
     }
     // KEY-BUCKET rewrite (2026-10-16): route rows by a hex run of the key leaf
     // so the output files partition the key space. See `Config::key_bucket`.

@@ -52,7 +52,7 @@ use iceberg::{
     Catalog, CatalogBuilder, MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder, NamespaceIdent,
     TableCommit, TableCreation, TableIdent, TableUpdate,
 };
-use iceberg_compaction::config::{Config, KeyBucket};
+use iceberg_compaction::config::{ColumnStamp, Config, KeyBucket};
 use iceberg_compaction::engine::{compact_table, current_data_files, current_delete_files};
 use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
@@ -444,15 +444,66 @@ async fn write_unpartitioned(table: &Table, prefix: &str, b: RecordBatch) -> Vec
     w.close().await.unwrap()
 }
 
-/// 2026-10-18 (device): a bronze table that was UNPARTITIONED first (the loader era wrote its op=r rows there) and
-/// evolved the `_is_backfill` identity partition later. The repair doorway predicates on `_is_backfill = true`,
-/// which can never exclude the unpartitioned files, so every repair commit read them all (≈ 6 GiB) — and its DVs
-/// landed in them (167/167), so re-homing those rows anywhere ELSE would strand the versions the repair supersedes.
-/// The pass: plan ONLY the unpartitioned files (`partition_filter_unpartitioned`), bucket-sort them and write every
-/// output row under `_is_backfill = true` (`partition_override`) although the rows' own column says false; the
-/// partitioned files (backfill + CDC) stay untouched; rows, keys and the column value survive unchanged.
+/// (id, op, key) of every live row, sorted — the re-home must not edit a row.
+async fn read_rows_ops(table: &Table) -> Vec<(i32, String, Option<String>)> {
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .select_all()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for b in &batches {
+        let schema = b.schema();
+        let ids = b
+            .column(schema.index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let cdc = b
+            .column(schema.index_of("_cdc").unwrap())
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let ops = cdc
+            .column_by_name("op")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        let keys = cdc
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            out.push((
+                ids.value(i),
+                ops.value(i).to_string(),
+                keys.is_valid(i).then(|| keys.value(i).to_string()),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A table that was UNPARTITIONED first — its oldest files hold the loader's `r` rows AND ordinary change rows side
+/// by side, and predate the `_is_backfill` column (it reads NULL) — and evolved the `_is_backfill` identity partition
+/// later. A reader predicating on `_is_backfill = true` can never exclude those files, and the deletion vectors it
+/// writes land in them. The pass: plan ONLY the unpartitioned files (`partition_filter_unpartitioned`), stamp
+/// `_is_backfill = true` on the rows whose `_cdc.op` is `R`/`r` (`column_stamp`), bucket-sort, and let the writer
+/// DERIVE each row's partition from the stamped column: the `r` rows land in `_is_backfill = true` key buckets, the
+/// `c`/`u` rows in the NULL partition — column and partition agree on every row; the partitioned files stay
+/// untouched; ids, ops and keys survive unchanged; the DV on a loader-era file is applied and reabsorbed.
 #[tokio::test]
-async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_override_partition() {
+async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_rows_by_op_stamp() {
     let warehouse = TempDir::new().unwrap();
     let catalog = MemoryCatalogBuilder::default()
         .load(
@@ -481,19 +532,33 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     let ident = TableIdent::new(ns, "bronze_device".to_string());
     assert!(table.metadata().default_partition_spec().is_unpartitioned());
 
-    // Two loader-era files: key-MIXED across three prefixes, the `_is_backfill` COLUMN false (the loader never set
-    // it), one NULL key — exactly device's spec-0 shape.
-    let mk = |id: i32, prefix: &str| (id, "p", "r", Some(oid_key(prefix, id as u32)), Some(false));
+    // Two loader-era files, MIXED: `r` baseline rows and `c`/`u` change rows interleaved, keys across three
+    // prefixes, one NULL key, one uppercase `R`, the `_is_backfill` column NULL on every row (it did not exist).
+    let row = |id: i32, prefix: &str, op: &'static str| {
+        (id, "p", op, Some(oid_key(prefix, id as u32)), None::<bool>)
+    };
     let s0_a = write_unpartitioned(
         &table,
         "s0-a",
-        batch(&table, &[mk(1, "69c"), mk(2, "69e"), mk(3, "6a1"), mk(4, "69c"), mk(5, "69e")]),
+        batch(&table, &[
+            row(1, "69c", "r"),
+            row(2, "69e", "r"),
+            row(3, "6a1", "r"),
+            row(4, "69c", "u"),
+            row(5, "69e", "r"),
+        ]),
     )
     .await;
     let s0_b = write_unpartitioned(
         &table,
         "s0-b",
-        batch(&table, &[mk(6, "6a1"), mk(7, "69c"), (8, "p", "r", None, Some(false)), mk(9, "69e")]),
+        batch(&table, &[
+            row(6, "6a1", "r"),
+            row(7, "69c", "c"),
+            (8, "p", "r", None, None),
+            row(9, "69e", "u"),
+            row(12, "6a1", "R"),
+        ]),
     )
     .await;
     let tx = Transaction::new(&table);
@@ -505,6 +570,7 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     let table = tx.commit(&catalog).await.unwrap();
     let s0_paths: Vec<String> =
         s0_a.iter().chain(s0_b.iter()).map(|f| f.file_path().to_string()).collect();
+    let a_path = s0_a[0].file_path().to_string();
 
     // Evolve: the `_is_backfill` identity partition becomes the default spec (spec 1).
     let evolve = TableCommit::builder()
@@ -523,7 +589,7 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     let table = catalog.update_table(evolve).await.unwrap();
     assert!(!table.metadata().default_partition_spec().is_unpartitioned());
 
-    // Under spec 1: one backfill-partition file (a later repair baseline) and one CDC file (partition NULL).
+    // Under spec 1: one backfill-partition file (a later baseline row) and one CDC file (partition NULL).
     let bf = write_data(
         &table,
         "bf",
@@ -535,7 +601,7 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
         &table,
         "cdc",
         None,
-        batch(&table, &[(11, "p", "u", Some("{id={\"$oid\": \"69e00000000000000000000b\"}}".to_string()), Some(false))]),
+        batch(&table, &[(11, "p", "u", Some("{id={\"$oid\": \"69e00000000000000000000b\"}}".to_string()), None)]),
     )
     .await;
     let tx = Transaction::new(&table);
@@ -547,9 +613,33 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     let table = tx.commit(&catalog).await.unwrap();
     let bf_path = bf[0].file_path().to_string();
     let cdc_path = cdc[0].file_path().to_string();
-    let before_rows = read_rows(&table).await;
-    let before_flags = read_flags(&table).await;
-    assert_eq!(before_rows.len(), 11);
+
+    // A deletion vector on loader-era file A dropping id=2 (position 1) — the shape a key-set upsert leaves in
+    // these files; the rewrite must apply it and reabsorb it.
+    let mut positions = RoaringTreemap::new();
+    positions.insert(1);
+    let dv_path = format!("{}/dv-s0a.puffin", warehouse.path().to_str().unwrap());
+    let dv_file = DeleteVector::new(positions)
+        .write_to_puffin_file(table.file_io(), dv_path, a_path.clone(), Struct::empty(), 0)
+        .await
+        .unwrap();
+    let tx = Transaction::new(&table);
+    let table = tx
+        .row_delta()
+        .add_delete_files(vec![dv_file])
+        .apply(tx)
+        .unwrap()
+        .commit(&catalog)
+        .await
+        .unwrap();
+    let before = read_rows_ops(&table).await;
+    assert_eq!(before.len(), 11, "12 written, one DV'd");
+    assert!(before.iter().all(|r| r.0 != 2), "id=2 is deleted by the DV");
+    assert_eq!(current_delete_files(&table).await.unwrap().len(), 1);
+    assert!(
+        read_flags(&table).await.iter().all(|(id, f)| (*id == 10) == f.is_some()),
+        "before: only the backfill-partition row carries the column"
+    );
 
     let cfg = Config {
         min_input_files: 1,
@@ -557,7 +647,11 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
         rewrite_all: true,
         partition_filter: None,
         partition_filter_unpartitioned: true,
-        partition_override: Some(("_is_backfill".to_string(), true)),
+        column_stamp: Some(ColumnStamp {
+            column: "_is_backfill".to_string(),
+            source_column: "_cdc.op".to_string(),
+            values: vec!["R".to_string(), "r".to_string()],
+        }),
         key_bucket: Some(KeyBucket {
             leaf: "_cdc.key".to_string(),
             skip: 10,
@@ -570,7 +664,10 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     assert_eq!(out.groups_planned, 1, "one group = the unpartitioned files only");
     assert_eq!(out.groups_rewritten, 1);
     assert_eq!(out.rewritten, 2, "both loader-era files rewritten");
-    assert_eq!(out.added, 4, "one output file per bucket: 69c, 69e, 6a1, other");
+    assert_eq!(
+        out.added, 6,
+        "stamped rows: 69c, 69e, 6a1, other under `_is_backfill = true`; change rows: 69c, 69e under NULL"
+    );
 
     let table = catalog.load_table(&ident).await.unwrap();
     let files = current_data_files(&table).await.unwrap();
@@ -579,39 +676,61 @@ async fn key_bucket_rewrite_rehomes_unpartitioned_loader_era_files_into_the_over
     for p in &s0_paths {
         assert!(!files.contains_key(p), "the loader-era input {p} is gone");
     }
-    // Every output file sits in the OVERRIDE partition (`_is_backfill = true`), one 3-hex prefix per file, with
-    // key bounds the doorway's bracket can prune on; the `other` file holds the NULL-key row.
-    let key_field = table
-        .metadata()
-        .current_schema()
-        .field_id_by_name("_cdc.key")
-        .expect("the key leaf has a field id");
+    assert_eq!(current_delete_files(&table).await.unwrap().len(), 0, "the DV is reabsorbed");
+
+    // Per-row placement: every output file sits in the partition its rows' STAMPED column says — `r`/`R` rows
+    // under `_is_backfill = true`, `c`/`u` rows under NULL — one 3-hex prefix per file with key bounds the
+    // bracket prunes on; the `other` file holds the NULL-key row.
+    let schema = table.metadata().current_schema();
+    let key_field = schema.field_id_by_name("_cdc.key").expect("the key leaf has a field id");
+    let op_field = schema.field_id_by_name("_cdc.op").expect("the op leaf has a field id");
     let true_partition = Struct::from_iter(vec![Some(Literal::bool(true))]);
-    let mut prefixes: Vec<(String, u64)> = Vec::new();
-    let mut other: Vec<u64> = Vec::new();
+    let null_partition = Struct::from_iter(vec![None::<Literal>]);
+    let mut placed: Vec<(&str, String, u64)> = Vec::new();
     let hex3 = |s: &str| s.len() >= 13 && s.as_bytes()[10..13].iter().all(u8::is_ascii_hexdigit);
     for (path, f) in files.iter() {
         if *path == bf_path || *path == cdc_path {
             continue;
         }
-        assert_eq!(*f.partition(), true_partition, "output {path} is not in the override partition");
-        match (key_bound(f, key_field, true), key_bound(f, key_field, false)) {
+        let (label, ops) = if *f.partition() == true_partition {
+            ("true", ["R", "r"])
+        } else if *f.partition() == null_partition {
+            ("null", ["c", "u"])
+        } else {
+            panic!("output {path} is in an unexpected partition {:?}", f.partition());
+        };
+        for bound in [key_bound(f, op_field, true), key_bound(f, op_field, false)] {
+            let op = bound.expect("op bounds recorded");
+            assert!(ops.contains(&op.as_str()), "file {path} ({label}) holds an op `{op}` outside its class");
+        }
+        let prefix = match (key_bound(f, key_field, true), key_bound(f, key_field, false)) {
             (Some(lo), Some(hi)) if hex3(&lo) && hex3(&hi) => {
                 assert_eq!(&lo[10..13], &hi[10..13], "file {path} spans prefixes {lo}..{hi}");
-                prefixes.push((lo[10..13].to_string(), f.record_count()));
+                lo[10..13].to_string()
             }
-            _ => other.push(f.record_count()),
-        }
+            _ => "other".to_string(),
+        };
+        placed.push((label, prefix, f.record_count()));
     }
-    prefixes.sort();
+    placed.sort();
     assert_eq!(
-        prefixes,
-        vec![("69c".to_string(), 3), ("69e".to_string(), 3), ("6a1".to_string(), 2)],
-        "one re-homed output file per prefix, with key stats"
+        placed,
+        vec![
+            ("null", "69c".to_string(), 2),
+            ("null", "69e".to_string(), 1),
+            ("true", "69c".to_string(), 1),
+            ("true", "69e".to_string(), 1),
+            ("true", "6a1".to_string(), 3),
+            ("true", "other".to_string(), 1),
+        ],
+        "each row class in its own partition, one file per prefix"
     );
-    assert_eq!(other, vec![1], "ONE `other` file holding the NULL-key row");
 
-    // Rows re-homed, never edited: the same ids and keys, and the `_is_backfill` COLUMN still false on them.
-    assert_eq!(read_rows(&table).await, before_rows, "every row and key survives the re-home");
-    assert_eq!(read_flags(&table).await, before_flags, "the column value is untouched — only the partition moved");
+    // Rows re-homed, never edited: the same ids, ops and keys; the column now says what the partition says.
+    assert_eq!(read_rows_ops(&table).await, before, "every row, op and key survives the re-home");
+    let stamped: Vec<i32> = vec![1, 3, 5, 6, 8, 10, 12];
+    for (id, flag) in read_flags(&table).await {
+        let want = stamped.contains(&id).then_some(true);
+        assert_eq!(flag, want, "id {id}: `_is_backfill` column and partition agree");
+    }
 }
