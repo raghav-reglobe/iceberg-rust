@@ -575,7 +575,7 @@ pub enum KeyMatcher {
 }
 
 impl KeyMatcher {
-    fn planning_predicate(&self, key_column: &str) -> Option<Predicate> {
+    pub(crate) fn planning_predicate(&self, key_column: &str) -> Option<Predicate> {
         match self {
             KeyMatcher::Prefix(p) => {
                 Some(Reference::new(key_column).starts_with(Datum::string(p.clone())))

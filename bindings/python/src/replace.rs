@@ -32,6 +32,8 @@ use iceberg::atomic_replace::{
     atomic_partition_replace_prefix_with_props,
     atomic_partition_replace_with_props,
 };
+use arrow::datatypes::TimeUnit;
+use iceberg::latest_versions::{VersionColumns, latest_versions_by_key};
 use iceberg::spec::Literal;
 use iceberg::{NamespaceIdent, TableIdent};
 use pyo3::exceptions::PyValueError;
@@ -429,12 +431,87 @@ fn bronze_replace_prefix(
     })
 }
 
+/// READ-ONLY: the latest live version of each requested key over the whole
+/// table (every partition, every op), ranked by `COALESCE(<source_ts>, <ts>)`
+/// then `<seq>` then `<offset>` under the key column's parent struct —
+/// `{key_text: (row_hash | None, source_ts_epoch_us | None)}`; a key with no
+/// live version is absent. A string key column matches the text exactly; a
+/// struct key column (a pk tuple) matches a flat JSON object text field by
+/// field (`{"id": 7}`). `integer_ts_unit` is the unit of an INTEGER `ts`
+/// column (`"ms"` | `"us"` | `"s"` | `"ns"`; a Timestamp column carries its
+/// own). Empty `keys` reads nothing.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, keys, key_column="_cdc.key".to_string(), hash_column="_row_hash".to_string(), integer_ts_unit="ms".to_string()))]
+fn bronze_latest_versions(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    keys: Vec<String>,
+    key_column: String,
+    hash_column: String,
+    integer_ts_unit: String,
+) -> PyResult<HashMap<String, (Option<String>, Option<i64>)>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    let keys: Vec<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let unit = match integer_ts_unit.as_str() {
+        "s" => TimeUnit::Second,
+        "ms" => TimeUnit::Millisecond,
+        "us" => TimeUnit::Microsecond,
+        "ns" => TimeUnit::Nanosecond,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "integer_ts_unit must be one of s/ms/us/ns, got `{other}`"
+            )));
+        }
+    };
+    let parent = key_column
+        .rsplit_once('.')
+        .map(|(p, _)| format!("{p}."))
+        .unwrap_or_default();
+    let version_columns = VersionColumns {
+        source_instant: format!("{parent}source_ts"),
+        capture_instant: format!("{parent}ts"),
+        sequence: Some(format!("{parent}seq")),
+        offset: Some(format!("{parent}offset")),
+        integer_instant_unit: unit,
+    };
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let out = latest_versions_by_key(
+                catalog.as_ref(),
+                &ident,
+                &key_column,
+                &hash_column,
+                &version_columns,
+                keys,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("latest versions: {e}")))?;
+            Ok(out
+                .into_iter()
+                .map(|(k, v)| (k, (v.hash, v.source_instant_us)))
+                .collect())
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "replace")?;
     this.add_function(wrap_pyfunction!(bronze_replace, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_keys, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_replace_prefix, &this)?)?;
     this.add_function(wrap_pyfunction!(bronze_append, &this)?)?;
+    this.add_function(wrap_pyfunction!(bronze_latest_versions, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }
