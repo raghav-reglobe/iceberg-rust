@@ -347,12 +347,12 @@ pub async fn latest_versions_by_key(
     }
     // project the roots of every column read: the key's, the version columns'
     // and the hash column (a struct root brings all of its fields)
-    let mut roots: Vec<&str> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
     let mut push_root = |dotted: &str| {
         if schema.field_id_by_name(dotted).is_some() {
             let root = dotted.split('.').next().expect("non-empty dotted path");
-            if !roots.iter().any(|r| *r == root) {
-                roots.push(root);
+            if !roots.iter().any(|r| r == root) {
+                roots.push(root.to_string());
             }
         }
     };
@@ -367,8 +367,7 @@ pub async fn latest_versions_by_key(
     }
     let has_hash = schema.field_id_by_name(hash_column).is_some();
     push_root(hash_column);
-    let select_cols: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
-    let mut scan = table.scan().snapshot_id(snapshot_id).select(select_cols);
+    let mut scan = table.scan().snapshot_id(snapshot_id).select(roots);
     if let Some(pred) = planning_predicate(&schema, key_column, &shape) {
         scan = scan.with_filter(pred);
     }
