@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Copy-on-write column rewrites — today: MySQL `TIME` string spellings into one
-//! signed `long` of microseconds (see `iceberg::time_rewrite`).
+//! Copy-on-write rewrites: MySQL `TIME` string spellings into one signed `long`
+//! of microseconds (see `iceberg::time_rewrite`), and caller-supplied rows for
+//! named data files (see `iceberg::replace_file_rows`).
 use std::collections::HashMap;
+use std::io::Cursor;
 
+use arrow::array::RecordBatch;
+use iceberg::replace_file_rows::{FileRows, replace_file_rows as replace_rows};
 use iceberg::time_rewrite::{mysql_time_text_to_us as parse_time, rewrite_time_columns as rewrite};
 use iceberg::{NamespaceIdent, TableIdent};
 use pyo3::exceptions::PyValueError;
@@ -103,17 +107,33 @@ fn rewrite_time_columns(
             .await
             .map_err(|e| PyValueError::new_err(format!("time rewrite {table}: {e}")))?;
             Ok(HashMap::from([
-                ("snapshot_before".to_string(), out.snapshot_before.to_string()),
+                (
+                    "snapshot_before".to_string(),
+                    out.snapshot_before.to_string(),
+                ),
                 (
                     "snapshot_after".to_string(),
-                    out.snapshot_after.map(|s| s.to_string()).unwrap_or_default(),
+                    out.snapshot_after
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
                 ),
                 ("rows".to_string(), out.rows.to_string()),
-                ("records_before".to_string(), out.records_before.map(|n| n.to_string()).unwrap_or_default()),
-                ("partition_fields".to_string(), out.partition_fields.to_string()),
+                (
+                    "records_before".to_string(),
+                    out.records_before
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "partition_fields".to_string(),
+                    out.partition_fields.to_string(),
+                ),
                 ("files_deleted".to_string(), out.files_deleted.to_string()),
                 ("files_added".to_string(), out.files_added.to_string()),
-                ("delete_files_removed".to_string(), out.delete_files_removed.to_string()),
+                (
+                    "delete_files_removed".to_string(),
+                    out.delete_files_removed.to_string(),
+                ),
                 ("digits".to_string(), out.counts.digits.to_string()),
                 ("dated".to_string(), out.counts.dated.to_string()),
                 ("clock".to_string(), out.counts.clock.to_string()),
@@ -125,10 +145,101 @@ fn rewrite_time_columns(
     })
 }
 
+fn decode_ipc(path: &str, ipc: &[u8]) -> PyResult<Vec<RecordBatch>> {
+    let reader =
+        arrow::ipc::reader::StreamReader::try_new(Cursor::new(ipc), None).map_err(|e| {
+            PyValueError::new_err(format!("reading Arrow IPC stream for `{path}`: {e}"))
+        })?;
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PyValueError::new_err(format!("reading Arrow IPC stream for `{path}`: {e}")))
+}
+
+/// Replace the rows of named data files of `table` (`catalog.namespace.table`),
+/// copy-on-write, in ONE replace snapshot. `files` is a list of `(data_file_path,
+/// ipc_bytes)`: each path as the table metadata records it, each payload an Arrow
+/// IPC stream (`pyarrow.ipc.new_stream` bytes) holding every row the file should
+/// hold afterwards — as many rows as the file has live rows at `base_snapshot`,
+/// columns matched to the table schema by name (a `variant` column may arrive
+/// as JSON text). Delete files bound to a named file are removed with it. The
+/// call refuses when the table is no longer at `base_snapshot`, when a row count
+/// differs, or when a row's partition value differs from its file's; the commit
+/// refuses when any snapshot landed after `base_snapshot`. With `dry_run`
+/// everything is validated and nothing is written. `carry_summary_prefix` copies
+/// the base snapshot's summary keys with that prefix onto the new snapshot.
+/// Returns a dict of strings.
+#[pyfunction]
+#[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None))]
+fn replace_file_rows(
+    py: Python<'_>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    table: String,
+    base_snapshot: i64,
+    files: Vec<(String, Vec<u8>)>,
+    dry_run: bool,
+    snapshot_properties: Option<HashMap<String, String>>,
+    carry_summary_prefix: Option<String>,
+) -> PyResult<HashMap<String, String>> {
+    let (catalog_name, namespace, table_name) = split_fqn(&table)?;
+    let Some(props) = catalogs.get(&catalog_name).cloned() else {
+        return Err(PyValueError::new_err(format!(
+            "catalog `{catalog_name}` not in `catalogs`"
+        )));
+    };
+    let files = files
+        .iter()
+        .map(|(path, ipc)| {
+            Ok(FileRows {
+                data_file_path: path.clone(),
+                batches: decode_ipc(path, ipc)?,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| {
+        runtime().block_on(async move {
+            let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
+            let ident = TableIdent::new(namespace, table_name);
+            let out = replace_rows(
+                catalog.as_ref(),
+                &ident,
+                base_snapshot,
+                files,
+                dry_run,
+                snapshot_properties.unwrap_or_default(),
+                carry_summary_prefix.as_deref(),
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("replace file rows {table}: {e}")))?;
+            Ok(HashMap::from([
+                (
+                    "snapshot_before".to_string(),
+                    out.snapshot_before.to_string(),
+                ),
+                (
+                    "snapshot_after".to_string(),
+                    out.snapshot_after
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                ("files_replaced".to_string(), out.files_replaced.to_string()),
+                ("files_added".to_string(), out.files_added.to_string()),
+                ("rows_live".to_string(), out.rows_live.to_string()),
+                ("rows_written".to_string(), out.rows_written.to_string()),
+                (
+                    "delete_files_removed".to_string(),
+                    out.delete_files_removed.to_string(),
+                ),
+                ("dry_run".to_string(), dry_run.to_string()),
+            ]))
+        })
+    })
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "rewrite")?;
     this.add_function(wrap_pyfunction!(rewrite_time_columns, &this)?)?;
     this.add_function(wrap_pyfunction!(mysql_time_text_to_us, &this)?)?;
+    this.add_function(wrap_pyfunction!(replace_file_rows, &this)?)?;
     m.add_submodule(&this)?;
     Ok(())
 }

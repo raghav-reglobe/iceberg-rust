@@ -96,6 +96,7 @@ pub use runtime::{Runtime, RuntimeHandle};
 pub mod arrow;
 pub mod atomic_replace;
 pub mod latest_versions;
+pub mod replace_file_rows;
 pub mod time_rewrite;
 pub mod hot_derive;
 pub(crate) mod delete_file_index;
