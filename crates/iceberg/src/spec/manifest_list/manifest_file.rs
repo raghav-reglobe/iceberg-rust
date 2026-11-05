@@ -206,7 +206,7 @@ impl ManifestFile {
         for entry in &mut entries {
             entry.inherit_data(self);
         }
-        crate::spec::manifest::assign_first_row_ids(self, &mut entries)?;
+        crate::spec::assign_first_row_ids(self, &mut entries)?;
 
         Ok(Manifest::new(metadata, entries))
     }

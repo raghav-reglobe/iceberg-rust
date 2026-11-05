@@ -20,6 +20,7 @@
 mod datatypes;
 mod encrypted_key;
 mod manifest;
+pub(crate) use manifest::assign_first_row_ids;
 mod manifest_list;
 mod name_mapping;
 mod partition;

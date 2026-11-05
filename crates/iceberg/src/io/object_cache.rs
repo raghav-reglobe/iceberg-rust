@@ -170,7 +170,7 @@ impl ObjectCache {
                 for entry in &mut entries {
                     entry.inherit_data(manifest_file);
                 }
-                crate::spec::manifest::assign_first_row_ids(manifest_file, &mut entries)?;
+                crate::spec::assign_first_row_ids(manifest_file, &mut entries)?;
                 return Ok(Arc::new(Manifest::new(metadata, entries)));
             }
             CacheBackend::Local(cache) => cache,
