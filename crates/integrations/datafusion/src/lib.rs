@@ -26,10 +26,6 @@ pub mod memory_gate;
 pub mod functions;
 
 pub mod physical_plan;
-pub use physical_plan::{
-    HELD_MAX_BYTES_DEFAULT, MorMergeOptions, MorWindowState, WindowRunResult, WindowSliceSpec,
-    run_window,
-};
 mod schema;
 pub mod table;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
