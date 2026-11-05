@@ -20,7 +20,10 @@
 
 use std::fmt;
 
-use super::SecureKey;
+use aes_gcm::aead::OsRng;
+use aes_gcm::aead::rand_core::RngCore;
+
+use super::{AesKeySize, SecureKey};
 use crate::{Error, ErrorKind, Result};
 
 /// Standard key metadata for Iceberg table encryption.
@@ -59,13 +62,19 @@ impl StandardKeyMetadata {
         Ok(Self::from(SecureKey::new(encryption_key)?))
     }
 
+    /// Generates a `StandardKeyMetadata` carrying a fresh random DEK of
+    /// `key_size` together with a fresh random AAD prefix.
+    pub(crate) fn generate(key_size: AesKeySize) -> Self {
+        Self::from(SecureKey::generate(key_size)).with_aad_prefix(&generate_aad_prefix())
+    }
+
     /// Adds an AAD prefix.
     pub fn with_aad_prefix(mut self, aad_prefix: &[u8]) -> Self {
         self.aad_prefix = Some(aad_prefix.into());
         self
     }
 
-    /// Adds a file length.
+    /// Sets the encrypted file length in bytes, required for AGS1 truncation protection.
     pub fn with_file_length(mut self, length: u64) -> Self {
         self.file_length = Some(length);
         self
@@ -81,7 +90,7 @@ impl StandardKeyMetadata {
         self.aad_prefix.as_deref()
     }
 
-    /// Returns the optional file length.
+    /// Returns the optional encrypted file length in bytes; AGS1 readers require it to be set.
     pub fn file_length(&self) -> Option<u64> {
         self.file_length
     }
@@ -106,6 +115,15 @@ impl From<SecureKey> for StandardKeyMetadata {
             file_length: None,
         }
     }
+}
+
+/// AAD prefix length in bytes.
+const AAD_PREFIX_LENGTH: usize = 16;
+
+fn generate_aad_prefix() -> Box<[u8]> {
+    let mut prefix = vec![0u8; AAD_PREFIX_LENGTH];
+    OsRng.fill_bytes(&mut prefix);
+    prefix.into_boxed_slice()
 }
 
 mod _serde {

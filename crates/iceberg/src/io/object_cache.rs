@@ -22,8 +22,8 @@ use crate::cache::ObjectBytesCacheRef;
 use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestListReader, SchemaId, SnapshotRef,
-    TableMetadataRef,
+    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestListReader, ManifestReader,
+    SchemaId, SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -38,7 +38,11 @@ pub(crate) enum CachedItem {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
     ManifestList((String, FormatVersion, SchemaId)),
-    Manifest(String),
+    // The manifest-level `first_row_id` is part of the key because the parsed
+    // manifest inherits it onto its entries: the same physical manifest can be
+    // referenced with different offsets across snapshots and branches, so it
+    // cannot be shared under the path alone.
+    Manifest((String, Option<u64>)),
 }
 
 /// Where the parsed objects are stored.
@@ -171,7 +175,10 @@ impl ObjectCache {
             CacheBackend::Local(cache) => cache,
         };
 
-        let key = CachedObjectKey::Manifest(manifest_file.manifest_path.clone());
+        let key = CachedObjectKey::Manifest((
+            manifest_file.manifest_path.clone(),
+            manifest_file.first_row_id,
+        ));
 
         let cache_entry = cache
             .entry_by_ref(&key)

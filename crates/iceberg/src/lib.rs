@@ -65,9 +65,13 @@
 #[macro_use]
 extern crate derive_builder;
 extern crate core;
+// Required so `#[derive(Properties)]` output can name `::iceberg::Error`.
+extern crate self as iceberg;
 
 mod error;
 pub use error::{Error, ErrorKind, Result};
+
+pub mod sensitive;
 
 mod catalog;
 
@@ -91,7 +95,7 @@ pub mod transaction;
 pub mod transform;
 
 mod runtime;
-pub use runtime::{Runtime, RuntimeHandle};
+pub use runtime::{JoinHandle, Runtime, RuntimeHandle};
 
 pub mod arrow;
 pub mod atomic_replace;
@@ -106,6 +110,7 @@ pub mod writer;
 
 pub mod delete_vector;
 pub mod metadata_columns;
+pub mod partitioning;
 pub mod puffin;
 /// Utility functions and modules.
 pub mod util;

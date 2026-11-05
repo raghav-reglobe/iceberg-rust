@@ -35,6 +35,7 @@ pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
 /// Scan decode-memory accounting (engine-pluggable reservation gate)
 pub mod scan_memory_gate;
+pub(crate) use record_batch_transformer::build_partition_constant;
 mod scan_metrics;
 mod value;
 /// Infer + merge Arrow schemas from Variant values (Spark `SchemaOfVariant` port)

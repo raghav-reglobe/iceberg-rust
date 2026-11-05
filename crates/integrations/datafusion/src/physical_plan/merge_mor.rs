@@ -486,7 +486,7 @@ async fn writer_task(
         .table_properties()
         .map_err(to_datafusion_error)?;
     let parquet_writer_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())
+        ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())?
             .with_variant_shred_types((*overrides).clone());
     let location_generator =
         DefaultLocationGenerator::new(ctx.table.metadata()).map_err(to_datafusion_error)?;
@@ -497,7 +497,7 @@ async fn writer_task(
     );
     let rolling_writer_builder = RollingFileWriterBuilder::new(
         parquet_writer_builder,
-        table_props.write_target_file_size_bytes,
+        table_props.write_target_file_size_bytes()?,
         ctx.table.file_io().clone(),
         location_generator,
         file_name_generator,
@@ -1627,7 +1627,7 @@ async fn run_mor_write(
         .table_properties()
         .map_err(to_datafusion_error)?;
     let file_format =
-        <DataFileFormat as std::str::FromStr>::from_str(&table_props.write_format_default)
+        <DataFileFormat as std::str::FromStr>::from_str(&table_props.write_format_default()?)
             .map_err(to_datafusion_error)?;
     if file_format != DataFileFormat::Parquet {
         return Err(to_datafusion_error(iceberg::Error::new(
@@ -1641,7 +1641,7 @@ async fn run_mor_write(
     // each variant column's layout from the table's existing files, and give
     // the writer the exact shredded arrow types the (shredded) batches will
     // carry. Empty map = canonical output, the untouched default.
-    let shred_output = table_props.parquet_shred_variants;
+    let shred_output = table_props.parquet_shred_variants()?;
     let shred_pairs = if shred_output {
         with_deadline(deadline, "deriving the shredding layout", async {
             merge_shred_types(&table, snapshot_id).await
@@ -2877,7 +2877,7 @@ async fn inline_reabsorb(
         shred_variants: committed
             .metadata()
             .table_properties()
-            .map(|p| p.parquet_shred_variants)
+            .map(|p| p.parquet_shred_variants()?)
             .unwrap_or(false),
         ..Default::default()
     };

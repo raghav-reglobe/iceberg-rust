@@ -190,7 +190,6 @@ impl<'a> SnapshotProducer<'a> {
             .collect();
 
         let runtime = self.table.runtime();
-        let file_io = self.table.file_io();
         let manifest_list = self
             .table
             .manifest_list_reader(current_snapshot)
@@ -202,10 +201,8 @@ impl<'a> SnapshotProducer<'a> {
             .consume_entries()
             .into_iter()
             .map(|entry| {
-                let file_io = file_io.clone();
-                runtime
-                    .io()
-                    .spawn(async move { entry.load_manifest(&file_io).await })
+                let reader = self.table.manifest_reader();
+                runtime.io().spawn(async move { reader.read(&entry).await })
             })
             .collect::<FuturesUnordered<_>>()
             .try_fold(Vec::new(), |mut acc, manifest| async move {
@@ -758,13 +755,13 @@ impl<'a> SnapshotProducer<'a> {
             .file_io()
             .new_output(manifest_list_path.clone())?;
 
-        let (writer, encryption_key_id) = match self.table.encryption_manager() {
+        let (writer, encrypted_output) = match self.table.encryption_manager() {
             Some(em) => {
                 let encrypted_output = em.encrypt(raw_output);
-                let key_id = em
-                    .encrypt_manifest_list_key_metadata(encrypted_output.key_metadata())
-                    .await?;
-                (encrypted_output.writer().await?, Some(key_id))
+                (
+                    encrypted_output.writer().await?,
+                    Some((em.clone(), encrypted_output)),
+                )
             }
             None => (raw_output.writer().await?, None),
         };
@@ -799,7 +796,16 @@ impl<'a> SnapshotProducer<'a> {
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
-        manifest_list_writer.close().await?;
+        let file_metadata = manifest_list_writer.close().await?;
+        let encryption_key_id = match encrypted_output {
+            Some((em, encrypted_output)) => Some(
+                em.encrypt_manifest_list_key_metadata(
+                    &encrypted_output.key_metadata_with_saved_file_metadata(&file_metadata),
+                )
+                .await?,
+            ),
+            None => None,
+        };
 
         let commit_ts = chrono::Utc::now().timestamp_millis();
         let new_snapshot = Snapshot::builder()
