@@ -112,7 +112,41 @@ fn rewrite_time_columns(
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("time rewrite {table}: {e}")))?;
-            Ok(outcome_dict(&out, dry_run))
+            Ok(HashMap::from([
+                (
+                    "snapshot_before".to_string(),
+                    out.snapshot_before.to_string(),
+                ),
+                (
+                    "snapshot_after".to_string(),
+                    out.snapshot_after
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                ("rows".to_string(), out.rows.to_string()),
+                (
+                    "records_before".to_string(),
+                    out.records_before
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "partition_fields".to_string(),
+                    out.partition_fields.to_string(),
+                ),
+                ("files_deleted".to_string(), out.files_deleted.to_string()),
+                ("files_added".to_string(), out.files_added.to_string()),
+                (
+                    "delete_files_removed".to_string(),
+                    out.delete_files_removed.to_string(),
+                ),
+                ("digits".to_string(), out.counts.digits.to_string()),
+                ("dated".to_string(), out.counts.dated.to_string()),
+                ("clock".to_string(), out.counts.clock.to_string()),
+                ("days".to_string(), out.counts.days.to_string()),
+                ("nulls".to_string(), out.counts.nulls.to_string()),
+                ("dry_run".to_string(), dry_run.to_string()),
+            ]))
         })
     })
 }
@@ -238,27 +272,7 @@ fn replace_file_rows(
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("replace file rows {table}: {e}")))?;
-            Ok(HashMap::from([
-                (
-                    "snapshot_before".to_string(),
-                    out.snapshot_before.to_string(),
-                ),
-                (
-                    "snapshot_after".to_string(),
-                    out.snapshot_after
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                ),
-                ("files_replaced".to_string(), out.files_replaced.to_string()),
-                ("files_added".to_string(), out.files_added.to_string()),
-                ("rows_live".to_string(), out.rows_live.to_string()),
-                ("rows_written".to_string(), out.rows_written.to_string()),
-                (
-                    "delete_files_removed".to_string(),
-                    out.delete_files_removed.to_string(),
-                ),
-                ("dry_run".to_string(), dry_run.to_string()),
-            ]))
+            Ok(outcome_dict(&out, dry_run))
         })
     })
 }
