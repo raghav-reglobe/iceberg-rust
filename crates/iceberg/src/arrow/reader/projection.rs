@@ -2579,6 +2579,9 @@ message schema {
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+            data_sequence_number: None,
+            first_row_id: None,
+            unified_partition_type: None,
             sequence_number: None,
                 row_selection_positions: None,
                 key_metadata: None,

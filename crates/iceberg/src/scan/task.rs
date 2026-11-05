@@ -645,7 +645,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod fork_tests {
     use super::*;
     use crate::ErrorKind;
     use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};

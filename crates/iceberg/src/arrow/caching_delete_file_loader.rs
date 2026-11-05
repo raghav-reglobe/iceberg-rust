@@ -1947,6 +1947,7 @@ mod tests {
             .unwrap();
 
         let dv_del = FileScanTaskDeleteFile {
+                record_count: None,
                 sequence_number: None,
                 partition: None,
             key_metadata: None,
@@ -1962,6 +1963,9 @@ mod tests {
         };
 
         let file_scan_task = FileScanTask {
+            data_sequence_number: None,
+            first_row_id: None,
+            unified_partition_type: None,
             sequence_number: None,
             row_selection_positions: None,
             key_metadata: None,
@@ -2075,6 +2079,7 @@ mod tests {
             .iter()
             .zip([data_file_1.clone(), data_file_2.clone()])
             .map(|(blob_meta, referenced)| FileScanTaskDeleteFile {
+                record_count: None,
                 sequence_number: None,
                 partition: None,
                 key_metadata: None,
@@ -2215,6 +2220,7 @@ mod tests {
         record_count: u64,
         key_metadata: Option<Box<[u8]>>,
     ) -> FileScanTaskDeleteFile {
+        record_count: None,
         FileScanTaskDeleteFile::builder()
             .with_file_path(dv_path)
             .with_file_size_in_bytes(file_size)
@@ -2378,6 +2384,7 @@ mod tests {
 
     // A well-formed deletion-vector task, for tests that then clear or corrupt one field.
     fn valid_dv_task() -> FileScanTaskDeleteFile {
+        record_count: None,
         dv_task(
             "deletes.puffin".to_string(),
             100,

@@ -1407,7 +1407,6 @@ mod strip_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::sync::Arc;

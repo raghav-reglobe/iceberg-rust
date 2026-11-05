@@ -3035,7 +3035,7 @@ mod tests {
 
         let file = std::fs::File::open(&path).unwrap();
         let reader =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         let fields = reader.metadata().file_metadata().schema().get_fields();
         let logical = |name: &str| {
             fields

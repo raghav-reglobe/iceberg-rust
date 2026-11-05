@@ -236,7 +236,7 @@ mod tests {
         let task = FileScanTaskDeleteFile {
                 sequence_number: None,
                 partition: None,
-            file_format: crate::spec::DataFileFormat::Parquet,
+            file_format: DataFileFormat::Parquet,
             referenced_data_file: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -321,7 +321,7 @@ mod tests {
         let task = FileScanTaskDeleteFile {
                 sequence_number: None,
                 partition: None,
-            file_format: crate::spec::DataFileFormat::Parquet,
+            file_format: DataFileFormat::Parquet,
             referenced_data_file: None,
             content_offset: None,
             content_size_in_bytes: None,

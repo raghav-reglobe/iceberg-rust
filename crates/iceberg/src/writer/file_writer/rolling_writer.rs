@@ -260,7 +260,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, LargeStringArray};
+    use arrow_array::{ArrayRef, Int32Array, LargeStringArray, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;

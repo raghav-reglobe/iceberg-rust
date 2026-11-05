@@ -1312,6 +1312,11 @@ pub(crate) fn build_partition_constant(
 
 #[cfg(test)]
 mod test {
+    /// The fork's tests name the field id as text; upstream's helper takes it as a number.
+    fn simple_field(name: &str, data_type: DataType, nullable: bool, field_id: &str) -> Field {
+        super::field_with_id(name, data_type, nullable, field_id.parse().unwrap())
+    }
+
     use std::collections::HashMap;
     use std::sync::Arc;
 
