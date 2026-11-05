@@ -3109,6 +3109,8 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(vals.value(0), [0x00], "variant-null bytes are verbatim");
+    }
+
     #[test]
     fn test_from_table_properties_sizing_defaults() {
         // With no properties set, the writer must use Iceberg's defaults (which

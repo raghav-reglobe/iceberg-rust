@@ -1123,6 +1123,7 @@ mod tests {
         let err = ArrowReader::build_keep_row_selection(&row_groups_metadata, &None, &[5, 3])
             .unwrap_err();
         assert!(err.to_string().contains("sorted"), "{err}");
+    }
 
     /// End-to-end read of a data file with a V3 deletion vector applied. Exercises the whole
     /// deletion-vector read path together: the DV coordinates on the scan task, the loader
