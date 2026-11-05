@@ -386,7 +386,7 @@ mod tests {
                 .with_project_field_ids(vec![1])
                 .with_predicate(Some(predicate.bind(schema, true).unwrap()))
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap();
             Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream
         };
@@ -679,7 +679,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_record_count(Some(100))
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         // Task 2: read the second and third row groups
@@ -693,7 +693,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_record_count(Some(200))
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -829,7 +829,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap();
 
             let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -937,7 +937,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap();
 
             let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1275,7 +1275,7 @@ mod tests {
             .with_project_field_ids(vec![1, 2])
             .with_predicate(Some(predicate))
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         let stream = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1377,7 +1377,7 @@ mod tests {
                 key_metadata: None,
             }])
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         let stream_sub2 =

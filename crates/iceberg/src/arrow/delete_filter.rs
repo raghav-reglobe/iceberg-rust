@@ -988,7 +988,7 @@ pub(crate) mod tests {
                 .with_project_field_ids(vec![])
                 .with_deletes(vec![pos_del_1, pos_del_2.clone()])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap(),
             FileScanTask::builder()
                 .with_file_size_in_bytes(0)
@@ -1000,7 +1000,7 @@ pub(crate) mod tests {
                 .with_project_field_ids(vec![])
                 .with_deletes(vec![pos_del_3])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap(),
         ];
 
@@ -1062,7 +1062,7 @@ pub(crate) mod tests {
                     .build(),
             ])
             .with_case_sensitive(true)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         let filter = DeleteFilter::new(Runtime::current());

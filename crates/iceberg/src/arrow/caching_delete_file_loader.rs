@@ -1874,7 +1874,7 @@ mod tests {
             .with_project_field_ids(vec![2, 3])
             .with_deletes(vec![pos_del, eq_del])
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
             .unwrap();
 
         // Load the deletes - should handle both types without error
