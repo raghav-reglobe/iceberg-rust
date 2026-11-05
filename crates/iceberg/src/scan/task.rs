@@ -410,7 +410,6 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_file_format(ctx.manifest_entry.data_file().file_format())
             .with_partition_spec_id(ctx.partition_spec_id)
             .with_equality_ids(ctx.manifest_entry.data_file.equality_ids.clone())
-            .with_file_format(ctx.manifest_entry.data_file().file_format())
             .with_referenced_data_file(ctx.manifest_entry.data_file().referenced_data_file())
             .with_content_offset(ctx.manifest_entry.data_file().content_offset())
             .with_content_size_in_bytes(ctx.manifest_entry.data_file().content_size_in_bytes())

@@ -960,13 +960,6 @@ pub(crate) fn create_primitive_array_repeated(
                     })?,
             )
         }
-        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => {
-            Arc::new(StringArray::from(vec![value.clone(); num_rows]))
-        }
-        (DataType::Utf8, None) => {
-            let vals: Vec<Option<String>> = vec![None; num_rows];
-            Arc::new(StringArray::from(vals))
-        }
         (DataType::LargeUtf8, Some(PrimitiveLiteral::String(value))) => {
             Arc::new(LargeStringArray::from(vec![value.clone(); num_rows]))
         }

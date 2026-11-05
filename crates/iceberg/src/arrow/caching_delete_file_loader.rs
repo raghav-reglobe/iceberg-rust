@@ -30,7 +30,6 @@ use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
 use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::io::FileIO;
-use crate::puffin::PuffinReader;
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{
