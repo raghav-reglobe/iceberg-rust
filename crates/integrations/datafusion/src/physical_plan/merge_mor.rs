@@ -480,13 +480,10 @@ async fn writer_task(
     mut rx: tokio::sync::mpsc::Receiver<WriteItem>,
     overrides: Arc<HashMap<String, DataType>>,
 ) -> DFResult<Vec<DataFile>> {
-    let table_props = ctx
-        .table
-        .metadata()
-        .table_properties()
-        .map_err(to_datafusion_error)?;
+    let table_props = ctx.table.metadata().table_properties();
     let parquet_writer_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())?
+        ParquetWriterBuilder::from_table_properties(&table_props, ctx.table_schema.clone())
+            .map_err(to_datafusion_error)?
             .with_variant_shred_types((*overrides).clone());
     let location_generator =
         DefaultLocationGenerator::new(ctx.table.metadata()).map_err(to_datafusion_error)?;
@@ -1622,13 +1619,12 @@ async fn run_mor_write(
     let table_schema = table.metadata().current_schema().clone();
     let table_arrow: ArrowSchemaRef =
         Arc::new(schema_to_arrow_schema(&table_schema).map_err(to_datafusion_error)?);
-    let table_props = table
-        .metadata()
-        .table_properties()
+    let table_props = table.metadata().table_properties();
+    let write_format = table_props
+        .write_format_default()
         .map_err(to_datafusion_error)?;
-    let file_format =
-        <DataFileFormat as std::str::FromStr>::from_str(&table_props.write_format_default()?)
-            .map_err(to_datafusion_error)?;
+    let file_format = <DataFileFormat as std::str::FromStr>::from_str(&write_format)
+        .map_err(to_datafusion_error)?;
     if file_format != DataFileFormat::Parquet {
         return Err(to_datafusion_error(iceberg::Error::new(
             iceberg::ErrorKind::FeatureUnsupported,
@@ -2877,7 +2873,7 @@ async fn inline_reabsorb(
         shred_variants: committed
             .metadata()
             .table_properties()
-            .map(|p| p.parquet_shred_variants()?)
+            .parquet_shred_variants()
             .unwrap_or(false),
         ..Default::default()
     };
