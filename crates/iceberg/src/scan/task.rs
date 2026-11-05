@@ -667,7 +667,7 @@ mod fork_tests {
             .with_partition(partition)
             .with_partition_spec(partition_spec)
             .with_case_sensitive(false)
-            .build().unwrap()
+            .build()
     }
 
     fn schema_and_spec(

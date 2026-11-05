@@ -1052,7 +1052,7 @@ pub(crate) mod tests {
                     .with_file_format(DataFileFormat::Parquet)
                     .with_partition_spec_id(0)
                     .with_equality_ids(Some(vec![1]))
-                    .build().unwrap(),
+                    .build(),
                 FileScanTaskDeleteFile::builder()
                     .with_file_path("eq-del-2.parquet".to_string())
                     .with_file_size_in_bytes(1)
@@ -1062,7 +1062,7 @@ pub(crate) mod tests {
                     .build(),
             ])
             .with_case_sensitive(true)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let filter = DeleteFilter::new(Runtime::current());
@@ -1146,7 +1146,7 @@ pub(crate) mod tests {
                     .with_file_type(DataContentType::EqualityDeletes)
                     .with_partition_spec_id(0)
                     .with_equality_ids(Some(vec![1]))
-                    .build().unwrap(),
+                    .build(),
                 FileScanTaskDeleteFile::builder()
                     .with_file_path("eq-del-by-name.parquet".to_string())
                     .with_file_size_in_bytes(1)
@@ -1156,7 +1156,7 @@ pub(crate) mod tests {
                     .build(),
             ])
             .with_case_sensitive(true)
-            .build();
+            .build().unwrap();
 
         let filter = DeleteFilter::new(Runtime::current());
 

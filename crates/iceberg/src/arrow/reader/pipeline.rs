@@ -3248,7 +3248,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap()),
             Ok(FileScanTask::builder()
                 .with_file_size_in_bytes(
@@ -3263,7 +3263,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap()),
             Ok(FileScanTask::builder()
                 .with_file_size_in_bytes(
@@ -3278,7 +3278,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build().unwrap()
+                .build()
                 .unwrap()),
         ];
 
