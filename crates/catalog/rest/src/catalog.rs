@@ -580,7 +580,15 @@ impl RestCatalog {
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
     ) -> Self {
-        let session_catalog = Arc::new(RestSessionCatalog::new(config, auth_manager, storage_factory, runtime, kms_client, None, None));
+        let session_catalog = Arc::new(RestSessionCatalog::new(
+            config,
+            auth_manager,
+            storage_factory,
+            runtime,
+            kms_client,
+            None,
+            None,
+        ));
 
         Self::from_session_catalog(context, session_catalog)
     }
@@ -1865,8 +1873,6 @@ mod tests {
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
             None,
-            None,
-            None,
         );
 
         let plan = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan"
@@ -1899,8 +1905,6 @@ mod tests {
             None,
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
-            None,
-            None,
             None,
         );
 
@@ -1938,8 +1942,6 @@ mod tests {
             None,
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
-            None,
-            None,
             None,
         );
 
@@ -3285,8 +3287,6 @@ mod tests {
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
             None,
-            None,
-            None,
         );
 
         assert!(
@@ -3661,8 +3661,6 @@ mod tests {
             None,
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
-            None,
-            None,
             None,
         );
 
@@ -4098,8 +4096,6 @@ mod tests {
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
             None,
-            None,
-            None,
         );
 
         let table1 = {
@@ -4247,8 +4243,6 @@ mod tests {
             None,
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
-            None,
-            None,
             None,
         );
 

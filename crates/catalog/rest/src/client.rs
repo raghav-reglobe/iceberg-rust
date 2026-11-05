@@ -412,7 +412,7 @@ mod tests {
         headers.insert("authorization", "Bearer leaked".parse().unwrap());
         headers.insert("x-request-id", "abc123".parse().unwrap());
         let response = HttpResponse::new(
-            http::StatusCode::IM_A_TEAPOT,
+            StatusCode::IM_A_TEAPOT,
             headers,
             br#"{"error": "nope"}"#.to_vec(),
         );
