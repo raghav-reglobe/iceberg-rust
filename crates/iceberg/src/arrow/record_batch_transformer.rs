@@ -3389,11 +3389,11 @@ mod test {
             .unwrap();
         assert_eq!(id_col.values(), &[100, 200, 300]);
 
-        // name column from file
+        // name column from file (strings read as LargeUtf8 in this fork)
         let name_col = result
             .column(1)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeStringArray>()
             .unwrap();
         assert_eq!(name_col.value(0), "a");
 

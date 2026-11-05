@@ -260,7 +260,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, LargeStringArray, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
@@ -500,7 +500,7 @@ mod tests {
                 .collect();
 
             let int_array = Arc::new(Int32Array::from(int_values)) as ArrayRef;
-            let str_array = Arc::new(StringArray::from(str_values)) as ArrayRef;
+            let str_array = Arc::new(LargeStringArray::from(str_values)) as ArrayRef;
 
             let batch =
                 RecordBatch::try_new(Arc::clone(&arrow_schema_ref), vec![int_array, str_array])

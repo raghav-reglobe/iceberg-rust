@@ -77,60 +77,7 @@ impl ManifestReader {
         manifest_file: &ManifestFile,
         entries: &mut [ManifestEntry],
     ) -> Result<()> {
-        // A `first_row_id` is only valid on data manifests. Delete files always
-        // have a null `first_row_id`, so there is nothing to assign or clear; a
-        // stray value on a delete manifest is a spec violation by the writer,
-        // which we surface without failing the read.
-        if manifest_file.content != ManifestContentType::Data {
-            if let Some(manifest_first_row_id) = manifest_file.first_row_id {
-                tracing::warn!(
-                    "Ignoring first_row_id {manifest_first_row_id} on delete manifest {}",
-                    manifest_file.manifest_path
-                );
-            }
-
-            return Ok(());
-        }
-
-        let Some(manifest_first_row_id) = manifest_file.first_row_id else {
-            // A data manifest with no manifest-level `first_row_id` predates row
-            // lineage; clear any per-entry value inherited from an earlier read.
-            for entry in entries {
-                entry.data_file.first_row_id = None;
-            }
-
-            return Ok(());
-        };
-
-        let mut next_row_id = i64::try_from(manifest_first_row_id).map_err(|_| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Invalid first_row_id: {manifest_first_row_id} (exceeds i64::MAX)"),
-            )
-        })?;
-
-        for entry in entries {
-            if !entry.is_alive() {
-                continue;
-            }
-
-            if entry.data_file.first_row_id.is_none() {
-                let file_first_row_id = next_row_id;
-                entry.data_file.first_row_id = Some(file_first_row_id);
-                let record_count = entry.data_file.record_count;
-                next_row_id = file_first_row_id.checked_add_unsigned(record_count).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Row ID overflow assigning first_row_id in {}. File first_row_id: {file_first_row_id}, record count: {record_count}",
-                            manifest_file.manifest_path
-                        ),
-                    )
-                })?;
-            }
-        }
-
-        Ok(())
+        assign_first_row_ids(manifest_file, entries)
     }
 }
 
@@ -421,4 +368,67 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("Row ID overflow"));
     }
+}
+
+/// Assigns `first_row_id` to the live data-file entries of a loaded manifest (row-lineage
+/// inheritance); shared by every manifest load path so a caller that parses the manifest
+/// bytes itself observes the same ids as [`ManifestReader::read`].
+pub(crate) fn assign_first_row_ids(
+    manifest_file: &ManifestFile,
+    entries: &mut [ManifestEntry],
+) -> Result<()> {
+    // A `first_row_id` is only valid on data manifests. Delete files always
+    // have a null `first_row_id`, so there is nothing to assign or clear; a
+    // stray value on a delete manifest is a spec violation by the writer,
+    // which we surface without failing the read.
+    if manifest_file.content != ManifestContentType::Data {
+        if let Some(manifest_first_row_id) = manifest_file.first_row_id {
+            tracing::warn!(
+                "Ignoring first_row_id {manifest_first_row_id} on delete manifest {}",
+                manifest_file.manifest_path
+            );
+        }
+
+        return Ok(());
+    }
+
+    let Some(manifest_first_row_id) = manifest_file.first_row_id else {
+        // A data manifest with no manifest-level `first_row_id` predates row
+        // lineage; clear any per-entry value inherited from an earlier read.
+        for entry in entries {
+            entry.data_file.first_row_id = None;
+        }
+
+        return Ok(());
+    };
+
+    let mut next_row_id = i64::try_from(manifest_first_row_id).map_err(|_| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Invalid first_row_id: {manifest_first_row_id} (exceeds i64::MAX)"),
+        )
+    })?;
+
+    for entry in entries {
+        if !entry.is_alive() {
+            continue;
+        }
+
+        if entry.data_file.first_row_id.is_none() {
+            let file_first_row_id = next_row_id;
+            entry.data_file.first_row_id = Some(file_first_row_id);
+            let record_count = entry.data_file.record_count;
+            next_row_id = file_first_row_id.checked_add_unsigned(record_count).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Row ID overflow assigning first_row_id in {}. File first_row_id: {file_first_row_id}, record count: {record_count}",
+                        manifest_file.manifest_path
+                    ),
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }

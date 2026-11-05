@@ -1947,7 +1947,7 @@ mod tests {
             .unwrap();
 
         let dv_del = FileScanTaskDeleteFile {
-                record_count: None,
+                record_count: Some(dv_data_file.record_count()),
                 sequence_number: None,
                 partition: None,
             key_metadata: None,
@@ -2079,7 +2079,7 @@ mod tests {
             .iter()
             .zip([data_file_1.clone(), data_file_2.clone()])
             .map(|(blob_meta, referenced)| FileScanTaskDeleteFile {
-                record_count: None,
+                record_count: Some(2),
                 sequence_number: None,
                 partition: None,
                 key_metadata: None,

@@ -1961,7 +1961,7 @@ mod row_position_range_tests {
         // A narrow projection (1% of the file) reads its ranges directly.
         let store = Arc::new(CountingBytesCache::default());
         assert_eq!(
-            read(Some(cache(&store, 0.5, 0)), tasks(sizes(10, 990))).await,
+            read(Some(cache(&store, 0.5, 0)), tasks(sizes(file_size / 100, file_size - file_size / 100))).await,
             direct
         );
         assert_eq!(store.sets.load(Ordering::SeqCst), 0, "no whole-file fetch");
@@ -1970,7 +1970,7 @@ mod row_position_range_tests {
         // A wide projection (99%) takes the whole-file path.
         let store = Arc::new(CountingBytesCache::default());
         assert_eq!(
-            read(Some(cache(&store, 0.5, 0)), tasks(sizes(990, 10))).await,
+            read(Some(cache(&store, 0.5, 0)), tasks(sizes(file_size - file_size / 100, file_size / 100))).await,
             direct
         );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1);
@@ -1983,7 +1983,7 @@ mod row_position_range_tests {
         // A small file is admitted whatever its share.
         let store = Arc::new(CountingBytesCache::default());
         assert_eq!(
-            read(Some(cache(&store, 0.5, file_size)), tasks(sizes(10, 990))).await,
+            read(Some(cache(&store, 0.5, file_size)), tasks(sizes(file_size / 100, file_size - file_size / 100))).await,
             direct
         );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1);
@@ -1991,7 +1991,7 @@ mod row_position_range_tests {
         // The check disabled (fraction 0): every file within the cap.
         let store = Arc::new(CountingBytesCache::default());
         assert_eq!(
-            read(Some(cache(&store, 0.0, 0)), tasks(sizes(10, 990))).await,
+            read(Some(cache(&store, 0.0, 0)), tasks(sizes(file_size / 100, file_size - file_size / 100))).await,
             direct
         );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1);
