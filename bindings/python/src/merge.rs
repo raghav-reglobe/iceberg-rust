@@ -151,7 +151,8 @@ type ScopedTables = HashMap<String, HashMap<String, Vec<String>>>;
 
 /// `{catalog: ["namespace.table", ...]}` -> catalog -> namespace -> tables.
 /// A catalog WITH an entry mounts scoped (zero list calls, one load_table
-/// per named table — the per-call latency floor + Polaris-stampede fix);
+/// per named table: the per-call latency floor, and no listing storm on the
+/// catalog server);
 /// a catalog WITHOUT one keeps the full eager mount.
 fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult<ScopedTables> {
     let mut out: ScopedTables = HashMap::new();
@@ -191,8 +192,8 @@ fn parse_scoped_tables(scoped: Option<HashMap<String, Vec<String>>>) -> PyResult
 /// partitions therefore fill 100% of the pool with spillable batches, and
 /// whichever UNSPILLABLE consumer asks next — the hash-join build side, a
 /// partition's own pre-spill merge reservation — fails the whole statement.
-/// Pool SIZE only scales the fill: the same hot-key bucket class failed at
-/// 18G, 30G and 36.9G pools with one signature (2026-09-07). This wrapper
+/// Pool SIZE only scales the fill: the same statement class fails at any
+/// pool size with one signature. This wrapper
 /// changes the RULE instead: a spillable `try_grow` is refused once the
 /// pool's total reservation would exceed `limit - reserve` (the sorter then
 /// spills and retries — its normal path), while unspillable requests pass
@@ -1000,23 +1001,23 @@ mod snapshot_pin_tests {
     fn snapshot_ids_group_per_catalog_and_split_multilevel_namespaces() {
         let ids = parse_snapshot_ids(Some(HashMap::from([
             (
-                "bronze_dbnew.cashify_mart.orders".to_string(),
+                "cat_a.sales.orders".to_string(),
                 1_833_894_294_735_745_083_i64,
             ),
             (
-                "bronze_dbadhoc.rawtwin.kapture.ticket_report_data_t6".to_string(),
+                "cat_b.raw.tickets.report_t6".to_string(),
                 8_076_658_723_558_311_002_i64,
             ),
         ])))
         .unwrap();
         assert_eq!(
-            ids["bronze_dbnew"][&("cashify_mart".to_string(), "orders".to_string())],
+            ids["cat_a"][&("sales".to_string(), "orders".to_string())],
             1_833_894_294_735_745_083
         );
         assert_eq!(
-            ids["bronze_dbadhoc"][&(
-                "rawtwin.kapture".to_string(),
-                "ticket_report_data_t6".to_string()
+            ids["cat_b"][&(
+                "raw.tickets".to_string(),
+                "report_t6".to_string()
             )],
             8_076_658_723_558_311_002
         );
@@ -1025,7 +1026,7 @@ mod snapshot_pin_tests {
     #[test]
     fn snapshot_ids_reject_a_two_part_key() {
         assert!(
-            parse_snapshot_ids(Some(HashMap::from([("bronze.orders".to_string(), 1_i64)])))
+            parse_snapshot_ids(Some(HashMap::from([("cat.orders".to_string(), 1_i64)])))
                 .is_err()
         );
     }
