@@ -941,7 +941,7 @@ mod fork_tests {
         writer.close().await.unwrap();
 
         let input = output.to_input_file();
-        let reader = PuffinReader::new(input);
+        let reader = PuffinReader::new(input).await.unwrap();
         let meta = reader.file_metadata().await.unwrap().clone();
         assert_eq!(meta.blobs.len(), 1);
         let read_blob = reader.blob(meta.blobs.first().unwrap()).await.unwrap();
@@ -993,7 +993,7 @@ mod fork_tests {
 
         // The written Puffin file reads back to the same positions.
         let input = file_io.new_input(&location).unwrap();
-        let reader = PuffinReader::new(input);
+        let reader = PuffinReader::new(input).await.unwrap();
         let meta = reader.file_metadata().await.unwrap().clone();
         let blob = reader.blob(meta.blobs.first().unwrap()).await.unwrap();
         let restored = DeleteVector::from_puffin_blob(blob).unwrap();

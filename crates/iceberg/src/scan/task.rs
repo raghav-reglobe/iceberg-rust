@@ -445,6 +445,7 @@ pub struct FileScanTaskDeleteFile {
 
     /// The delete file's format, from the manifest entry. A `PositionDeletes` entry written as
     /// `Puffin` is a V3 deletion vector; one written as `Parquet` is a position delete file.
+    #[builder(default = DataFileFormat::Parquet)]
     pub file_format: DataFileFormat,
 
     /// partition id
@@ -580,7 +581,7 @@ mod tests {
             .with_project_field_ids(project)
             .with_column_sizes(column_sizes)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
     }
 
     /// Leaves only: the variant column (10) has no entry — its bytes are
@@ -666,7 +667,7 @@ mod fork_tests {
             .with_partition(partition)
             .with_partition_spec(partition_spec)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
     }
 
     fn schema_and_spec(

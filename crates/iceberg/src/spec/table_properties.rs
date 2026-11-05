@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_shred_variants_off_by_default_on_by_flag() {
-        let tp = TableProperties::new(&HashMap::new());
+        let tp = TableProperties::new(&HashMap::<String, String>::new());
         assert!(!tp.parquet_shred_variants().unwrap());
         let props = HashMap::from([(
             TableProperties::PROPERTY_PARQUET_SHRED_VARIANTS.to_string(),

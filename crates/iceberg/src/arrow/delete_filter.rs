@@ -988,7 +988,7 @@ pub(crate) mod tests {
                 .with_project_field_ids(vec![])
                 .with_deletes(vec![pos_del_1, pos_del_2.clone()])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap(),
             FileScanTask::builder()
                 .with_file_size_in_bytes(0)
@@ -1000,7 +1000,7 @@ pub(crate) mod tests {
                 .with_project_field_ids(vec![])
                 .with_deletes(vec![pos_del_3])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap(),
         ];
 
@@ -1052,7 +1052,7 @@ pub(crate) mod tests {
                     .with_file_format(DataFileFormat::Parquet)
                     .with_partition_spec_id(0)
                     .with_equality_ids(Some(vec![1]))
-                    .build(),
+                    .build().unwrap(),
                 FileScanTaskDeleteFile::builder()
                     .with_file_path("eq-del-2.parquet".to_string())
                     .with_file_size_in_bytes(1)
@@ -1146,7 +1146,7 @@ pub(crate) mod tests {
                     .with_file_type(DataContentType::EqualityDeletes)
                     .with_partition_spec_id(0)
                     .with_equality_ids(Some(vec![1]))
-                    .build(),
+                    .build().unwrap(),
                 FileScanTaskDeleteFile::builder()
                     .with_file_path("eq-del-by-name.parquet".to_string())
                     .with_file_size_in_bytes(1)

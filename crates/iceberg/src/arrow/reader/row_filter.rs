@@ -386,7 +386,7 @@ mod tests {
                 .with_project_field_ids(vec![1])
                 .with_predicate(Some(predicate.bind(schema, true).unwrap()))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap();
             Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream
         };
@@ -679,7 +679,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_record_count(Some(100))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         // Task 2: read the second and third row groups
@@ -693,7 +693,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_record_count(Some(200))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -829,7 +829,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap();
 
             let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -937,7 +937,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap();
 
             let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1275,7 +1275,7 @@ mod tests {
             .with_project_field_ids(vec![1, 2])
             .with_predicate(Some(predicate))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let stream = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1366,7 +1366,6 @@ mod tests {
                 partition: None,
                 file_path: pos_del_path.clone(),
                 file_type: DataContentType::PositionDeletes,
-                file_format: DataFileFormat::Parquet,
                 partition_spec_id: 0,
                 equality_ids: None,
                 file_size_in_bytes: std::fs::metadata(&pos_del_path).unwrap().len(),
@@ -1378,7 +1377,7 @@ mod tests {
                 key_metadata: None,
             }])
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let stream_sub2 =
@@ -1603,7 +1602,7 @@ mod row_position_range_tests {
                     .with_schema(schema.clone())
                     .with_project_field_ids(vec![1, RESERVED_FIELD_ID_POS])
                     .with_case_sensitive(false)
-                    .build())
+                    .build().unwrap())
             })
             .collect();
         let batches = reader
@@ -1720,7 +1719,7 @@ mod row_position_range_tests {
             .with_schema(schema)
             .with_project_field_ids(vec![1, 2])
             .with_case_sensitive(false)
-            .build();
+            .build().unwrap();
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
         let batches: Vec<RecordBatch> = reader
             .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
@@ -1801,7 +1800,7 @@ mod row_position_range_tests {
                         .with_schema(schema.clone())
                         .with_project_field_ids(vec![1, RESERVED_FIELD_ID_POS])
                         .with_case_sensitive(false)
-                        .build())
+                        .build().unwrap())
                 })
                 .collect()
         };
@@ -1923,7 +1922,7 @@ mod row_position_range_tests {
                 .with_project_field_ids(vec![1])
                 .with_column_sizes(column_sizes)
                 .with_case_sensitive(false)
-                .build())]
+                .build().unwrap())]
         };
         let ids = |batches: Vec<RecordBatch>| -> Vec<i32> {
             let mut out: Vec<i32> = batches

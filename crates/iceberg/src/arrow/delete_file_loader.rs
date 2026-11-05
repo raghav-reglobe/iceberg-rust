@@ -234,12 +234,8 @@ mod tests {
         );
 
         let task = FileScanTaskDeleteFile {
-                sequence_number: None,
-                partition: None,
-            file_format: DataFileFormat::Parquet,
-            referenced_data_file: None,
-            content_offset: None,
-            content_size_in_bytes: None,
+            sequence_number: None,
+            partition: None,
             file_path: del_path.clone(),
             file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
             file_type: DataContentType::PositionDeletes,
@@ -319,12 +315,8 @@ mod tests {
         );
 
         let task = FileScanTaskDeleteFile {
-                sequence_number: None,
-                partition: None,
-            file_format: DataFileFormat::Parquet,
-            referenced_data_file: None,
-            content_offset: None,
-            content_size_in_bytes: None,
+            sequence_number: None,
+            partition: None,
             file_path: del_path.clone(),
             file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
             file_type: DataContentType::EqualityDeletes,

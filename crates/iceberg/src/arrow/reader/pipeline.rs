@@ -1470,7 +1470,7 @@ mod tests {
             .with_schema(schema)
             .with_project_field_ids(project_field_ids)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1660,7 +1660,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_case_sensitive(false)
             .with_key_metadata(Some(key_metadata))
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1733,7 +1733,7 @@ mod tests {
             .with_schema(schema)
             .with_project_field_ids(vec![1])
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1814,7 +1814,7 @@ mod tests {
             .with_first_row_id(first_row_id)
             .with_data_sequence_number(data_sequence_number)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap()
     }
 
@@ -2059,7 +2059,7 @@ mod tests {
             .with_first_row_id(Some(100))
             .with_data_sequence_number(Some(9))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
@@ -2207,7 +2207,7 @@ mod tests {
             .with_first_row_id(first_row_id)
             .with_deletes(deletes)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap()
     }
 
@@ -2388,7 +2388,7 @@ mod tests {
                 .with_first_row_id(Some(42))
                 .with_data_sequence_number(Some(7))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
@@ -2451,7 +2451,7 @@ mod tests {
                 .with_partition(Some(partition_data.clone()))
                 .with_unified_partition_type(Some(unified_type.clone()))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
@@ -2565,7 +2565,7 @@ mod tests {
             .with_first_row_id(Some(100))
             .with_data_sequence_number(Some(9))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
@@ -2649,7 +2649,7 @@ mod tests {
             .with_project_field_ids(vec![1, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID])
             .with_first_row_id(Some(100))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
@@ -2816,7 +2816,7 @@ mod tests {
             .with_predicate(Some(bound))
             .with_first_row_id(first_row_id)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap()
     }
 
@@ -3158,7 +3158,7 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_case_sensitive(false)
             .with_key_metadata(Some(wrong_key_metadata))
-            .build()
+            .build().unwrap()
             .unwrap();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3248,7 +3248,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()),
             Ok(FileScanTask::builder()
                 .with_file_size_in_bytes(
@@ -3263,7 +3263,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()),
             Ok(FileScanTask::builder()
                 .with_file_size_in_bytes(
@@ -3278,7 +3278,7 @@ mod tests {
                 .with_schema(schema.clone())
                 .with_project_field_ids(vec![1, 2])
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()),
         ];
 
@@ -3997,7 +3997,7 @@ mod tests {
                     .with_schema(schema)
                     .with_project_field_ids(vec![1, 2])
                     .with_case_sensitive(false)
-                    .build();
+                    .build().unwrap();
                 let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
                 let batches: Vec<RecordBatch> = reader
                     .read(tasks)
@@ -4107,7 +4107,7 @@ mod tests {
             .with_project_field_ids(project_field_ids)
             .with_first_row_id(first_row_id)
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap()
     }
 
@@ -4190,7 +4190,7 @@ mod tests {
             .with_project_field_ids(vec![RESERVED_FIELD_ID_POS])
             .with_predicate(Some(bound))
             .with_case_sensitive(false)
-            .build()
+            .build().unwrap()
             .unwrap();
 
         // Row selection must be enabled for the predicate to filter rows. The row filter
@@ -4286,7 +4286,7 @@ mod tests {
                 .with_first_row_id(Some(100))
                 .with_data_sequence_number(Some(9))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
@@ -4361,7 +4361,7 @@ mod tests {
                 .with_first_row_id(Some(100))
                 .with_data_sequence_number(Some(9))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
@@ -4426,7 +4426,7 @@ mod tests {
                 .with_first_row_id(None)
                 .with_data_sequence_number(Some(9))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
@@ -4530,7 +4530,7 @@ mod tests {
                 .with_partition(Some(Struct::from_iter([Some(Literal::int(42))])))
                 .with_partition_spec(Some(spec.clone()))
                 .with_case_sensitive(false)
-                .build()
+                .build().unwrap()
                 .unwrap()
         };
 
