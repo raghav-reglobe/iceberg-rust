@@ -485,19 +485,12 @@ impl TableProperties<'_> {
     /// Default value for history.expire.max-ref-age-ms (effectively never expire refs).
     pub const PROPERTY_MAX_REF_AGE_MS_DEFAULT: i64 = i64::MAX;
 
-    /// Compression codec for parquet data files.
-    pub const PROPERTY_PARQUET_COMPRESSION_CODEC: &str = "write.parquet.compression-codec";
-    /// Default parquet compression codec — zstd, the Iceberg default (parquet-rs's
-    /// own writer default is UNCOMPRESSED, which must never be inherited implicitly).
-    pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &str = "zstd";
-    /// Compression level for parquet data files (codec-specific; unset = codec default).
-    pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
 
     /// Write variant columns SHREDDED (a `typed_value` subtree readers can
     /// prune into) instead of the canonical `{metadata, value}` pair, deriving
     /// each column's shredding from existing data files (shred-preserving —
     /// the layout is never invented, only carried forward).
-    pub const PROPERTY_PARQUET_SHRED_VARIANTS: &str = "write.parquet.shred-variants";
+    pub const PROPERTY_PARQUET_SHRED_VARIANTS: &'static str = "write.parquet.shred-variants";
     /// Default value for shred-variants (canonical output).
     pub const PROPERTY_PARQUET_SHRED_VARIANTS_DEFAULT: bool = false;
 

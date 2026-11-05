@@ -335,7 +335,9 @@ impl From<FileScanTask> for Result<FileScanTask> {
         task.validate()?;
         Ok(task)
     }
+}
 
+impl FileScanTask {
     /// The share of the file's bytes this task's projection will read,
     /// estimated from the manifest's per-field `column_sizes`: each
     /// projected field contributes its recorded size plus that of every

@@ -610,6 +610,7 @@ impl ParquetWriter {
                 file_size_in_bytes,
                 file_path,
                 HashMap::new(),
+                None,
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
             builder.partition(partition);

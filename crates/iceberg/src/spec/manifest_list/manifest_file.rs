@@ -21,6 +21,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use super::ByteBuf;
 use crate::error::Result;
+use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::io::FileIO;
 use crate::spec::{Manifest, TableMetadataRef};
 use crate::{Error, ErrorKind};

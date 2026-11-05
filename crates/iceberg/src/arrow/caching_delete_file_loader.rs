@@ -197,15 +197,6 @@ enum DeleteFileContext {
         file_path: String,
         stream: ArrowRecordBatchStream,
     },
-    /// A V3 deletion vector; the blob located by `content_offset`/`content_size`
-    /// is read and parsed into a `DeleteVector` in the parse phase.
-    DelVec {
-        file_path: String,
-        referenced_data_file: String,
-        content_offset: u64,
-        content_size: u64,
-        file_io: FileIO,
-    },
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
@@ -720,70 +711,6 @@ impl CachingDeleteFileLoader {
     /// Reads a V3 deletion-vector-v1 blob located at `content_offset` (length
     /// `content_size`) within `file_path` and parses it into a `DeleteVector`.
     ///
-    /// The blob is addressed by the manifest entry's content offset/size rather
-    /// than by parsing a Puffin footer, so this works whether the deletion vector
-    /// is a standalone blob file (e.g. written by DuckDB) or stored inside a
-    /// Puffin container.
-    async fn read_deletion_vector(
-        file_io: &FileIO,
-        file_path: &str,
-        content_offset: u64,
-        content_size: u64,
-    ) -> Result<DeleteVector> {
-        let bytes = file_io.new_input(file_path)?.read().await?;
-        let start = content_offset as usize;
-        let end = start
-            .checked_add(content_size as usize)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "deletion vector blob range {content_offset}..+{content_size} is out of bounds for {file_path} ({} bytes)",
-                        bytes.len()
-                    ),
-                )
-            })?;
-
-        // Fast path: per the Iceberg spec a `deletion-vector-v1` blob is stored
-        // uncompressed ("Omit compression-codec; deletion-vector-v1 is not
-        // compressed"), so the bytes located by content_offset/content_size are the
-        // serialized blob directly. This also covers container-less blob files
-        // (e.g. written by DuckDB) that have no Puffin footer.
-        if let Ok(delete_vector) = DeleteVector::from_serialized_bytes(&bytes[start..end]) {
-            return Ok(delete_vector);
-        }
-
-        // Fallback: a deletion vector blob that is compressed (which the spec
-        // forbids, but a non-conforming writer could produce) can only be
-        // decompressed using the codec recorded in the Puffin footer. If this file
-        // is a valid Puffin file, read the blob through its footer, which honors
-        // the per-blob compression codec.
-        let reader = PuffinReader::new(file_io.new_input(file_path)?);
-        let metadata = reader.file_metadata().await.map_err(|err| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "deletion vector at offset {content_offset} in {file_path} is neither a valid uncompressed deletion-vector-v1 blob nor a Puffin container"
-                ),
-            )
-            .with_source(err)
-        })?;
-        let blob_metadata = metadata
-            .blobs()
-            .iter()
-            .find(|blob| blob.offset() == content_offset)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Puffin file {file_path} has no blob at content_offset {content_offset}"
-                    ),
-                )
-            })?;
-        let blob = reader.blob(blob_metadata).await?;
-        DeleteVector::from_puffin_blob(blob)
-    }
 
     /// Parses a record batch stream coming from positional delete files
     ///
@@ -831,7 +758,7 @@ impl CachingDeleteFileLoader {
             // into its existing delete vector (order does not affect the result).
             let mut run_path: Option<&str> = None;
 
-            for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
+            for (file_path, pos) in file_paths.zip(positions.iter()) {
                 let (Some(file_path), Some(pos)) = (file_path, pos) else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,

@@ -54,23 +54,6 @@ pub struct MemoryCatalogBuilder {
     data_bytes_cache: Option<DataBytesCache>,
 }
 
-impl Default for MemoryCatalogBuilder {
-    fn default() -> Self {
-        Self {
-            config: MemoryCatalogConfig {
-                name: None,
-                warehouse: "".to_string(),
-                props: HashMap::new(),
-            },
-            storage_factory: None,
-            kms_client_factory: None,
-            runtime: None,
-            object_bytes_cache: None,
-            data_bytes_cache: None,
-        }
-    }
-}
-
 impl MemoryCatalogBuilder {
     /// Attach a SHARED, path-keyed cache of raw manifest / manifest-list
     /// bytes (see [`crate::cache::ObjectBytesCache`]). Every table this
