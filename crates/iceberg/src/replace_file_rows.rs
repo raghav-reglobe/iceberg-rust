@@ -44,6 +44,7 @@
 //! replace, the carried values are the table's latest.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -78,6 +79,35 @@ pub struct FileRows {
     pub data_file_path: String,
     /// Every row the file should hold after the replace.
     pub batches: Vec<RecordBatch>,
+}
+
+/// A re-openable supply of replacement rows, read one batch at a time.
+///
+/// [`replace_file_rows_from_sources`] opens a source once to validate its rows
+/// and, unless it is a dry run, once more to write them, so rows too many to
+/// hold in memory can be streamed from disk instead of given as
+/// [`FileRows::batches`]. Every open must yield the same rows in the same order.
+pub trait RowSource: Send + Sync + fmt::Debug {
+    /// Start a fresh read of every row.
+    fn open(&self) -> Result<RowBatches<'_>>;
+}
+
+/// The batches one [`RowSource::open`] yields.
+pub type RowBatches<'a> = Box<dyn Iterator<Item = Result<RecordBatch>> + Send + 'a>;
+
+impl RowSource for Vec<RecordBatch> {
+    fn open(&self) -> Result<RowBatches<'_>> {
+        Ok(Box::new(self.iter().cloned().map(Ok)))
+    }
+}
+
+/// The complete replacement rows of one live data file, read on demand.
+#[derive(Debug, Clone)]
+pub struct FileRowSource {
+    /// The data file's path exactly as the table metadata records it.
+    pub data_file_path: String,
+    /// Every row the file should hold after the replace.
+    pub source: Arc<dyn RowSource>,
 }
 
 /// What a replace did (or, on a dry run, would do).
@@ -154,6 +184,34 @@ fn literal_at(array: &ArrayRef, row: usize) -> Result<Option<Literal>> {
     }))
 }
 
+/// Every row of `batch` must carry its file's identity-partition values.
+fn check_partition(
+    batch: &RecordBatch,
+    identity: &[(usize, String)],
+    old: &DataFile,
+    ident: &TableIdent,
+    path: &str,
+) -> Result<()> {
+    for (pos, col) in identity {
+        let want = old.partition().fields().get(*pos).cloned().flatten();
+        let idx = batch.schema().index_of(col).map_err(|_| {
+            invalid(format!(
+                "{ident}: replacement rows lack the partition column `{col}`"
+            ))
+        })?;
+        let arr = batch.column(idx).clone();
+        for r in 0..arr.len() {
+            if literal_at(&arr, r)? != want {
+                return Err(invalid(format!(
+                    "{ident}: a replacement row for {path} carries `{col}` = {:?}, the file's partition is {want:?}",
+                    literal_at(&arr, r)?
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replace the rows of the named live data files of `ident` with the caller's
 /// rows, copy-on-write, in one `Replace` snapshot (see the module docs). With
 /// `dry_run` every check runs and nothing is written or committed.
@@ -162,6 +220,39 @@ pub async fn replace_file_rows(
     ident: &TableIdent,
     base_snapshot: i64,
     files: Vec<FileRows>,
+    dry_run: bool,
+    snapshot_properties: HashMap<String, String>,
+    carry_summary_prefix: Option<&str>,
+) -> Result<ReplaceFileRowsOutcome> {
+    let files = files
+        .into_iter()
+        .map(|f| FileRowSource {
+            data_file_path: f.data_file_path,
+            source: Arc::new(f.batches) as Arc<dyn RowSource>,
+        })
+        .collect();
+    replace_file_rows_from_sources(
+        catalog,
+        ident,
+        base_snapshot,
+        files,
+        dry_run,
+        snapshot_properties,
+        carry_summary_prefix,
+    )
+    .await
+}
+
+/// [`replace_file_rows`] over sources read one batch at a time. Each file's
+/// rows are read once to count, conform and check them, retaining nothing;
+/// only when every file passed (and it is not a dry run) is each source read
+/// again and written. The write refuses when the second read yields a
+/// different row count than the first.
+pub async fn replace_file_rows_from_sources(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    base_snapshot: i64,
+    files: Vec<FileRowSource>,
     dry_run: bool,
     snapshot_properties: HashMap<String, String>,
     carry_summary_prefix: Option<&str>,
@@ -309,7 +400,8 @@ pub async fn replace_file_rows(
         ..Default::default()
     };
     let target_arrow: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema)?);
-    let mut conformed: Vec<(DataFile, Vec<RecordBatch>)> = Vec::new();
+    // first pass: count, conform and check every replacement row, retaining none
+    let mut validated: Vec<(DataFile, Arc<dyn RowSource>, u64)> = Vec::new();
     for (f, old) in files.into_iter().zip(old_files) {
         let tasks = tasks_by_file.remove(&f.data_file_path).unwrap_or_default();
         let live = if tasks.is_empty() {
@@ -328,7 +420,16 @@ pub async fn replace_file_rows(
             }
             n
         };
-        let given: u64 = f.batches.iter().map(|b| b.num_rows() as u64).sum();
+        let mut given = 0u64;
+        for b in f.source.open()? {
+            let b = b?;
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let c = conform_batch(&b, &target_arrow)?;
+            check_partition(&c, &identity, &old, ident, &f.data_file_path)?;
+            given += c.num_rows() as u64;
+        }
         if given != live {
             return Err(invalid(format!(
                 "{ident}: {} has {live} live rows but {given} replacement rows were given",
@@ -336,44 +437,19 @@ pub async fn replace_file_rows(
             )));
         }
         outcome.rows_live += live;
-        let mut out = Vec::with_capacity(f.batches.len());
-        for b in &f.batches {
-            if b.num_rows() == 0 {
-                continue;
-            }
-            let c = conform_batch(b, &target_arrow)?;
-            for (pos, col) in &identity {
-                let want = old.partition().fields().get(*pos).cloned().flatten();
-                let idx = c.schema().index_of(col).map_err(|_| {
-                    invalid(format!(
-                        "{ident}: replacement rows lack the partition column `{col}`"
-                    ))
-                })?;
-                let arr = c.column(idx).clone();
-                for r in 0..arr.len() {
-                    if literal_at(&arr, r)? != want {
-                        return Err(invalid(format!(
-                            "{ident}: a replacement row for {} carries `{col}` = {:?}, the file's partition is {want:?}",
-                            f.data_file_path,
-                            literal_at(&arr, r)?
-                        )));
-                    }
-                }
-            }
-            outcome.rows_written += c.num_rows() as u64;
-            out.push(c);
-        }
-        conformed.push((old, out));
+        outcome.rows_written += given;
+        validated.push((old, f.source, given));
     }
     if dry_run {
         return Ok(outcome);
     }
 
+    // second pass: read each source again and write it
     let run = Uuid::now_v7();
     let mut new_files: Vec<DataFile> = Vec::new();
     let mut old_files: Vec<DataFile> = Vec::new();
-    for (i, (old, batches)) in conformed.into_iter().enumerate() {
-        if !batches.is_empty() {
+    for (i, (old, source, expected)) in validated.into_iter().enumerate() {
+        if expected > 0 {
             let rolling = RollingFileWriterBuilder::new_with_default_file_size(
                 ParquetWriterBuilder::new(writer_properties(&table), schema.clone()),
                 table.file_io().clone(),
@@ -394,8 +470,21 @@ pub async fn replace_file_rows(
                 ))
             };
             let mut writer = DataFileWriterBuilder::new(rolling).build(pkey).await?;
-            for b in batches {
-                writer.write(b).await?;
+            let mut written = 0u64;
+            for b in source.open()? {
+                let b = b?;
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let c = conform_batch(&b, &target_arrow)?;
+                written += c.num_rows() as u64;
+                writer.write(c).await?;
+            }
+            if written != expected {
+                return Err(invalid(format!(
+                    "{ident}: {} yielded {expected} replacement rows when validated but {written} when written",
+                    old.file_path()
+                )));
             }
             new_files.extend(writer.close().await?);
         }
@@ -430,6 +519,7 @@ pub async fn replace_file_rows(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{
         Array, ArrayRef, BooleanArray, Int64Array, LargeStringArray, RecordBatch, StringArray,
@@ -1037,5 +1127,343 @@ mod tests {
             }
         }
         assert_eq!(live_deletes, 0);
+    }
+
+    /// A source that counts its opens and, when `grows`, yields one extra row
+    /// from the second open on, like a stream rewritten between the passes.
+    #[derive(Debug)]
+    struct Counting {
+        batches: Vec<RecordBatch>,
+        opens: AtomicUsize,
+        grows: bool,
+    }
+
+    impl Counting {
+        fn new(batches: Vec<RecordBatch>, grows: bool) -> Arc<Self> {
+            Arc::new(Self {
+                batches,
+                opens: AtomicUsize::new(0),
+                grows,
+            })
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RowSource for Counting {
+        fn open(&self) -> Result<RowBatches<'_>> {
+            let n = self.opens.fetch_add(1, Ordering::SeqCst);
+            let mut out = self.batches.clone();
+            if self.grows && n >= 1 {
+                out.push(rows(&[99], &[Some("late")], Some(false), None));
+            }
+            Ok(Box::new(out.into_iter().map(Ok)))
+        }
+    }
+
+    /// Appends f1 (ids 1 and 2, `v` null) and f2 (id 3) and returns f1 with the table.
+    async fn two_files(catalog: &dyn Catalog, table: &Table) -> (DataFile, Table) {
+        let f1 = write(
+            table,
+            "f1",
+            rows(&[1, 2], &[None, None], Some(false), None),
+            Some(false),
+        )
+        .await;
+        let f2 = write(
+            table,
+            "f2",
+            rows(&[3], &[Some("keep")], Some(false), None),
+            Some(false),
+        )
+        .await;
+        let table = append(catalog, table, vec![f1.clone(), f2], HashMap::new()).await;
+        (f1, table)
+    }
+
+    fn two_batches() -> Vec<RecordBatch> {
+        vec![
+            rows(&[1], &[Some("a")], Some(false), None),
+            rows(&[2], &[Some("b")], Some(false), None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_source_is_read_twice_and_lands_what_the_batches_entry_lands() {
+        let (_wa, cat_a, ident_a, table_a) = setup(FormatVersion::V2, false).await;
+        let (f1_a, table_a) = two_files(cat_a.as_ref(), &table_a).await;
+        let by_batches = replace_file_rows(
+            cat_a.as_ref(),
+            &ident_a,
+            table_a.metadata().current_snapshot_id().unwrap(),
+            vec![FileRows {
+                data_file_path: f1_a.file_path().to_string(),
+                batches: two_batches(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (_wb, cat_b, ident_b, table_b) = setup(FormatVersion::V2, false).await;
+        let (f1_b, table_b) = two_files(cat_b.as_ref(), &table_b).await;
+        let source = Counting::new(two_batches(), false);
+        let by_source = replace_file_rows_from_sources(
+            cat_b.as_ref(),
+            &ident_b,
+            table_b.metadata().current_snapshot_id().unwrap(),
+            vec![FileRowSource {
+                data_file_path: f1_b.file_path().to_string(),
+                source: source.clone(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(source.opens(), 2, "one read to validate, one to write");
+        let shape = |o: &ReplaceFileRowsOutcome| {
+            (
+                o.files_replaced,
+                o.files_added,
+                o.rows_live,
+                o.rows_written,
+                o.delete_files_removed,
+            )
+        };
+        assert_eq!(shape(&by_source), shape(&by_batches));
+        assert_eq!(shape(&by_source), (1, 1, 2, 2, 0));
+        assert!(by_source.snapshot_after.is_some());
+        let rows_a = read(&cat_a.load_table(&ident_a).await.unwrap()).await;
+        let rows_b = read(&cat_b.load_table(&ident_b).await.unwrap()).await;
+        assert_eq!(rows_a, rows_b);
+        assert_eq!(rows_b, vec![
+            (1, Some("a".to_string())),
+            (2, Some("b".to_string())),
+            (3, Some("keep".to_string()))
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_over_a_source_reads_it_once_and_writes_nothing() {
+        let (_wh, catalog, ident, table) = setup(FormatVersion::V2, false).await;
+        let (f1, table) = two_files(catalog.as_ref(), &table).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let source = Counting::new(two_batches(), false);
+        let out = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            vec![FileRowSource {
+                data_file_path: f1.file_path().to_string(),
+                source: source.clone(),
+            }],
+            true,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.opens(), 1);
+        assert_eq!((out.rows_live, out.rows_written, out.files_added), (2, 2, 0));
+        assert_eq!(out.snapshot_after, None);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().current_snapshot_id(), Some(s0));
+        assert_eq!(read(&table).await, vec![(1, None), (2, None), (3, Some("keep".to_string()))]);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_grows_between_the_passes_refuses() {
+        let (_wh, catalog, ident, table) = setup(FormatVersion::V2, false).await;
+        let (f1, table) = two_files(catalog.as_ref(), &table).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let source = Counting::new(two_batches(), true);
+        let err = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            vec![FileRowSource {
+                data_file_path: f1.file_path().to_string(),
+                source: source.clone(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("2 replacement rows when validated but 3 when written"),
+            "{err}"
+        );
+        assert_eq!(source.opens(), 2);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().current_snapshot_id(), Some(s0), "nothing committed");
+        assert_eq!(read(&table).await, vec![(1, None), (2, None), (3, Some("keep".to_string()))]);
+    }
+
+    #[tokio::test]
+    async fn a_short_source_refuses_before_any_write() {
+        let (_wh, catalog, ident, table) = setup(FormatVersion::V2, false).await;
+        let (f1, table) = two_files(catalog.as_ref(), &table).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let source = Counting::new(vec![rows(&[1], &[Some("a")], Some(false), None)], false);
+        let err = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            vec![FileRowSource {
+                data_file_path: f1.file_path().to_string(),
+                source: source.clone(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("2 live rows but 1 replacement rows"),
+            "{err}"
+        );
+        assert_eq!(source.opens(), 1, "refused after the first pass");
+        assert_eq!(
+            catalog
+                .load_table(&ident)
+                .await
+                .unwrap()
+                .metadata()
+                .current_snapshot_id(),
+            Some(s0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_row_that_moves_partition_refuses() {
+        let (_wh, catalog, ident, table) = setup(FormatVersion::V2, true).await;
+        let (f1, table) = two_files(catalog.as_ref(), &table).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let source = Counting::new(
+            vec![rows(&[1, 2], &[Some("a"), Some("b")], Some(true), None)],
+            false,
+        );
+        let err = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            vec![FileRowSource {
+                data_file_path: f1.file_path().to_string(),
+                source: source.clone(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("the file's partition is"), "{err}");
+        assert_eq!(source.opens(), 1);
+        assert_eq!(
+            catalog
+                .load_table(&ident)
+                .await
+                .unwrap()
+                .metadata()
+                .current_snapshot_id(),
+            Some(s0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_removes_the_bound_delete_and_a_stale_base_refuses() {
+        let (_wh, catalog, ident, table) = setup(FormatVersion::V3, false).await;
+        let f1 = write(
+            &table,
+            "f1",
+            rows(
+                &[1, 2, 3],
+                &[None, None, None],
+                Some(false),
+                Some(&[None, None, None]),
+            ),
+            None,
+        )
+        .await;
+        let table = append(catalog.as_ref(), &table, vec![f1.clone()], HashMap::new()).await;
+        let dv = DeleteVector::new(RoaringTreemap::from_iter([1u64]));
+        let loc = format!("{}/data/dv-f1.puffin", table.metadata().location());
+        let del = dv
+            .write_to_puffin_file(
+                table.file_io(),
+                loc,
+                f1.file_path().to_string(),
+                Struct::empty(),
+                table.metadata().default_partition_spec_id(),
+            )
+            .await
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let table = tx
+            .row_delta()
+            .add_delete_files(vec![del])
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let source = Counting::new(
+            vec![rows(
+                &[1, 3],
+                &[Some("a"), Some("c")],
+                Some(false),
+                Some(&[None, None]),
+            )],
+            false,
+        );
+        let files = vec![FileRowSource {
+            data_file_path: f1.file_path().to_string(),
+            source: source.clone(),
+        }];
+        let out = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            files.clone(),
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.rows_live, out.delete_files_removed), (2, 1));
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(read(&table).await, vec![
+            (1, Some("a".to_string())),
+            (3, Some("c".to_string()))
+        ]);
+        // the same plan again: the head moved, the source is never opened
+        let before = source.opens();
+        let err = replace_file_rows_from_sources(
+            catalog.as_ref(),
+            &ident,
+            s0,
+            files,
+            false,
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("planned against snapshot"), "{err}");
+        assert_eq!(source.opens(), before);
     }
 }
