@@ -40,7 +40,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use opendal::raw::*;
-use opendal::{Buffer, Capability, Metadata, Result};
+use opendal::{Buffer, BytesRange, Capability, Metadata, OperationContext, Result};
 
 /// Marks request-signing failures (`reqsign::Sign` operation errors) as
 /// temporary. Must sit BENEATH `RetryLayer` (applied to the operator
