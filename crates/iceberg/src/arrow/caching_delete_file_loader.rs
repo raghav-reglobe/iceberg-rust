@@ -427,49 +427,16 @@ impl CachingDeleteFileLoader {
                         notified.await;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
-                    PosDelLoadAction::Load => {
-                        if task.file_format == DataFileFormat::Puffin {
-                            // V3 deletion vector — the blob located by
-                            // content_offset/content_size is read + parsed in the
-                            // parse phase (not a Parquet positional-delete stream).
-                            Ok(DeleteFileContext::DelVec {
-                                file_path: task.file_path.clone(),
-                                referenced_data_file: task
-                                    .referenced_data_file
-                                    .clone()
-                                    .ok_or_else(|| {
-                                        Error::new(
-                                            ErrorKind::DataInvalid,
-                                            "deletion vector is missing referenced_data_file",
-                                        )
-                                    })?,
-                                content_offset: task.content_offset.ok_or_else(|| {
-                                    Error::new(
-                                        ErrorKind::DataInvalid,
-                                        "deletion vector is missing content_offset",
-                                    )
-                                })? as u64,
-                                content_size: task.content_size_in_bytes.ok_or_else(|| {
-                                    Error::new(
-                                        ErrorKind::DataInvalid,
-                                        "deletion vector is missing content_size_in_bytes",
-                                    )
-                                })? as u64,
-                                file_io: basic_delete_file_loader.file_io().clone(),
-                            })
-                        } else {
-                            Ok(DeleteFileContext::PosDels {
-                                file_path: task.file_path.clone(),
-                                stream: basic_delete_file_loader
-                                    .parquet_to_batch_stream(
-                                        &task.file_path,
-                                        task.file_size_in_bytes,
-                                        task.key_metadata.as_deref(),
-                                    )
-                                    .await?,
-                            })
-                        }
-                    }
+                    PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
+                        file_path: task.file_path.clone(),
+                        stream: basic_delete_file_loader
+                            .parquet_to_batch_stream(
+                                &task.file_path,
+                                task.file_size_in_bytes,
+                                task.key_metadata.as_deref(),
+                            )
+                            .await?,
+                    }),
                 }
             }
 
