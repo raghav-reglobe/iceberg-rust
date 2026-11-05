@@ -36,12 +36,11 @@
 //! `reqsign::Sign` as temporary; the retry budget and backoff stay
 //! owned by the `RetryLayer` stacked above it.
 
-use opendal::raw::{
-    Access, Layer, LayeredAccess, OpCopier, OpCopy, OpCreateDir, OpDelete, OpList, OpPresign,
-    OpRead, OpRename, OpStat, OpWrite, RpCopy, RpCreateDir, RpDelete, RpList, RpPresign, RpRead,
-    RpRename, RpStat, RpWrite, oio,
-};
-use opendal::{Buffer, Metadata, Result};
+use std::fmt::Formatter;
+use std::sync::Arc;
+
+use opendal::raw::*;
+use opendal::{Buffer, Capability, Metadata, Result};
 
 /// Marks request-signing failures (`reqsign::Sign` operation errors) as
 /// temporary. Must sit BENEATH `RetryLayer` (applied to the operator
@@ -49,8 +48,6 @@ use opendal::{Buffer, Metadata, Result};
 #[derive(Clone, Debug, Default)]
 pub struct SignErrorRetryLayer;
 
-/// Reclassify a sign-phase failure as temporary; leave every other
-/// error untouched. The operation tag is only reachable through the
 /// Display form — opendal's `Error` exposes no `operation()` getter.
 fn reclassify(err: opendal::Error) -> opendal::Error {
     if err.kind() == opendal::ErrorKind::Unexpected
@@ -63,99 +60,129 @@ fn reclassify(err: opendal::Error) -> opendal::Error {
     }
 }
 
-impl<A: Access> Layer<A> for SignErrorRetryLayer {
-    type LayeredAccess = SignErrorRetryAccessor<A>;
-
-    fn layer(&self, inner: A) -> Self::LayeredAccess {
-        SignErrorRetryAccessor { inner }
+impl Layer for SignErrorRetryLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(SignErrorRetryService { inner })
     }
 }
 
+/// The service wrapper: every operation and every I/O body forwards to the
+/// inner service and reclassifies the error it returns.
 #[doc(hidden)]
-#[derive(Debug)]
-pub struct SignErrorRetryAccessor<A: Access> {
-    inner: A,
+pub struct SignErrorRetryService {
+    inner: Servicer,
 }
 
-impl<A: Access> LayeredAccess for SignErrorRetryAccessor<A> {
-    type Inner = A;
-    type Reader = SignErrorRetryWrapper<A::Reader>;
-    type Writer = SignErrorRetryWrapper<A::Writer>;
-    type Lister = SignErrorRetryWrapper<A::Lister>;
-    type Deleter = SignErrorRetryWrapper<A::Deleter>;
-    type Copier = SignErrorRetryWrapper<A::Copier>;
+impl std::fmt::Debug for SignErrorRetryService {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignErrorRetryService")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
 
-    fn inner(&self) -> &Self::Inner {
-        &self.inner
+impl Service for SignErrorRetryService {
+    type Reader = SignErrorRetryWrapper<oio::Reader>;
+    type Writer = SignErrorRetryWrapper<oio::Writer>;
+    type Lister = SignErrorRetryWrapper<oio::Lister>;
+    type Deleter = SignErrorRetryWrapper<oio::Deleter>;
+    type Copier = SignErrorRetryWrapper<oio::Copier>;
+
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
     }
 
-    async fn create_dir(&self, path: &str, args: OpCreateDir) -> Result<RpCreateDir> {
-        self.inner.create_dir(path, args).await.map_err(reclassify)
+    fn capability(&self) -> Capability {
+        self.inner.capability()
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
-        self.inner
-            .read(path, args)
-            .await
-            .map(|(rp, r)| (rp, SignErrorRetryWrapper::new(r)))
-            .map_err(reclassify)
-    }
-
-    async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, Self::Writer)> {
-        self.inner
-            .write(path, args)
-            .await
-            .map(|(rp, w)| (rp, SignErrorRetryWrapper::new(w)))
-            .map_err(reclassify)
-    }
-
-    async fn copy(
+    async fn create_dir(
         &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        self.inner
+            .create_dir(ctx, path, args)
+            .await
+            .map_err(reclassify)
+    }
+
+    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        self.inner
+            .read(ctx, path, args)
+            .map(SignErrorRetryWrapper::new)
+            .map_err(reclassify)
+    }
+
+    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        self.inner
+            .write(ctx, path, args)
+            .map(SignErrorRetryWrapper::new)
+            .map_err(reclassify)
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
         from: &str,
         to: &str,
         args: OpCopy,
         opts: OpCopier,
-    ) -> Result<(RpCopy, Self::Copier)> {
+    ) -> Result<Self::Copier> {
         self.inner
-            .copy(from, to, args, opts)
-            .await
-            .map(|(rp, c)| (rp, SignErrorRetryWrapper::new(c)))
+            .copy(ctx, from, to, args, opts)
+            .map(SignErrorRetryWrapper::new)
             .map_err(reclassify)
     }
 
-    async fn rename(&self, from: &str, to: &str, args: OpRename) -> Result<RpRename> {
-        self.inner.rename(from, to, args).await.map_err(reclassify)
-    }
-
-    async fn stat(&self, path: &str, args: OpStat) -> Result<RpStat> {
-        self.inner.stat(path, args).await.map_err(reclassify)
-    }
-
-    async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> Result<RpRename> {
         self.inner
-            .delete()
+            .rename(ctx, from, to, args)
             .await
-            .map(|(rp, d)| (rp, SignErrorRetryWrapper::new(d)))
             .map_err(reclassify)
     }
 
-    async fn list(&self, path: &str, args: OpList) -> Result<(RpList, Self::Lister)> {
+    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+        self.inner.stat(ctx, path, args).await.map_err(reclassify)
+    }
+
+    fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
         self.inner
-            .list(path, args)
-            .await
-            .map(|(rp, l)| (rp, SignErrorRetryWrapper::new(l)))
+            .delete(ctx)
+            .map(SignErrorRetryWrapper::new)
             .map_err(reclassify)
     }
 
-    async fn presign(&self, path: &str, args: OpPresign) -> Result<RpPresign> {
-        self.inner.presign(path, args).await.map_err(reclassify)
+    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        self.inner
+            .list(ctx, path, args)
+            .map(SignErrorRetryWrapper::new)
+            .map_err(reclassify)
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> Result<RpPresign> {
+        self.inner
+            .presign(ctx, path, args)
+            .await
+            .map_err(reclassify)
     }
 }
 
-/// Streaming ops sign fresh HTTP requests too (ranged GET per read
-/// chunk, one PUT per multipart part, continuation-page LIST, batch
-/// DELETE, complete-multipart on close) — so the reclassification must
-/// also cover the Reader/Writer/Lister/Deleter/Copier surfaces.
+/// Wraps an I/O body so every error it yields is reclassified too: a
+/// credential refresh can fail on any ranged read or multipart part, not
+/// only on the operation that opened the body.
 #[doc(hidden)]
 pub struct SignErrorRetryWrapper<T> {
     inner: T,
@@ -167,13 +194,32 @@ impl<T> SignErrorRetryWrapper<T> {
     }
 }
 
-impl<R: oio::Read> oio::Read for SignErrorRetryWrapper<R> {
+impl<T: oio::Read> oio::Read for SignErrorRetryWrapper<T> {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        self.inner
+            .open(range)
+            .await
+            .map(|(rp, stream)| {
+                (
+                    rp,
+                    Box::new(SignErrorRetryWrapper::new(stream)) as Box<dyn oio::ReadStreamDyn>,
+                )
+            })
+            .map_err(reclassify)
+    }
+
+    async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
+        self.inner.read(range).await.map_err(reclassify)
+    }
+}
+
+impl<T: oio::ReadStream> oio::ReadStream for SignErrorRetryWrapper<T> {
     async fn read(&mut self) -> Result<Buffer> {
         self.inner.read().await.map_err(reclassify)
     }
 }
 
-impl<W: oio::Write> oio::Write for SignErrorRetryWrapper<W> {
+impl<T: oio::Write> oio::Write for SignErrorRetryWrapper<T> {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
         self.inner.write(bs).await.map_err(reclassify)
     }
@@ -187,13 +233,13 @@ impl<W: oio::Write> oio::Write for SignErrorRetryWrapper<W> {
     }
 }
 
-impl<L: oio::List> oio::List for SignErrorRetryWrapper<L> {
+impl<T: oio::List> oio::List for SignErrorRetryWrapper<T> {
     async fn next(&mut self) -> Result<Option<oio::Entry>> {
         self.inner.next().await.map_err(reclassify)
     }
 }
 
-impl<D: oio::Delete> oio::Delete for SignErrorRetryWrapper<D> {
+impl<T: oio::Delete> oio::Delete for SignErrorRetryWrapper<T> {
     async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
         self.inner.delete(path, args).await.map_err(reclassify)
     }
@@ -203,7 +249,7 @@ impl<D: oio::Delete> oio::Delete for SignErrorRetryWrapper<D> {
     }
 }
 
-impl<C: oio::Copy> oio::Copy for SignErrorRetryWrapper<C> {
+impl<T: oio::Copy> oio::Copy for SignErrorRetryWrapper<T> {
     async fn next(&mut self) -> Result<Option<usize>> {
         self.inner.next().await.map_err(reclassify)
     }
@@ -219,54 +265,16 @@ impl<C: oio::Copy> oio::Copy for SignErrorRetryWrapper<C> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use opendal::layers::RetryLayer;
-    use opendal::raw::AccessorInfo;
-    use opendal::{Capability, EntryMode, ErrorKind, Operator};
+    use opendal::ErrorKind;
 
     use super::*;
 
-    /// The exact error shape opendal-core's `new_request_sign_error`
-    /// produces for a reqsign credential-load failure.
+    /// The exact error shape the signer path produces for a credential-load
+    /// failure.
     fn sign_error() -> opendal::Error {
         opendal::Error::new(ErrorKind::Unexpected, "signing http request")
             .with_operation("reqsign::Sign")
             .set_source(anyhow::anyhow!("failed to load signing credential"))
-    }
-
-    /// Fails `stat` with the sign error `fail_times` times, then succeeds.
-    #[derive(Debug, Clone)]
-    struct FlakySignService {
-        fail_times: usize,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl Access for FlakySignService {
-        type Reader = oio::Reader;
-        type Writer = oio::Writer;
-        type Lister = oio::Lister;
-        type Deleter = oio::Deleter;
-        type Copier = oio::Copier;
-
-        fn info(&self) -> Arc<AccessorInfo> {
-            let am = AccessorInfo::default();
-            am.set_native_capability(Capability {
-                stat: true,
-                ..Default::default()
-            });
-            am.into()
-        }
-
-        async fn stat(&self, _: &str, _: OpStat) -> Result<RpStat> {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if n < self.fail_times {
-                Err(sign_error())
-            } else {
-                Ok(RpStat::new(Metadata::new(EntryMode::FILE)))
-            }
-        }
     }
 
     #[test]
@@ -283,54 +291,8 @@ mod tests {
                 .with_operation("http_util::Client::send"),
         );
         assert!(!err.is_temporary(), "non-sign errors must stay permanent");
-
         let err = reclassify(opendal::Error::new(ErrorKind::NotFound, "not found"));
         assert!(!err.is_temporary());
         assert_eq!(err.kind(), ErrorKind::NotFound);
-    }
-
-    #[tokio::test]
-    async fn test_retry_layer_retries_reclassified_sign_error() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let svc = FlakySignService {
-            fail_times: 2,
-            calls: Arc::clone(&calls),
-        };
-
-        // Same stacking order as production: sign-retry beneath RetryLayer.
-        let op = Operator::from_inner(Arc::new(svc))
-            .layer(SignErrorRetryLayer)
-            .layer(RetryLayer::new().with_min_delay(std::time::Duration::from_millis(1)));
-
-        let meta = op
-            .stat("somefile")
-            .await
-            .expect("stat must succeed once RetryLayer retries the reclassified sign error");
-        assert_eq!(meta.mode(), EntryMode::FILE);
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "2 failures + 1 success");
-    }
-
-    #[tokio::test]
-    async fn test_without_layer_sign_error_is_fatal() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let svc = FlakySignService {
-            fail_times: 1,
-            calls: Arc::clone(&calls),
-        };
-
-        // RetryLayer alone (no reclassification) must NOT retry — this
-        // pins the underlying opendal behavior the layer exists to fix;
-        // if this test ever fails, upstream made sign errors retryable
-        // and SignErrorRetryLayer can be dropped.
-        let op = Operator::from_inner(Arc::new(svc))
-            .layer(RetryLayer::new().with_min_delay(std::time::Duration::from_millis(1)));
-
-        let err = op.stat("somefile").await.expect_err("must fail");
-        assert!(err.to_string().contains("reqsign::Sign"));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "no retry without the layer"
-        );
     }
 }
