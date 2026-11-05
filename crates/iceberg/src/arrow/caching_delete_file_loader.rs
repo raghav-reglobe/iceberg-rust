@@ -2220,7 +2220,6 @@ mod tests {
         record_count: u64,
         key_metadata: Option<Box<[u8]>>,
     ) -> FileScanTaskDeleteFile {
-        record_count: None,
         FileScanTaskDeleteFile::builder()
             .with_file_path(dv_path)
             .with_file_size_in_bytes(file_size)
@@ -2384,7 +2383,6 @@ mod tests {
 
     // A well-formed deletion-vector task, for tests that then clear or corrupt one field.
     fn valid_dv_task() -> FileScanTaskDeleteFile {
-        record_count: None,
         dv_task(
             "deletes.puffin".to_string(),
             100,

@@ -695,7 +695,6 @@ pub(crate) mod tests {
         spec_id: i32,
         partition: Option<Struct>,
     ) -> FileScanTaskDeleteFile {
-        record_count: None,
         assert!(filter.try_start_eq_del_load(path).is_some());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(
