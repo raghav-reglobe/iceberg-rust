@@ -50,6 +50,8 @@ pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
 /// Puffin blob property: referenced data file path the DV applies to.
 pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
+/// A set of deleted row positions, the in-memory form of an Iceberg V3
+/// `deletion-vector-v1` bitmap.
 #[derive(Debug, Default, Clone)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
@@ -99,6 +101,7 @@ impl DeleteVector {
         Ok(positions.len())
     }
 
+    /// Returns the number of deleted row positions.
     pub fn len(&self) -> u64 {
         self.inner.len()
     }
