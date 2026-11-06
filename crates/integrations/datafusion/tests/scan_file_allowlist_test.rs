@@ -20,7 +20,7 @@
 //! themselves (e.g. incremental processing of known appended files) restrict
 //! the mounted table via
 //! [`IcebergCatalogProvider::with_table_scan_file_allowlist`]; deletes still
-//! apply to the retained files; a MERGE whose USING source reads the
+//! apply to the retained files; a query whose subquery source reads the
 //! restricted table only sees the allowlisted files; unknown identifiers
 //! fail loudly.
 
@@ -29,10 +29,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
-use iceberg::spec::{DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Type};
+use iceberg::delete_vector::DeleteVector;
+use iceberg::spec::{
+    DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct, Type,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -232,29 +234,30 @@ async fn allowlist_restricts_scan_to_named_files() {
 }
 
 #[tokio::test]
-async fn merge_using_source_respects_allowlist() {
+async fn a_subquery_source_respects_allowlist() {
     let warehouse = TempDir::new().unwrap();
     let catalog = memory_catalog(&warehouse).await;
-    create_table(&catalog, "tgt").await;
     create_table(&catalog, "src").await;
     let src_a = append_one_file(&catalog, "src", "a", &[(10, "ten"), (11, "eleven")]).await;
     let _src_b = append_one_file(&catalog, "src", "b", &[(12, "twelve"), (13, "thirteen")]).await;
 
     let ctx = ctx_with_provider(&catalog, Some(("src", vec![src_a]))).await;
-    ctx.sql(&format!(
-        "MERGE INTO {CATALOG}.{NS}.tgt AS t \
-         USING (SELECT id, val FROM {CATALOG}.{NS}.src) AS s \
-         ON t.id = s.id \
-         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)"
-    ))
-    .await
-    .unwrap()
-    .collect()
-    .await
-    .unwrap();
-
-    // Only the allowlisted source file's rows reached the target.
-    assert_eq!(read_ids(&ctx, "tgt").await, vec![10, 11]);
+    let batches = ctx
+        .sql(&format!(
+            "SELECT s.id FROM (SELECT id, val FROM {CATALOG}.{NS}.src) AS s ORDER BY s.id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for b in &batches {
+        let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        ids.extend(col.values().iter().copied());
+    }
+    // Only the allowlisted source file's rows reach the outer query.
+    assert_eq!(ids, vec![10, 11]);
 }
 
 #[tokio::test]
@@ -264,22 +267,48 @@ async fn deletes_still_apply_to_allowlisted_files() {
     create_table(&catalog, "t").await;
     let file_a = append_one_file(&catalog, "t", "a", &[(1, "one"), (2, "two")]).await;
 
-    // MoR MATCHED-update: writes a deletion vector on file A's row for id=1
-    // plus the updated version in a NEW data file.
+    // A merge-on-read update of id=1, as one row delta: a deletion vector on
+    // file A's row 0 plus the updated version in a NEW data file.
+    let ident = TableIdent::new(NamespaceIdent::new(NS.to_string()), "t".to_string());
+    let table = catalog.load_table(&ident).await.unwrap();
+    let mut dv = DeleteVector::default();
+    dv.insert(0);
+    let dv_file = dv
+        .write_to_puffin_file(
+            table.file_io(),
+            format!("{}/data/dv-a.puffin", table.metadata().location()),
+            file_a.clone(),
+            Struct::empty(),
+            table.metadata().default_partition_spec_id(),
+        )
+        .await
+        .unwrap();
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table.metadata().current_schema().clone(),
+        ),
+        table.file_io().clone(),
+        DefaultLocationGenerator::new(table.metadata()).unwrap(),
+        DefaultFileNameGenerator::new("v2".to_string(), None, DataFileFormat::Parquet),
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .unwrap();
+    writer.write(simple_batch(&[(1, "one-v2")])).await.unwrap();
+    let updated = writer.close().await.unwrap();
+    let tx = Transaction::new(&table);
+    tx.row_delta()
+        .add_data_files(updated)
+        .add_delete_files(vec![dv_file])
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
     let ctx = ctx_with_provider(&catalog, None).await;
-    let upd = simple_batch(&[(1, "one-v2")]);
-    let mem = MemTable::try_new(upd.schema(), vec![vec![upd]]).unwrap();
-    ctx.register_table("batch", Arc::new(mem)).unwrap();
-    ctx.sql(&format!(
-        "MERGE INTO {CATALOG}.{NS}.t AS t USING (SELECT id, val FROM batch) AS s \
-         ON t.id = s.id \
-         WHEN MATCHED THEN UPDATE SET val = s.val"
-    ))
-    .await
-    .unwrap()
-    .collect()
-    .await
-    .unwrap();
+    assert_eq!(read_ids(&ctx, "t").await, vec![1, 2], "the update is visible without an allowlist");
 
     // Allowlist = file A only: id=1's OLD version is DV-deleted (the DV must
     // still bind under the allowlist) and its NEW version lives in an
