@@ -28,7 +28,7 @@
 //! groups, kept groups, and across a row-group boundary.
 //!
 //! Layout under test: one 2,048-row seed file (4×512-row groups, 64-row
-//! pages, page statistics on) merged via the SCD2 MERGE shape so a DV
+//! pages, page statistics on) given the SCD2 update shape directly: a DV
 //! covers two scattered clusters — one inside row group 0, one SPANNING
 //! the group 2/3 boundary — plus appended replacement rows in a second
 //! file. Predicates then prune to: only group 0; only groups 2+3; a mixed
@@ -41,13 +41,14 @@ use datafusion::arrow::array::{
     Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use iceberg::spec::{
     DataContentType, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList,
     NestedField, PartitionKey, PrimitiveType, Schema, Struct as IcebergStruct, Transform, Type,
     UnboundPartitionSpec,
 };
+use iceberg::delete_vector::DeleteVector;
+use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -121,27 +122,6 @@ fn seed_batch() -> RecordBatch {
         )),
         Arc::new(Int64Array::from(vec![None::<i64>; ids.len()])),
         Arc::new(BooleanArray::from(vec![true; ids.len()])),
-    ])
-    .unwrap()
-}
-
-fn cdc_batch() -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("val", DataType::Utf8, true),
-        Field::new("_valid_from", DataType::Int64, false),
-    ]));
-    let ids: Vec<i32> = CLUSTER_A.chain(CLUSTER_B).collect();
-    RecordBatch::try_new(schema, vec![
-        Arc::new(Int32Array::from(ids.clone())),
-        Arc::new(datafusion::arrow::array::StringArray::from(
-            ids.iter().map(|i| format!("u{i}")).collect::<Vec<_>>(),
-        )),
-        Arc::new(Int64Array::from(
-            ids.iter()
-                .map(|i| NEW_VF_BASE + *i as i64)
-                .collect::<Vec<_>>(),
-        )),
     ])
     .unwrap()
 }
@@ -221,33 +201,100 @@ async fn setup(warehouse: &TempDir) -> (Arc<dyn Catalog>, SessionContext) {
     );
     ctx.register_catalog(CATALOG, provider);
 
-    let cdc = cdc_batch();
-    let mem = MemTable::try_new(cdc.schema(), vec![vec![cdc]]).unwrap();
-    ctx.register_table("batch", Arc::new(mem)).unwrap();
-
     (catalog, ctx)
 }
 
-/// The SCD2 chained MERGE shape: matched rows demote via DV + re-append as
-/// closed versions; batch rows insert as new currents.
-fn scd2_merge_sql() -> String {
-    format!(
-        "MERGE INTO {CATALOG}.{NS}.{TABLE} AS t USING ( \
-             SELECT id, val, _valid_from, CAST(NULL AS BIGINT) AS _valid_to, \
-                    true AS _is_current \
-             FROM batch \
-             UNION ALL \
-             SELECT t2.id, t2.val, t2._valid_from, b.new_vf AS _valid_to, \
-                    false AS _is_current \
-             FROM {CATALOG}.{NS}.{TABLE} t2 \
-             JOIN (SELECT id, MIN(_valid_from) AS new_vf FROM batch GROUP BY id) b \
-               ON t2.id = b.id AND t2._is_current \
-         ) AS s \
-         ON t.id = s.id AND t._valid_from = s._valid_from \
-         WHEN MATCHED THEN UPDATE SET _valid_to = s._valid_to, _is_current = s._is_current \
-         WHEN NOT MATCHED THEN INSERT (id, val, _valid_from, _valid_to, _is_current) \
-             VALUES (s.id, s.val, s._valid_from, s._valid_to, s._is_current)"
-    )
+fn version_batch(rows: &[(i32, String, i64, Option<i64>, bool)]) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        field(1, "id", DataType::Int32, false),
+        field(2, "val", DataType::LargeUtf8, true),
+        field(3, "_valid_from", DataType::Int64, false),
+        field(4, "_valid_to", DataType::Int64, true),
+        field(5, "_is_current", DataType::Boolean, false),
+    ]));
+    RecordBatch::try_new(schema, vec![
+        Arc::new(Int32Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(LargeStringArray::from(
+            rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+        Arc::new(BooleanArray::from(rows.iter().map(|r| r.4).collect::<Vec<_>>())),
+    ])
+    .unwrap()
+}
+
+async fn write_versions(table: &Table, name: &str, current: bool, rows: &[(i32, String, i64, Option<i64>, bool)]) -> Vec<DataFile> {
+    let schema = table.metadata().current_schema().clone();
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone()),
+        table.file_io().clone(),
+        DefaultLocationGenerator::new(table.metadata()).unwrap(),
+        DefaultFileNameGenerator::new(name.to_string(), None, DataFileFormat::Parquet),
+    );
+    let key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        schema,
+        IcebergStruct::from_iter(vec![Some(Literal::bool(current))]),
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling).build(Some(key)).await.unwrap();
+    writer.write(version_batch(rows)).await.unwrap();
+    writer.close().await.unwrap()
+}
+
+/// The SCD2 update of every id in both clusters, committed as ONE row delta:
+/// a deletion vector on the seed file over the updated rows (seed position ==
+/// id), the demoted versions (closed `_valid_to`, `_is_current = false`) and the
+/// new current versions appended as data files.
+async fn apply_scd2_update(catalog: &dyn Catalog) {
+    let ident = TableIdent::new(NamespaceIdent::new(NS.to_string()), TABLE.to_string());
+    let table = catalog.load_table(&ident).await.unwrap();
+    let seed = table.metadata().current_snapshot().unwrap();
+    let bytes = table.file_io().new_input(seed.manifest_list()).unwrap().read().await.unwrap();
+    let ml = ManifestList::parse_with_version(&bytes, table.metadata().format_version()).unwrap();
+    let mut seed_path = None;
+    for mf in ml.entries() {
+        for e in mf.load_manifest(table.file_io()).await.unwrap().entries() {
+            if e.is_alive() && e.data_file().content_type() == DataContentType::Data {
+                seed_path = Some(e.data_file().file_path().to_string());
+            }
+        }
+    }
+    let seed_path = seed_path.expect("the seed data file");
+    let ids: Vec<i32> = CLUSTER_A.chain(CLUSTER_B).collect();
+    let mut dv = DeleteVector::default();
+    for id in &ids {
+        dv.insert(*id as u64);
+    }
+    let dv_file = dv
+        .write_to_puffin_file(
+            table.file_io(),
+            format!("{}/data/dv-seed.puffin", table.metadata().location()),
+            seed_path,
+            IcebergStruct::from_iter(vec![Some(Literal::bool(true))]),
+            table.metadata().default_partition_spec_id(),
+        )
+        .await
+        .unwrap();
+    let demoted: Vec<_> = ids
+        .iter()
+        .map(|i| (*i, format!("v{i}"), VF_BASE + *i as i64, Some(NEW_VF_BASE + *i as i64), false))
+        .collect();
+    let current: Vec<_> = ids
+        .iter()
+        .map(|i| (*i, format!("u{i}"), NEW_VF_BASE + *i as i64, None, true))
+        .collect();
+    let mut data = write_versions(&table, "demoted", false, &demoted).await;
+    data.extend(write_versions(&table, "current", true, &current).await);
+    let tx = Transaction::new(&table);
+    tx.row_delta()
+        .add_data_files(data)
+        .add_delete_files(vec![dv_file])
+        .apply(tx)
+        .unwrap()
+        .commit(catalog)
+        .await
+        .unwrap();
 }
 
 /// Deterministic full-row projection for identity comparison.
@@ -332,14 +379,9 @@ async fn row_selection_composes_with_deletion_vectors() {
     // Ensure the trusted-baseline phase really runs gate-OFF.
     unsafe { std::env::remove_var("ICEBERG_SCAN_ROW_SELECTION") };
 
-    ctx.sql(&scd2_merge_sql())
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    apply_scd2_update(catalog.as_ref()).await;
 
-    // The merge produced ONE DV on the seed file covering both clusters.
+    // ONE DV on the seed file covering both clusters.
     let table = catalog
         .load_table(&TableIdent::new(
             NamespaceIdent::new(NS.to_string()),
