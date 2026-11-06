@@ -32,11 +32,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::common::resources_datafusion_err;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool, UnboundedMemoryPool, human_readable_size};
-use iceberg::Catalog;
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+    TrackConsumersPool, UnboundedMemoryPool, human_readable_size,
+};
+use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::functions::{register_parity_functions, register_variant_functions};
 use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::functions::{register_parity_functions, register_variant_functions};
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
