@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, stream};
 
+use super::{METADATA_READ_CONCURRENCY, ordered_bounded};
 use crate::spec::DataContentType;
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
@@ -339,20 +340,28 @@ async fn collect_candidates(
     let mut delete_files: HashSet<String> = HashSet::new();
     let mut stats_files: HashSet<String> = HashSet::new();
 
+    let expired_snapshots: Vec<_> = metadata
+        .snapshots()
+        .filter(|snapshot| {
+            expired.contains(&snapshot.snapshot_id()) && !snapshot.manifest_list().is_empty()
+        })
+        .collect();
+    for snapshot in &expired_snapshots {
+        if !retained.contains(snapshot.manifest_list()) {
+            manifest_lists.insert(snapshot.manifest_list().to_string());
+        }
+    }
     let mut manifests_to_load = Vec::new();
-    for snapshot in metadata.snapshots() {
-        if !expired.contains(&snapshot.snapshot_id()) {
-            continue;
-        }
-        let manifest_list_path = snapshot.manifest_list();
-        if manifest_list_path.is_empty() {
-            continue;
-        }
-        if !retained.contains(manifest_list_path) {
-            manifest_lists.insert(manifest_list_path.to_string());
-        }
-        let manifest_list = view.manifest_list_reader(snapshot).load().await?;
-        for manifest_file in manifest_list.entries() {
+    let mut lists = std::pin::pin!(ordered_bounded(
+        expired_snapshots.iter(),
+        METADATA_READ_CONCURRENCY,
+        |snapshot| {
+            let reader = view.manifest_list_reader(snapshot);
+            async move { reader.load().await }
+        },
+    ));
+    while let Some(manifest_list) = lists.next().await {
+        for manifest_file in manifest_list?.entries() {
             if retained.contains(&manifest_file.manifest_path) {
                 continue;
             }
@@ -362,9 +371,13 @@ async fn collect_candidates(
             }
         }
     }
-    for manifest_file in manifests_to_load {
-        let manifest = manifest_file.load_manifest(file_io).await?;
-        for entry in manifest.entries() {
+    let mut loaded = std::pin::pin!(ordered_bounded(
+        manifests_to_load.iter(),
+        METADATA_READ_CONCURRENCY,
+        |manifest_file| manifest_file.load_manifest(file_io),
+    ));
+    while let Some(manifest) = loaded.next().await {
+        for entry in manifest?.entries() {
             let path = entry.data_file().file_path();
             if retained.contains(path) {
                 continue;
@@ -408,9 +421,9 @@ async fn collect_candidates(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    use super::ExpireSnapshotsWithCleanupAction;
+    use super::{ExpireSnapshotsWithCleanupAction, METADATA_READ_CONCURRENCY, collect_candidates};
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
@@ -714,5 +727,86 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_noop());
+    }
+
+    /// The one-object-at-a-time walk the bounded walks replaced: manifest
+    /// lists, manifests and file paths of every snapshot not in `skip`.
+    async fn sequential_reachable(table: &Table, skip: &HashSet<i64>) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut manifests = Vec::new();
+        for snapshot in table.metadata().snapshots() {
+            if skip.contains(&snapshot.snapshot_id()) {
+                continue;
+            }
+            out.insert(snapshot.manifest_list().to_string());
+            let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+            for manifest_file in list.entries() {
+                if out.insert(manifest_file.manifest_path.clone()) {
+                    manifests.push(manifest_file.clone());
+                }
+            }
+        }
+        for manifest_file in manifests {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                out.insert(entry.data_file().file_path().to_string());
+            }
+        }
+        out
+    }
+
+    fn is_table_metadata(path: &str) -> bool {
+        path.ends_with(".metadata.json") || path.ends_with("version-hint.text")
+    }
+
+    #[tokio::test]
+    async fn test_many_manifest_walks_match_a_sequential_walk() {
+        let catalog = new_memory_catalog().await;
+        // More snapshots (each with its own manifest list and one new
+        // manifest) than several windows of concurrent reads.
+        let appends = 3 * METADATA_READ_CONCURRENCY + 5;
+        let table = seed_table(&catalog, appends).await;
+        let newest = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let expired: HashSet<i64> = table
+            .metadata()
+            .snapshots()
+            .map(|s| s.snapshot_id())
+            .filter(|id| *id != newest)
+            .collect();
+        assert_eq!(expired.len(), appends - 1);
+
+        // The full walk: the sequential walk's set plus table metadata files.
+        let all = super::super::reachable_files(&table, None).await.unwrap();
+        let want_all = sequential_reachable(&table, &HashSet::new()).await;
+        assert!(want_all.is_subset(&all));
+        assert!(all.difference(&want_all).all(|p| is_table_metadata(p)));
+
+        // The retained view after expiring everything but the newest snapshot.
+        let retained = super::super::reachable_files(&table, Some(&expired))
+            .await
+            .unwrap();
+        let retained_seq = sequential_reachable(&table, &expired).await;
+        assert!(retained_seq.is_subset(&retained));
+        assert!(
+            retained
+                .difference(&retained_seq)
+                .all(|p| is_table_metadata(p))
+        );
+
+        // The exclusive diff: exactly what only the expired snapshots reach.
+        let keep: HashSet<i64> = HashSet::from([newest]);
+        let reach_expired = sequential_reachable(&table, &keep).await;
+        let mut want: Vec<String> = reach_expired.difference(&retained).cloned().collect();
+        want.sort();
+        let result = collect_candidates(&table, &expired, &retained)
+            .await
+            .unwrap();
+        let mut got: Vec<String> = result.candidate_files().cloned().collect();
+        got.sort();
+        assert_eq!(got, want);
+        // Each expired snapshot owns its manifest list; the newest snapshot's
+        // manifests still carry every data file.
+        assert_eq!(result.candidate_manifest_lists.len(), appends - 1);
+        assert!(result.candidate_data_files.is_empty());
     }
 }

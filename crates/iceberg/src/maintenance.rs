@@ -32,9 +32,10 @@
 mod expire_snapshots;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 pub use expire_snapshots::{ExpireSnapshotsResult, ExpireSnapshotsWithCleanupAction};
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 
 use crate::io::ListEntry;
 use crate::table::Table;
@@ -310,6 +311,28 @@ impl RemoveOrphanFilesAction {
 /// Snapshots whose id is in `skip_snapshots` are excluded, along with their
 /// statistics entries — the "still reachable AFTER expiring those snapshots"
 /// view used by [`ExpireSnapshotsWithCleanupAction`]'s dry run.
+/// How many metadata objects (manifest lists, manifests) a file walk reads at
+/// once. Each read is one object-store round trip; reading them one at a time
+/// makes a walk over a long snapshot history latency-bound.
+pub(crate) const METADATA_READ_CONCURRENCY: usize = 32;
+
+/// Maps `items` through `f` with at most `limit` futures in flight and yields
+/// the outputs in input order, so a walk built on it visits objects in the
+/// same order as a sequential loop.
+pub(crate) fn ordered_bounded<'a, I, F, Fut>(
+    items: I,
+    limit: usize,
+    f: F,
+) -> impl Stream<Item = Fut::Output> + 'a
+where
+    I: IntoIterator + 'a,
+    I::IntoIter: 'a,
+    F: FnMut(I::Item) -> Fut + 'a,
+    Fut: Future + 'a,
+{
+    stream::iter(items).map(f).buffered(limit.max(1))
+}
+
 pub(crate) async fn reachable_files(
     table: &Table,
     skip_snapshots: Option<&HashSet<i64>>,
@@ -350,25 +373,39 @@ pub(crate) async fn reachable_files(
 
     // Every retained snapshot: manifest list, manifests, and ALL entries'
     // file paths (any status).
-    let mut manifests_to_load = Vec::new();
-    for snapshot in metadata.snapshots() {
-        if skip(snapshot.snapshot_id()) {
-            continue;
-        }
+    let snapshots: Vec<_> = metadata
+        .snapshots()
+        .filter(|snapshot| !skip(snapshot.snapshot_id()))
+        .collect();
+    for snapshot in &snapshots {
         if !snapshot.manifest_list().is_empty() {
             referenced.insert(snapshot.manifest_list().to_string());
         }
-        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-        for manifest_file in manifest_list.entries() {
+    }
+    let mut manifests_to_load = Vec::new();
+    let mut manifest_lists = std::pin::pin!(ordered_bounded(
+        snapshots.iter(),
+        METADATA_READ_CONCURRENCY,
+        |snapshot| {
+            let reader = table.manifest_list_reader(snapshot);
+            async move { reader.load().await }
+        },
+    ));
+    while let Some(manifest_list) = manifest_lists.next().await {
+        for manifest_file in manifest_list?.entries() {
             // insert() returning true = first sighting -> load once.
             if referenced.insert(manifest_file.manifest_path.clone()) {
                 manifests_to_load.push(manifest_file.clone());
             }
         }
     }
-    for manifest_file in manifests_to_load {
-        let manifest = manifest_file.load_manifest(file_io).await?;
-        for entry in manifest.entries() {
+    let mut manifests = std::pin::pin!(ordered_bounded(
+        manifests_to_load.iter(),
+        METADATA_READ_CONCURRENCY,
+        |manifest_file| manifest_file.load_manifest(file_io),
+    ));
+    while let Some(manifest) = manifests.next().await {
+        for entry in manifest?.entries() {
             referenced.insert(entry.data_file().file_path().to_string());
         }
     }
@@ -468,5 +505,33 @@ mod tests {
             normalize_uri("s3://bucket-alias/a/b.parquet", &s, &a),
             "s3://bucket/a/b.parquet"
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_bounded_caps_in_flight_and_keeps_input_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let limit = 8;
+        let out: Vec<usize> = ordered_bounded(0..100usize, limit, |i| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Every item waits at least once (so a full window is pending
+                // together) and later items finish first within a window: the
+                // output must still come back in input order.
+                for _ in 0..1 + (100 - i) % 5 {
+                    tokio::task::yield_now().await;
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        })
+        .collect()
+        .await;
+        assert_eq!(out, (0..100).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), limit);
     }
 }
