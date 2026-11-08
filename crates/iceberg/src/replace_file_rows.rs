@@ -52,6 +52,13 @@
 //! [`ReplaceFileRowsOutcome::rebase_rechecks`]; a failing one refuses with the
 //! stale-snapshot error and commits nothing.
 //!
+//! With [`BoundFloor`]s (proof 5), every data file those appends added must
+//! also rank after the replaced rows: its data sequence number above the
+//! planning snapshot's, and for each floor the minimum of the PRESENT column
+//! lower bounds among the floor's fields strictly above the floor (none
+//! present refuses). Floors on timestamp fields are given in microseconds and
+//! scaled for a nanosecond field.
+//!
 //! The summary properties starting with `carry_summary_prefix` are copied onto
 //! the new snapshot from the snapshot it lands on, read at commit time, so the
 //! carried values are the table's latest even after appends landed.
@@ -72,11 +79,12 @@ use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 use crate::atomic_replace::{conform_batch, writer_properties};
 use crate::scan::{FileScanTask, FileScanTaskStream};
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, PartitionKey, Struct,
-    Transform,
+    DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, PartitionKey,
+    PrimitiveType, Schema, Struct, Transform, Type,
 };
 use crate::transaction::{
-    AppendRebaseGuard, ApplyTransactionAction, RebaseLog, RebaseRecheck, Transaction,
+    AppendRebaseGuard, ApplyTransactionAction, LowerBoundFloor, RebaseLog, RebaseRecheck,
+    Transaction,
 };
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
@@ -150,6 +158,79 @@ pub struct ReplaceFileRowsOutcome {
 
 /// Commit attempts a replace takes, the first included, before it refuses.
 pub const REPLACE_COMMIT_MAX_ATTEMPTS: usize = 5;
+
+/// A floor every data file appended after the planning snapshot must clear
+/// before the replace lands on it: the minimum of the PRESENT column lower
+/// bounds among `fields` (dotted names) must be strictly above `above`.
+/// `above` is the field's integer value — microseconds for a timestamp field
+/// (scaled for a nanosecond one). Fields of one floor share a unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundFloor {
+    /// Dotted field names whose present lower bounds are pooled.
+    pub fields: Vec<String>,
+    /// The exclusive floor.
+    pub above: i64,
+}
+
+/// Resolve floors against the planning schema: field ids, and the floor in
+/// each field's stored unit.
+fn resolve_floors(
+    ident: &TableIdent,
+    schema: &Schema,
+    floors: &[BoundFloor],
+) -> Result<Vec<LowerBoundFloor>> {
+    let mut out = Vec::with_capacity(floors.len());
+    for f in floors {
+        if f.fields.is_empty() {
+            return Err(invalid(format!("{ident}: a bound floor names no field")));
+        }
+        let mut ids = Vec::with_capacity(f.fields.len());
+        let mut scale: Option<i64> = None;
+        for name in &f.fields {
+            let field = schema.field_by_name(name).ok_or_else(|| {
+                invalid(format!(
+                    "{ident}: bound floor field `{name}` is not in the schema"
+                ))
+            })?;
+            let s = match field.field_type.as_ref() {
+                Type::Primitive(
+                    PrimitiveType::Int
+                    | PrimitiveType::Long
+                    | PrimitiveType::Timestamp
+                    | PrimitiveType::Timestamptz,
+                ) => 1,
+                Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs) => 1000,
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "{ident}: bound floor field `{name}` is {other}, not an integer or timestamp"
+                        ),
+                    ));
+                }
+            };
+            if scale.is_some_and(|x| x != s) {
+                return Err(invalid(format!(
+                    "{ident}: bound floor fields {:?} mix microsecond and nanosecond units",
+                    f.fields
+                )));
+            }
+            scale = Some(s);
+            ids.push(field.id);
+        }
+        let above = f.above.checked_mul(scale.unwrap_or(1)).ok_or_else(|| {
+            invalid(format!(
+                "{ident}: bound floor {} overflows the field unit",
+                f.above
+            ))
+        })?;
+        out.push(LowerBoundFloor {
+            field_ids: ids,
+            above,
+        });
+    }
+    Ok(out)
+}
 
 fn invalid(msg: String) -> Error {
     Error::new(ErrorKind::DataInvalid, msg)
@@ -279,6 +360,33 @@ pub async fn replace_file_rows_from_sources(
     snapshot_properties: HashMap<String, String>,
     carry_summary_prefix: Option<&str>,
 ) -> Result<ReplaceFileRowsOutcome> {
+    replace_file_rows_from_sources_with_floors(
+        catalog,
+        ident,
+        base_snapshot,
+        files,
+        dry_run,
+        snapshot_properties,
+        carry_summary_prefix,
+        &[],
+    )
+    .await
+}
+
+/// [`replace_file_rows_from_sources`] whose commit also holds every appended
+/// data file to `floors` (proof 5; see the module docs). Floors are resolved
+/// against the planning schema before anything is read or written.
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_file_rows_from_sources_with_floors(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    base_snapshot: i64,
+    files: Vec<FileRowSource>,
+    dry_run: bool,
+    snapshot_properties: HashMap<String, String>,
+    carry_summary_prefix: Option<&str>,
+    floors: &[BoundFloor],
+) -> Result<ReplaceFileRowsOutcome> {
     if files.is_empty() {
         return Err(invalid("no files to replace".to_string()));
     }
@@ -301,6 +409,7 @@ pub async fn replace_file_rows_from_sources(
         )));
     }
     let schema = table.metadata().current_schema().clone();
+    let lower_bound_floors = resolve_floors(ident, &schema, floors)?;
     let spec = table.metadata().default_partition_spec().clone();
     let default_spec_id = table.metadata().default_partition_spec_id();
     // the identity partition columns: (position in the partition struct, column name)
@@ -542,6 +651,7 @@ pub async fn replace_file_rows_from_sources(
             })
             .collect::<Result<_>>()?,
         max_attempts: REPLACE_COMMIT_MAX_ATTEMPTS,
+        lower_bound_floors,
     };
     let log: RebaseLog = RebaseLog::default();
     let tx = Transaction::new(&table);
@@ -1905,6 +2015,7 @@ mod tests {
                 (f1.file_size_in_bytes(), records, Some(1)),
             )]),
             max_attempts: REPLACE_COMMIT_MAX_ATTEMPTS,
+            lower_bound_floors: vec![],
         };
         let log = RebaseLog::default();
         let tx = Transaction::new(&table);
@@ -2002,5 +2113,284 @@ mod tests {
             *landed.last().unwrap(),
             "the replace committed nothing"
         );
+    }
+
+    // ---- proof 5: appended files must rank after the replaced rows ----
+
+    /// A table (id, off long, ts timestamp no-tz, sts timestamptz, k string).
+    async fn setup_ordered() -> (TempDir, Arc<dyn Catalog>, TableIdent, Table) {
+        let warehouse = TempDir::new().unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.path().to_str().unwrap().to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new("db".to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "off", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::optional(4, "sts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+                NestedField::optional(5, "k", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let creation = TableCreation::builder()
+            .name("o".to_string())
+            .schema(schema)
+            .format_version(FormatVersion::V2)
+            .build();
+        let table = catalog.create_table(&ns, creation).await.unwrap();
+        (
+            warehouse,
+            catalog,
+            TableIdent::new(ns, "o".to_string()),
+            table,
+        )
+    }
+
+    /// Rows with `off` = ids, the given ts / sts (microseconds) per row.
+    fn ordered_rows(
+        table: &Table,
+        ids: &[i64],
+        ts: &[Option<i64>],
+        sts: &[Option<i64>],
+    ) -> RecordBatch {
+        use arrow_array::TimestampMicrosecondArray;
+        let target = Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
+        let ts_type = target.field_with_name("sts").unwrap().data_type().clone();
+        let tz = match ts_type {
+            DataType::Timestamp(_, tz) => tz,
+            _ => None,
+        };
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(ts.to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(sts.to_vec()).with_timezone_opt(tz)),
+            Arc::new(StringArray::from(vec![Some("x"); ids.len()])),
+        ];
+        let b = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(
+                target
+                    .fields()
+                    .iter()
+                    .zip(&cols)
+                    .map(|(f, c)| Field::new(f.name(), c.data_type().clone(), true))
+                    .collect::<Vec<_>>(),
+            )),
+            cols,
+        )
+        .unwrap();
+        conform_batch(&b, &target).unwrap()
+    }
+
+    fn floors() -> Vec<BoundFloor> {
+        vec![
+            BoundFloor {
+                fields: vec!["off".to_string()],
+                above: 100,
+            },
+            BoundFloor {
+                fields: vec!["ts".to_string(), "sts".to_string()],
+                above: 5_000,
+            },
+        ]
+    }
+
+    /// f1 (off 1..=100, ts = sts = 1000..=5000 step ~40) is replaced while a lane
+    /// file `lane` lands; the replace holds appended files to `floors()`.
+    async fn floor_case(
+        lane_ids: &[i64],
+        lane_ts: &[Option<i64>],
+        lane_sts: &[Option<i64>],
+    ) -> (
+        Result<ReplaceFileRowsOutcome>,
+        Arc<dyn Catalog>,
+        TableIdent,
+        i64,
+        TempDir,
+    ) {
+        let (wh, inner, ident, table) = setup_ordered().await;
+        let ids: Vec<i64> = (1..=100).collect();
+        let t: Vec<Option<i64>> = ids.iter().map(|i| Some(1000 + (i - 1) * 40 + 40)).collect();
+        let f1 = write(&table, "f1", ordered_rows(&table, &ids, &t, &t), None).await;
+        let table = append(inner.as_ref(), &table, vec![f1.clone()], HashMap::new()).await;
+        let s0 = head_of(&table);
+        let lane = write(
+            &table,
+            "lane",
+            ordered_rows(&table, lane_ids, lane_ts, lane_sts),
+            None,
+        )
+        .await;
+        let cat = Interloper::new(inner.clone(), vec![Interjection::Append(
+            lane,
+            HashMap::new(),
+        )]);
+        let files = vec![FileRowSource {
+            data_file_path: f1.file_path().to_string(),
+            source: Arc::new(vec![ordered_rows(&table, &ids, &t, &t)]) as Arc<dyn RowSource>,
+        }];
+        let out = replace_file_rows_from_sources_with_floors(
+            &cat,
+            &ident,
+            s0,
+            files,
+            false,
+            HashMap::new(),
+            None,
+            &floors(),
+        )
+        .await;
+        let landed = cat.landed()[0];
+        (out, inner, ident, landed, wh)
+    }
+
+    async fn assert_refused_at(
+        out: Result<ReplaceFileRowsOutcome>,
+        inner: &Arc<dyn Catalog>,
+        ident: &TableIdent,
+        landed: i64,
+        why: &str,
+    ) {
+        let msg = out.unwrap_err().to_string();
+        assert!(
+            msg.contains("Cannot commit RewriteFiles based on stale snapshot"),
+            "{msg}"
+        );
+        assert!(msg.contains("proof 5"), "{msg}");
+        assert!(msg.contains(why), "{msg}");
+        assert_eq!(
+            head_of(&inner.load_table(ident).await.unwrap()),
+            landed,
+            "nothing committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn proof5_an_appended_file_above_both_floors_is_rebased() {
+        let (out, inner, ident, landed, _wh) =
+            floor_case(&[101, 102], &[Some(6_000), Some(6_100)], &[
+                Some(6_050),
+                Some(6_200),
+            ])
+            .await;
+        let out = out.unwrap();
+        assert_eq!(out.rebase_rechecks.len(), 1);
+        assert_eq!(out.rebase_rechecks[0].snapshots, vec![landed]);
+        let t = inner.load_table(&ident).await.unwrap();
+        assert_eq!(
+            t.metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            Some(landed)
+        );
+    }
+
+    #[tokio::test]
+    async fn proof5_an_appended_file_below_the_offset_floor_refuses() {
+        let (out, inner, ident, landed, _wh) =
+            floor_case(&[50, 150], &[Some(6_000), Some(6_100)], &[
+                Some(6_000),
+                Some(6_100),
+            ])
+            .await;
+        assert_refused_at(
+            out,
+            &inner,
+            &ident,
+            landed,
+            "lower bound 50 over fields [2], not above 100",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proof5_an_appended_file_above_the_offset_but_earlier_in_time_refuses() {
+        // sts is late, ts is early: the pooled minimum (ts) is at or below the floor
+        let (out, inner, ident, landed, _wh) =
+            floor_case(&[200], &[Some(5_000)], &[Some(9_000)]).await;
+        assert_refused_at(
+            out,
+            &inner,
+            &ident,
+            landed,
+            "lower bound 5000 over fields [3, 4], not above 5000",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proof5_a_null_only_source_time_passes_on_the_event_time_alone() {
+        // the no-tz `ts` alone carries the time (sts null-only: pre-contract rows, mongo tails)
+        let (out, inner, ident, landed, _wh) =
+            floor_case(&[300, 301], &[Some(7_000), Some(7_001)], &[None, None]).await;
+        let out = out.unwrap();
+        assert_eq!(out.rebase_rechecks[0].snapshots, vec![landed]);
+        let t = inner.load_table(&ident).await.unwrap();
+        assert_eq!(
+            t.metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            Some(landed)
+        );
+    }
+
+    #[tokio::test]
+    async fn proof5_an_appended_file_with_no_time_bound_refuses() {
+        let (out, inner, ident, landed, _wh) = floor_case(&[400], &[None], &[None]).await;
+        assert_refused_at(
+            out,
+            &inner,
+            &ident,
+            landed,
+            "has no lower bound for any of fields [3, 4]",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proof5_a_floor_on_a_non_integer_field_refuses_before_any_write() {
+        let (_wh, inner, ident, table) = setup_ordered().await;
+        let ids: Vec<i64> = (1..=3).collect();
+        let t = vec![Some(1_000); 3];
+        let f1 = write(&table, "f1", ordered_rows(&table, &ids, &t, &t), None).await;
+        let table = append(inner.as_ref(), &table, vec![f1.clone()], HashMap::new()).await;
+        let s0 = head_of(&table);
+        let source = Counting::new(vec![ordered_rows(&table, &ids, &t, &t)], false);
+        let err = replace_file_rows_from_sources_with_floors(
+            inner.as_ref(),
+            &ident,
+            s0,
+            vec![FileRowSource {
+                data_file_path: f1.file_path().to_string(),
+                source: source.clone(),
+            }],
+            false,
+            HashMap::new(),
+            None,
+            &[BoundFloor {
+                fields: vec!["k".to_string()],
+                above: 0,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("bound floor field `k`"), "{err}");
+        assert_eq!(source.opens(), 0, "refused before reading the rows");
+        assert_eq!(head_of(&inner.load_table(&ident).await.unwrap()), s0);
     }
 }

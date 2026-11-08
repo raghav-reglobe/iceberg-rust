@@ -89,7 +89,9 @@ use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-pub use crate::transaction::rewrite_files::{AppendRebaseGuard, RebaseLog, RebaseRecheck};
+pub use crate::transaction::rewrite_files::{
+    AppendRebaseGuard, LowerBoundFloor, RebaseLog, RebaseRecheck,
+};
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
