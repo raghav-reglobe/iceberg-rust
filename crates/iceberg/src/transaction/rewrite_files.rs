@@ -16,18 +16,59 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, Operation,
+};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+
+/// What a rewrite planned against `base_snapshot_id` saw, for
+/// [`RewriteFilesAction::rebase_across_appends`] to prove unchanged at commit.
+#[derive(Debug, Clone)]
+pub struct AppendRebaseGuard {
+    /// The snapshot the rewrite was planned against.
+    pub base_snapshot_id: i64,
+    /// The table's current schema id at the base.
+    pub schema_id: i32,
+    /// The table's default partition spec id at the base.
+    pub default_spec_id: i32,
+    /// The table's default sort order id at the base.
+    pub default_sort_order_id: i64,
+    /// Every file the rewrite removes (data files and delete files), by path:
+    /// its manifest entry at the base as (file size in bytes, record count,
+    /// data sequence number).
+    pub removed_entries: HashMap<String, (u64, u64, Option<i64>)>,
+    /// Commit attempts allowed, the first included; one more refuses.
+    pub max_attempts: usize,
+}
+
+/// One stale-base proof that passed: the commit attempt, the planning
+/// snapshot, the snapshot the table was at, and the snapshots committed in
+/// between (oldest first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseRecheck {
+    /// 1-based commit attempt.
+    pub attempt: usize,
+    /// The planning snapshot.
+    pub expected: i64,
+    /// The table's snapshot at this attempt.
+    pub current: i64,
+    /// The snapshots in (expected, current], oldest first.
+    pub snapshots: Vec<i64>,
+}
+
+/// The rechecks of one rewrite, shared with its caller.
+pub type RebaseLog = Arc<Mutex<Vec<RebaseRecheck>>>;
 
 /// Transaction action for compaction-style rewrites: replace existing data files
 /// with new (compacted) ones and reabsorb their delete files — position/equality
@@ -48,6 +89,9 @@ pub struct RewriteFilesAction {
     snapshot_properties: HashMap<String, String>,
     starting_snapshot_id: Option<i64>,
     rebase_base_snapshot_id: Option<i64>,
+    append_rebase: Option<(AppendRebaseGuard, RebaseLog)>,
+    attempts: AtomicUsize,
+    carry_summary_prefix: Option<String>,
 }
 
 impl RewriteFilesAction {
@@ -60,7 +104,43 @@ impl RewriteFilesAction {
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
             rebase_base_snapshot_id: None,
+            append_rebase: None,
+            attempts: AtomicUsize::new(0),
+            carry_summary_prefix: None,
         }
+    }
+
+    /// Commit on top of snapshots that landed after the planning snapshot
+    /// only when every one of them is a plain append the rewrite cannot
+    /// conflict with; otherwise refuse as a stale base (`DataInvalid`, not
+    /// retried). At each commit attempt that finds the table moved, every
+    /// snapshot in (base, current] must
+    ///   1. be an `append`,
+    ///   2. add no delete file,
+    ///   3. remove no file,
+    ///   4. carry the base schema id.
+    ///
+    /// The table must keep the base schema id, default partition spec id and
+    /// default sort order id; and every removed file's live manifest entry
+    /// must be unchanged (file size, record count, data sequence number).
+    ///
+    /// Each passing proof is pushed to `log`. The transaction's own retry
+    /// (refresh, re-apply on a commit conflict) drives the attempts;
+    /// `guard.max_attempts` bounds them. Mutually exclusive with
+    /// [`Self::validate_from_snapshot`] (the strict form wins) and
+    /// [`Self::validate_rebase_from`] (this form wins).
+    pub fn rebase_across_appends(mut self, guard: AppendRebaseGuard, log: RebaseLog) -> Self {
+        self.append_rebase = Some((guard, log));
+        self
+    }
+
+    /// Copy the summary properties whose key starts with `prefix` from the
+    /// snapshot this commit lands on (its parent, read at each attempt) onto
+    /// the new snapshot. A key given in the snapshot properties wins. Read at
+    /// commit time, a carried value is the table's latest even after a rebase.
+    pub fn carry_parent_summary(mut self, prefix: impl Into<String>) -> Self {
+        self.carry_summary_prefix = Some(prefix.into());
+        self
     }
 
     /// Add the rewritten (compacted) data files.
@@ -137,6 +217,164 @@ impl RewriteFilesAction {
         )
     }
 
+    /// A failed append-rebase proof, in the strict form's words.
+    fn stale(base: i64, table: &Table, why: String) -> crate::Error {
+        crate::Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!(
+                "Cannot commit RewriteFiles based on stale snapshot. Expected: {}, Current: {:?}: {why}",
+                base,
+                table.metadata().current_snapshot_id()
+            ),
+        )
+    }
+
+    /// The proof of [`Self::rebase_across_appends`]; returns the snapshots in
+    /// (base, current], oldest first.
+    async fn prove_appends_only(
+        &self,
+        table: &Table,
+        guard: &AppendRebaseGuard,
+    ) -> Result<Vec<i64>> {
+        let meta = table.metadata();
+        let base = guard.base_snapshot_id;
+        let mut skipped: Vec<i64> = Vec::new();
+        let mut cursor = meta.current_snapshot_id();
+        loop {
+            match cursor {
+                None => {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        "the base is not an ancestor of the current snapshot".to_string(),
+                    ));
+                }
+                Some(id) if id == base => break,
+                Some(id) => {
+                    let snap = meta.snapshot_by_id(id).ok_or_else(|| {
+                        Self::stale(base, table, format!("ancestor snapshot {id} is missing"))
+                    })?;
+                    skipped.push(id);
+                    cursor = snap.parent_snapshot_id();
+                }
+            }
+        }
+        skipped.reverse();
+
+        if meta.current_schema_id() != guard.schema_id
+            || meta.default_partition_spec_id() != guard.default_spec_id
+            || meta.default_sort_order_id() != guard.default_sort_order_id
+        {
+            return Err(Self::stale(
+                base,
+                table,
+                format!(
+                    "the table layout moved: schema {} (base {}), partition spec {} (base {}), sort order {} (base {})",
+                    meta.current_schema_id(),
+                    guard.schema_id,
+                    meta.default_partition_spec_id(),
+                    guard.default_spec_id,
+                    meta.default_sort_order_id(),
+                    guard.default_sort_order_id
+                ),
+            ));
+        }
+
+        for &id in &skipped {
+            let snap = meta.snapshot_by_id(id).expect("resolved above");
+            let op = snap.summary().operation.clone();
+            if op != Operation::Append {
+                return Err(Self::stale(
+                    base,
+                    table,
+                    format!("snapshot {id} is a {op:?}, not an append"),
+                ));
+            }
+            if let Some(sid) = snap.schema_id()
+                && sid != guard.schema_id
+            {
+                return Err(Self::stale(
+                    base,
+                    table,
+                    format!(
+                        "snapshot {id} was written under schema {sid} (base {})",
+                        guard.schema_id
+                    ),
+                ));
+            }
+            let manifest_list = table.manifest_list_reader(snap).load().await?;
+            for mf in manifest_list
+                .entries()
+                .iter()
+                .filter(|m| m.added_snapshot_id == id)
+            {
+                if mf.content == ManifestContentType::Deletes && mf.has_added_files() {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!("snapshot {id} adds delete files ({})", mf.manifest_path),
+                    ));
+                }
+                if mf.has_deleted_files() {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!("snapshot {id} removes files ({})", mf.manifest_path),
+                    ));
+                }
+            }
+        }
+
+        // every removed file's live entry, unchanged, exactly once
+        let current = meta
+            .current_snapshot()
+            .ok_or_else(|| Self::stale(base, table, "no current snapshot".to_string()))?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let manifest_list = table.manifest_list_reader(current).load().await?;
+        for mf in manifest_list.entries() {
+            let manifest = mf.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    continue;
+                }
+                let df = entry.data_file();
+                let Some(want) = guard.removed_entries.get(df.file_path()) else {
+                    continue;
+                };
+                let got = (
+                    df.file_size_in_bytes(),
+                    df.record_count(),
+                    entry.sequence_number(),
+                );
+                if got != *want {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!(
+                            "the entry of {} changed: (size, records, data seq) {got:?}, base {want:?}",
+                            df.file_path()
+                        ),
+                    ));
+                }
+                if !seen.insert(df.file_path().to_string()) {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!("{} is live twice", df.file_path()),
+                    ));
+                }
+            }
+        }
+        if let Some(missing) = guard.removed_entries.keys().find(|p| !seen.contains(*p)) {
+            return Err(Self::stale(
+                base,
+                table,
+                format!("{missing} is no longer live"),
+            ));
+        }
+        Ok(skipped)
+    }
+
     /// Walk the snapshots committed after `base` (exclusive) and reject the
     /// rebase if any of them touched this rewrite's inputs. See
     /// [`Self::validate_rebase_from`] for the conflict rules.
@@ -207,9 +445,7 @@ impl RewriteFilesAction {
                 let manifest = mf.load_manifest(table.file_io()).await?;
                 for entry in manifest.entries() {
                     match entry.status() {
-                        crate::spec::ManifestStatus::Added
-                            if mf.content == ManifestContentType::Deletes =>
-                        {
+                        ManifestStatus::Added if mf.content == ManifestContentType::Deletes => {
                             let refd = entry.data_file().referenced_data_file();
                             let collides = match refd.as_deref() {
                                 Some(p) => our_inputs.contains(p),
@@ -227,7 +463,7 @@ impl RewriteFilesAction {
                                 )));
                             }
                         }
-                        crate::spec::ManifestStatus::Deleted => {
+                        ManifestStatus::Deleted => {
                             let p = entry.data_file().file_path();
                             let hit = match mf.content {
                                 ManifestContentType::Data => our_inputs.contains(p),
@@ -266,20 +502,69 @@ impl TransactionAction for RewriteFilesAction {
             ));
         }
 
+        // Append-only rebase: prove every snapshot after the base a plain
+        // append that leaves the removed files untouched, bounded attempts.
+        if self.starting_snapshot_id.is_none()
+            && let Some((guard, log)) = &self.append_rebase
+        {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt > guard.max_attempts {
+                return Err(Self::stale(
+                    guard.base_snapshot_id,
+                    table,
+                    format!(
+                        "{} commit attempts used, the table kept moving",
+                        guard.max_attempts
+                    ),
+                ));
+            }
+            if let Some(current) = table.metadata().current_snapshot_id()
+                && current != guard.base_snapshot_id
+            {
+                let snapshots = self.prove_appends_only(table, guard).await?;
+                log.lock()
+                    .expect("rebase log poisoned")
+                    .push(RebaseRecheck {
+                        attempt,
+                        expected: guard.base_snapshot_id,
+                        current,
+                        snapshots,
+                    });
+            } else if table.metadata().current_snapshot_id().is_none() {
+                return Err(Self::stale(
+                    guard.base_snapshot_id,
+                    table,
+                    "the table has no current snapshot".to_string(),
+                ));
+            }
+        }
+
         // Rebase validation (input protection): allow concurrent appends,
         // conflict on anything touching this rewrite's inputs. See
         // `validate_rebase_from`. Skipped when the strict form is in use.
         if self.starting_snapshot_id.is_none()
+            && self.append_rebase.is_none()
             && let Some(base) = self.rebase_base_snapshot_id
             && table.metadata().current_snapshot_id() != Some(base)
         {
             self.validate_skipped_range(table, base).await?;
         }
 
+        let mut snapshot_properties = self.snapshot_properties.clone();
+        if let Some(prefix) = &self.carry_summary_prefix
+            && let Some(parent) = table.metadata().current_snapshot()
+        {
+            for (k, v) in &parent.summary().additional_properties {
+                if k.starts_with(prefix.as_str()) && !snapshot_properties.contains_key(k) {
+                    snapshot_properties.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.snapshot_properties.clone(),
+            snapshot_properties,
             self.added_data_files.clone(),
         );
 
@@ -358,13 +643,13 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
-    use crate::catalog::TableCommit;
     use crate::atomic_replace::atomic_partition_replace_key_set;
+    use crate::catalog::TableCommit;
     use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::spec::{
         DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType, ManifestList,
-        ManifestStatus, NestedField, PartitionKey, PrimitiveType, Schema, Struct, Transform,
-        Type, UnboundPartitionSpec,
+        ManifestStatus, NestedField, PartitionKey, PrimitiveType, Schema, Struct, Transform, Type,
+        UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -773,8 +1058,8 @@ mod tests {
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::bool(true))]),
         );
-        let file_c = write_row_file(&table, "file-c", &[(3, "k3", Some(true))], Some(spec1_key))
-            .await;
+        let file_c =
+            write_row_file(&table, "file-c", &[(3, "k3", Some(true))], Some(spec1_key)).await;
         let tx = Transaction::new(&table);
         let table = tx
             .fast_append()

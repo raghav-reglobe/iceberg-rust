@@ -172,6 +172,23 @@ fn outcome_dict(out: &ReplaceFileRowsOutcome, dry_run: bool) -> HashMap<String, 
             out.delete_files_removed.to_string(),
         ),
         ("dry_run".to_string(), dry_run.to_string()),
+        (
+            "rebase_rechecks".to_string(),
+            serde_json::Value::Array(
+                out.rebase_rechecks
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "attempt": r.attempt,
+                            "expected": r.expected,
+                            "current": r.current,
+                            "snapshots": r.snapshots,
+                        })
+                    })
+                    .collect(),
+            )
+            .to_string(),
+        ),
     ])
 }
 
@@ -226,10 +243,13 @@ fn decode_ipc(path: &str, ipc: &[u8]) -> PyResult<Vec<RecordBatch>> {
 /// as JSON text). Delete files bound to a named file are removed with it. The
 /// call refuses when the table is no longer at `base_snapshot`, when a row count
 /// differs, or when a row's partition value differs from its file's; the commit
-/// refuses when any snapshot landed after `base_snapshot`. With `dry_run`
-/// everything is validated and nothing is written. `carry_summary_prefix` copies
-/// the base snapshot's summary keys with that prefix onto the new snapshot.
-/// Returns a dict of strings.
+/// lands on top of snapshots committed after `base_snapshot` only when every
+/// one is a plain append that leaves the replaced files alone (else it refuses
+/// as a stale snapshot), at most 5 attempts. With `dry_run` everything is
+/// validated and nothing is written. `carry_summary_prefix` copies the summary
+/// keys with that prefix from the snapshot the commit lands on. Returns a dict
+/// of strings; `rebase_rechecks` is a JSON list of `{attempt, expected,
+/// current, snapshots}`, one per attempt that found the table moved.
 #[pyfunction]
 #[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None))]
 fn replace_file_rows(

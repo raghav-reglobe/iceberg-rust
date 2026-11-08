@@ -30,8 +30,10 @@
 //! untouched.
 //!
 //! Refusals (nothing is written or committed):
-//!   * the table is not at `base_snapshot` (planning snapshot), here and again at
-//!     commit — any snapshot committed in between, an append included, refuses;
+//!   * the table is not at `base_snapshot` (planning snapshot) when the call
+//!     starts;
+//!   * at commit, a snapshot committed after `base_snapshot` is anything but a
+//!     plain append that leaves the replaced files alone (see below);
 //!   * a named path is not a live data file, or was written under an older
 //!     partition spec;
 //!   * a delete file bound to a named file is an equality delete, or is also
@@ -39,9 +41,20 @@
 //!   * a replacement's row count differs from the file's live rows;
 //!   * a replacement row's identity-partition value differs from the file's.
 //!
-//! The base snapshot's summary properties starting with `carry_summary_prefix`
-//! are copied onto the new snapshot. Because any concurrent commit refuses the
-//! replace, the carried values are the table's latest.
+//! Appends that land while the replacement is written do not refuse it: the
+//! commit is re-applied on the current snapshot when every snapshot committed
+//! after `base_snapshot` is an `append` that adds no delete file and removes no
+//! file, the table keeps its schema, default partition spec and default sort
+//! order, and every replaced file (and delete file removed with it) still has
+//! its base manifest entry (size, record count, data sequence number). The
+//! transaction's own retry re-applies on a commit conflict, at most
+//! [`REPLACE_COMMIT_MAX_ATTEMPTS`] attempts. Each passing proof is listed in
+//! [`ReplaceFileRowsOutcome::rebase_rechecks`]; a failing one refuses with the
+//! stale-snapshot error and commits nothing.
+//!
+//! The summary properties starting with `carry_summary_prefix` are copied onto
+//! the new snapshot from the snapshot it lands on, read at commit time, so the
+//! carried values are the table's latest even after appends landed.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -62,7 +75,9 @@ use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, PartitionKey, Struct,
     Transform,
 };
-use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::transaction::{
+    AppendRebaseGuard, ApplyTransactionAction, RebaseLog, RebaseRecheck, Transaction,
+};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -127,7 +142,14 @@ pub struct ReplaceFileRowsOutcome {
     pub rows_written: u64,
     /// Delete files bound to the named files, removed with them.
     pub delete_files_removed: usize,
+    /// The appends committed after the planning snapshot that the commit was
+    /// proven safe to land on, one per commit attempt that found the table
+    /// moved (empty when it landed on the planning snapshot).
+    pub rebase_rechecks: Vec<RebaseRecheck>,
 }
+
+/// Commit attempts a replace takes, the first included, before it refuses.
+pub const REPLACE_COMMIT_MAX_ATTEMPTS: usize = 5;
 
 fn invalid(msg: String) -> Error {
     Error::new(ErrorKind::DataInvalid, msg)
@@ -308,6 +330,7 @@ pub async fn replace_file_rows_from_sources(
     // live entries of the planning snapshot
     let mut live_data: HashMap<String, DataFile> = HashMap::new();
     let mut live_deletes: HashMap<String, DataFile> = HashMap::new();
+    let mut base_entries: HashMap<String, (u64, u64, Option<i64>)> = HashMap::new();
     let manifest_list = table.manifest_list_reader(&snapshot).load().await?;
     for manifest_file in manifest_list.entries() {
         let manifest = manifest_file.load_manifest(table.file_io()).await?;
@@ -316,6 +339,14 @@ pub async fn replace_file_rows_from_sources(
                 continue;
             }
             let df = entry.data_file().clone();
+            base_entries.insert(
+                df.file_path().to_string(),
+                (
+                    df.file_size_in_bytes(),
+                    df.record_count(),
+                    entry.sequence_number(),
+                ),
+            );
             match entry.content_type() {
                 DataContentType::Data => {
                     live_data.insert(df.file_path().to_string(), df);
@@ -492,25 +523,41 @@ pub async fn replace_file_rows_from_sources(
     }
     outcome.files_added = new_files.len();
 
-    let mut props = snapshot_properties;
-    if let Some(prefix) = carry_summary_prefix {
-        for (k, v) in &snapshot.summary().additional_properties {
-            if k.starts_with(prefix) && !props.contains_key(k) {
-                props.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    let guard = AppendRebaseGuard {
+        base_snapshot_id: s0,
+        schema_id: schema.schema_id(),
+        default_spec_id,
+        default_sort_order_id: table.metadata().default_sort_order_id(),
+        removed_entries: old_files
+            .iter()
+            .chain(removed_deletes.iter())
+            .map(|f| {
+                let e = base_entries.get(f.file_path()).cloned().ok_or_else(|| {
+                    invalid(format!(
+                        "{ident}: {} has no manifest entry at {s0}",
+                        f.file_path()
+                    ))
+                })?;
+                Ok((f.file_path().to_string(), e))
+            })
+            .collect::<Result<_>>()?,
+        max_attempts: REPLACE_COMMIT_MAX_ATTEMPTS,
+    };
+    let log: RebaseLog = RebaseLog::default();
     let tx = Transaction::new(&table);
-    let table = tx
+    let mut action = tx
         .rewrite_files()
         .delete_data_files(old_files)
         .delete_delete_files(removed_deletes)
         .add_data_files(new_files)
-        .validate_from_snapshot(s0)
-        .set_snapshot_properties(props)
-        .apply(tx)?
-        .commit(catalog)
-        .await?;
+        .rebase_across_appends(guard, log.clone())
+        .set_snapshot_properties(snapshot_properties);
+    if let Some(prefix) = carry_summary_prefix {
+        action = action.carry_parent_summary(prefix);
+    }
+    let committed = action.apply(tx)?.commit(catalog).await;
+    outcome.rebase_rechecks = log.lock().expect("rebase log poisoned").clone();
+    let table = committed?;
     outcome.snapshot_after = table.metadata().current_snapshot_id();
     Ok(outcome)
 }
@@ -1271,11 +1318,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(source.opens(), 1);
-        assert_eq!((out.rows_live, out.rows_written, out.files_added), (2, 2, 0));
+        assert_eq!(
+            (out.rows_live, out.rows_written, out.files_added),
+            (2, 2, 0)
+        );
         assert_eq!(out.snapshot_after, None);
         let table = catalog.load_table(&ident).await.unwrap();
         assert_eq!(table.metadata().current_snapshot_id(), Some(s0));
-        assert_eq!(read(&table).await, vec![(1, None), (2, None), (3, Some("keep".to_string()))]);
+        assert_eq!(read(&table).await, vec![
+            (1, None),
+            (2, None),
+            (3, Some("keep".to_string()))
+        ]);
     }
 
     #[tokio::test]
@@ -1305,8 +1359,16 @@ mod tests {
         );
         assert_eq!(source.opens(), 2);
         let table = catalog.load_table(&ident).await.unwrap();
-        assert_eq!(table.metadata().current_snapshot_id(), Some(s0), "nothing committed");
-        assert_eq!(read(&table).await, vec![(1, None), (2, None), (3, Some("keep".to_string()))]);
+        assert_eq!(
+            table.metadata().current_snapshot_id(),
+            Some(s0),
+            "nothing committed"
+        );
+        assert_eq!(read(&table).await, vec![
+            (1, None),
+            (2, None),
+            (3, Some("keep".to_string()))
+        ]);
     }
 
     #[tokio::test]
@@ -1463,7 +1525,482 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("planned against snapshot"), "{err}");
+        assert!(
+            err.to_string().contains("planned against snapshot"),
+            "{err}"
+        );
         assert_eq!(source.opens(), before);
+    }
+
+    // ---- commits landing between the write and the commit ----
+
+    /// A commit another writer lands just before one `update_table` of ours.
+    #[allow(clippy::large_enum_variant)]
+    enum Interjection {
+        Append(DataFile, HashMap<String, String>),
+        DeleteFile(DataFile),
+        Rewrite { remove: DataFile, add: DataFile },
+    }
+
+    /// A catalog that lands the queued interjections, one per `update_table`,
+    /// right before forwarding ours — the lane committing while the replace
+    /// writes.
+    #[derive(Debug)]
+    struct Interloper {
+        inner: Arc<dyn Catalog>,
+        queue: std::sync::Mutex<std::collections::VecDeque<Interjection>>,
+        landed: std::sync::Mutex<Vec<i64>>,
+    }
+
+    impl fmt::Debug for Interjection {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Interjection")
+        }
+    }
+
+    impl Interloper {
+        fn new(inner: Arc<dyn Catalog>, queue: Vec<Interjection>) -> Self {
+            Self {
+                inner,
+                queue: std::sync::Mutex::new(queue.into()),
+                landed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn landed(&self) -> Vec<i64> {
+            self.landed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for Interloper {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> Result<crate::Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+        async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<crate::Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+        async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+        async fn create_table(
+            &self,
+            namespace: &NamespaceIdent,
+            creation: TableCreation,
+        ) -> Result<Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+        async fn load_table(&self, table: &TableIdent) -> Result<Table> {
+            self.inner.load_table(table).await
+        }
+        async fn drop_table(&self, table: &TableIdent) -> Result<()> {
+            self.inner.drop_table(table).await
+        }
+        async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+            self.inner.purge_table(table).await
+        }
+        async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
+            self.inner.table_exists(table).await
+        }
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+        async fn register_table(
+            &self,
+            table: &TableIdent,
+            metadata_location: String,
+        ) -> Result<Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+        async fn update_table(&self, commit: crate::TableCommit) -> Result<Table> {
+            let next = self.queue.lock().unwrap().pop_front();
+            if let Some(i) = next {
+                let t = self.inner.load_table(commit.identifier()).await?;
+                let tx = Transaction::new(&t);
+                let t = match i {
+                    Interjection::Append(f, props) => tx
+                        .fast_append()
+                        .add_data_files(vec![f])
+                        .set_snapshot_properties(props)
+                        .apply(tx)?,
+                    Interjection::DeleteFile(d) => {
+                        tx.row_delta().add_delete_files(vec![d]).apply(tx)?
+                    }
+                    Interjection::Rewrite { remove, add } => tx
+                        .rewrite_files()
+                        .delete_data_files(vec![remove])
+                        .add_data_files(vec![add])
+                        .apply(tx)?,
+                }
+                .commit(self.inner.as_ref())
+                .await?;
+                self.landed
+                    .lock()
+                    .unwrap()
+                    .push(t.metadata().current_snapshot_id().unwrap());
+            }
+            self.inner.update_table(commit).await
+        }
+    }
+
+    /// f1 (ids 1, 2) committed with `ledger.offset.a` = 41; the replacement of f1.
+    async fn ledgered_f1(catalog: &dyn Catalog, table: &Table) -> (DataFile, Table, Vec<FileRows>) {
+        let f1 = write(
+            table,
+            "f1",
+            rows(&[1, 2], &[None, None], Some(false), None),
+            None,
+        )
+        .await;
+        let table = append(
+            catalog,
+            table,
+            vec![f1.clone()],
+            HashMap::from([("ledger.offset.a".to_string(), "41".to_string())]),
+        )
+        .await;
+        let repl = vec![FileRows {
+            data_file_path: f1.file_path().to_string(),
+            batches: vec![rows(&[1, 2], &[Some("a"), Some("b")], Some(false), None)],
+        }];
+        (f1, table, repl)
+    }
+
+    fn head_of(t: &Table) -> i64 {
+        t.metadata().current_snapshot_id().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_append_landing_during_the_write_is_rebased_with_its_recheck_listed() {
+        let (_wh, inner, ident, table) = setup(FormatVersion::V2, false).await;
+        let (_f1, table, repl) = ledgered_f1(inner.as_ref(), &table).await;
+        let s0 = head_of(&table);
+        let f2 = write(
+            &table,
+            "f2",
+            rows(&[3], &[Some("lane")], Some(false), None),
+            None,
+        )
+        .await;
+        let cat = Interloper::new(inner.clone(), vec![Interjection::Append(
+            f2,
+            HashMap::from([("ledger.offset.a".to_string(), "42".to_string())]),
+        )]);
+        let out = replace_file_rows(
+            &cat,
+            &ident,
+            s0,
+            repl,
+            false,
+            HashMap::from([("mark".to_string(), "1".to_string())]),
+            Some("ledger."),
+        )
+        .await
+        .unwrap();
+        let s1 = cat.landed()[0];
+        assert_eq!(out.rebase_rechecks, vec![RebaseRecheck {
+            attempt: 2,
+            expected: s0,
+            current: s1,
+            snapshots: vec![s1],
+        }]);
+        let table = inner.load_table(&ident).await.unwrap();
+        let snap = table.metadata().current_snapshot().unwrap();
+        assert_eq!(Some(snap.snapshot_id()), out.snapshot_after);
+        assert_eq!(snap.parent_snapshot_id(), Some(s1), "landed on the append");
+        assert_eq!(read(&table).await, vec![
+            (1, Some("a".to_string())),
+            (2, Some("b".to_string())),
+            (3, Some("lane".to_string()))
+        ]);
+        let summary = &snap.summary().additional_properties;
+        assert_eq!(
+            summary.get("ledger.offset.a").map(String::as_str),
+            Some("42"),
+            "the carried ledger is the append's, never the base's"
+        );
+        assert_eq!(summary.get("mark").map(String::as_str), Some("1"));
+        assert_eq!(summary.get("total-records").map(String::as_str), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_meets_no_commit_lists_no_recheck() {
+        let (_wh, inner, ident, table) = setup(FormatVersion::V2, false).await;
+        let (_f1, table, repl) = ledgered_f1(inner.as_ref(), &table).await;
+        let s0 = head_of(&table);
+        let out = replace_file_rows(
+            inner.as_ref(),
+            &ident,
+            s0,
+            repl,
+            false,
+            HashMap::new(),
+            Some("ledger."),
+        )
+        .await
+        .unwrap();
+        assert!(out.rebase_rechecks.is_empty());
+        let table = inner.load_table(&ident).await.unwrap();
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            Some(s0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_file_landing_during_the_write_refuses() {
+        let (_wh, inner, ident, table) = setup(FormatVersion::V3, false).await;
+        let f1 = write(
+            &table,
+            "f1",
+            rows(&[1, 2], &[None, None], Some(false), Some(&[None, None])),
+            None,
+        )
+        .await;
+        let f2 = write(
+            &table,
+            "f2",
+            rows(&[3, 4], &[None, None], Some(false), Some(&[None, None])),
+            None,
+        )
+        .await;
+        let table = append(
+            inner.as_ref(),
+            &table,
+            vec![f1.clone(), f2.clone()],
+            HashMap::new(),
+        )
+        .await;
+        let s0 = head_of(&table);
+        // a deletion vector on f2 — a file the replace does not even name
+        let dv = DeleteVector::new(RoaringTreemap::from_iter([0u64]));
+        let del = dv
+            .write_to_puffin_file(
+                table.file_io(),
+                format!("{}/data/dv-f2.puffin", table.metadata().location()),
+                f2.file_path().to_string(),
+                Struct::empty(),
+                table.metadata().default_partition_spec_id(),
+            )
+            .await
+            .unwrap();
+        let cat = Interloper::new(inner.clone(), vec![Interjection::DeleteFile(del)]);
+        let repl = vec![FileRows {
+            data_file_path: f1.file_path().to_string(),
+            batches: vec![rows(
+                &[1, 2],
+                &[Some("a"), Some("b")],
+                Some(false),
+                Some(&[None, None]),
+            )],
+        }];
+        let err = replace_file_rows(&cat, &ident, s0, repl, false, HashMap::new(), None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot commit RewriteFiles based on stale snapshot"),
+            "{msg}"
+        );
+        assert!(msg.contains("not an append"), "{msg}");
+        let table = inner.load_table(&ident).await.unwrap();
+        assert_eq!(
+            head_of(&table),
+            cat.landed()[0],
+            "nothing committed after the delete"
+        );
+        assert_eq!(read(&table).await, vec![(1, None), (2, None), (4, None)]);
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_of_the_replaced_file_landing_during_the_write_refuses() {
+        let (_wh, inner, ident, table) = setup(FormatVersion::V2, false).await;
+        let (f1, table, repl) = ledgered_f1(inner.as_ref(), &table).await;
+        let s0 = head_of(&table);
+        let f1b = write(
+            &table,
+            "f1b",
+            rows(&[1, 2], &[Some("x"), Some("y")], Some(false), None),
+            None,
+        )
+        .await;
+        let cat = Interloper::new(inner.clone(), vec![Interjection::Rewrite {
+            remove: f1,
+            add: f1b,
+        }]);
+        let err = replace_file_rows(
+            &cat,
+            &ident,
+            s0,
+            repl,
+            false,
+            HashMap::new(),
+            Some("ledger."),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot commit RewriteFiles based on stale snapshot"),
+            "{msg}"
+        );
+        let table = inner.load_table(&ident).await.unwrap();
+        assert_eq!(head_of(&table), cat.landed()[0]);
+        assert_eq!(read(&table).await, vec![
+            (1, Some("x".to_string())),
+            (2, Some("y".to_string()))
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_changed_entry_of_a_removed_file_refuses_even_behind_a_plain_append() {
+        // The proof reads each removed file's entry at commit: a guard that saw
+        // another record count than the table holds refuses.
+        let (_wh, inner, ident, table) = setup(FormatVersion::V2, false).await;
+        let (f1, table, _repl) = ledgered_f1(inner.as_ref(), &table).await;
+        let s0 = head_of(&table);
+        let f2 = write(&table, "f2", rows(&[3], &[None], Some(false), None), None).await;
+        let table = append(inner.as_ref(), &table, vec![f2], HashMap::new()).await;
+        let f1b = write(
+            &table,
+            "f1b",
+            rows(&[1, 2], &[Some("a"), Some("b")], Some(false), None),
+            None,
+        )
+        .await;
+        let entry = |records: u64| AppendRebaseGuard {
+            base_snapshot_id: s0,
+            schema_id: table.metadata().current_schema_id(),
+            default_spec_id: table.metadata().default_partition_spec_id(),
+            default_sort_order_id: table.metadata().default_sort_order_id(),
+            removed_entries: HashMap::from([(
+                f1.file_path().to_string(),
+                (f1.file_size_in_bytes(), records, Some(1)),
+            )]),
+            max_attempts: REPLACE_COMMIT_MAX_ATTEMPTS,
+        };
+        let log = RebaseLog::default();
+        let tx = Transaction::new(&table);
+        let err = tx
+            .rewrite_files()
+            .delete_data_files(vec![f1.clone()])
+            .add_data_files(vec![f1b.clone()])
+            .rebase_across_appends(entry(3), log.clone())
+            .apply(tx)
+            .unwrap()
+            .commit(inner.as_ref())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("the entry of"), "{err}");
+        assert!(log.lock().unwrap().is_empty());
+        // the true entry passes the same proof
+        let tx = Transaction::new(&table);
+        let t = tx
+            .rewrite_files()
+            .delete_data_files(vec![f1.clone()])
+            .add_data_files(vec![f1b])
+            .rebase_across_appends(entry(2), log.clone())
+            .apply(tx)
+            .unwrap()
+            .commit(inner.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(
+            inner
+                .load_table(&ident)
+                .await
+                .unwrap()
+                .metadata()
+                .current_snapshot_id(),
+            t.metadata().current_snapshot_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_that_keeps_moving_refuses_after_the_bound() {
+        let (_wh, inner, ident, table) = setup(FormatVersion::V2, false).await;
+        // let the transaction retry past the replace's own bound
+        let tx = Transaction::new(&table);
+        let table = tx
+            .update_table_properties()
+            .set("commit.retry.num-retries".to_string(), "20".to_string())
+            .set("commit.retry.min-wait-ms".to_string(), "1".to_string())
+            .set("commit.retry.max-wait-ms".to_string(), "2".to_string())
+            .apply(tx)
+            .unwrap()
+            .commit(inner.as_ref())
+            .await
+            .unwrap();
+        let (_f1, table, repl) = ledgered_f1(inner.as_ref(), &table).await;
+        let s0 = head_of(&table);
+        let mut queue = Vec::new();
+        for i in 0..REPLACE_COMMIT_MAX_ATTEMPTS + 2 {
+            let f = write(
+                &table,
+                &format!("lane{i}"),
+                rows(&[100 + i as i64], &[None], Some(false), None),
+                None,
+            )
+            .await;
+            queue.push(Interjection::Append(f, HashMap::new()));
+        }
+        let cat = Interloper::new(inner.clone(), queue);
+        let err = replace_file_rows(
+            &cat,
+            &ident,
+            s0,
+            repl,
+            false,
+            HashMap::new(),
+            Some("ledger."),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "{REPLACE_COMMIT_MAX_ATTEMPTS} commit attempts used"
+            )),
+            "{err}"
+        );
+        let landed = cat.landed();
+        assert_eq!(
+            landed.len(),
+            REPLACE_COMMIT_MAX_ATTEMPTS,
+            "one append per attempt"
+        );
+        let table = inner.load_table(&ident).await.unwrap();
+        assert_eq!(
+            head_of(&table),
+            *landed.last().unwrap(),
+            "the replace committed nothing"
+        );
     }
 }

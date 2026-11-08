@@ -79,7 +79,9 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
-pub use crate::transaction::rewrite_files::RewriteFilesAction;
+pub use crate::transaction::rewrite_files::{
+    AppendRebaseGuard, RebaseLog, RebaseRecheck, RewriteFilesAction,
+};
 pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 pub use crate::transaction::rollback::RollbackToSnapshotAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
