@@ -50,6 +50,24 @@ pub struct AppendRebaseGuard {
     pub removed_entries: HashMap<String, (u64, u64, Option<i64>)>,
     /// Commit attempts allowed, the first included; one more refuses.
     pub max_attempts: usize,
+    /// Floors every data file ADDED after the base must clear (empty: no
+    /// floor). See [`LowerBoundFloor`].
+    pub lower_bound_floors: Vec<LowerBoundFloor>,
+}
+
+/// A floor on the column lower bounds of every data file added after the
+/// base: the minimum of the lower bounds PRESENT among `field_ids` (in the
+/// file's manifest entry) must be strictly above `above`; a file with none of
+/// them present refuses. Bounds compare as their stored integer value (the
+/// long / int itself; microseconds or nanoseconds for timestamps, as the field
+/// stores them); a bound of another type refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LowerBoundFloor {
+    /// The fields whose present lower bounds are pooled (their minimum is
+    /// tested).
+    pub field_ids: Vec<i32>,
+    /// The exclusive floor.
+    pub above: i64,
 }
 
 /// One stale-base proof that passed: the commit attempt, the planning
@@ -260,6 +278,12 @@ impl RewriteFilesAction {
             }
         }
         skipped.reverse();
+        let base_seq = meta
+            .snapshot_by_id(base)
+            .map(|s| s.sequence_number())
+            .ok_or_else(|| {
+                Self::stale(base, table, format!("the base snapshot {base} is missing"))
+            })?;
 
         if meta.current_schema_id() != guard.schema_id
             || meta.default_partition_spec_id() != guard.default_spec_id
@@ -322,6 +346,18 @@ impl RewriteFilesAction {
                         format!("snapshot {id} removes files ({})", mf.manifest_path),
                     ));
                 }
+                if !guard.lower_bound_floors.is_empty()
+                    && mf.content == ManifestContentType::Data
+                    && mf.has_added_files()
+                {
+                    let manifest = mf.load_manifest(table.file_io()).await?;
+                    for entry in manifest.entries() {
+                        if entry.status() != ManifestStatus::Added {
+                            continue;
+                        }
+                        Self::check_floors(table, guard, base_seq, id, entry)?;
+                    }
+                }
             }
         }
 
@@ -373,6 +409,79 @@ impl RewriteFilesAction {
             ));
         }
         Ok(skipped)
+    }
+
+    /// Proof 5: a data file added after the base ranks after every row the
+    /// rewrite planned — its data sequence number is above the base's, and
+    /// it clears every floor of `guard.lower_bound_floors`.
+    fn check_floors(
+        table: &Table,
+        guard: &AppendRebaseGuard,
+        base_seq: i64,
+        snapshot_id: i64,
+        entry: &ManifestEntry,
+    ) -> Result<()> {
+        let base = guard.base_snapshot_id;
+        let df = entry.data_file();
+        let path = df.file_path();
+        match entry.sequence_number() {
+            Some(seq) if seq > base_seq => {}
+            other => {
+                return Err(Self::stale(
+                    base,
+                    table,
+                    format!(
+                        "proof 5: {path} (added by snapshot {snapshot_id}) has data sequence {other:?}, not above the base's {base_seq}"
+                    ),
+                ));
+            }
+        }
+        for floor in &guard.lower_bound_floors {
+            let mut lowest: Option<i64> = None;
+            for fid in &floor.field_ids {
+                let Some(d) = df.lower_bounds().get(fid) else {
+                    continue;
+                };
+                let v = match d.literal() {
+                    crate::spec::PrimitiveLiteral::Long(v) => *v,
+                    crate::spec::PrimitiveLiteral::Int(v) => i64::from(*v),
+                    other => {
+                        return Err(Self::stale(
+                            base,
+                            table,
+                            format!(
+                                "proof 5: {path} carries a lower bound of field {fid} that is not an integer ({other:?})"
+                            ),
+                        ));
+                    }
+                };
+                lowest = Some(lowest.map_or(v, |l| l.min(v)));
+            }
+            match lowest {
+                Some(v) if v > floor.above => {}
+                Some(v) => {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!(
+                            "proof 5: {path} (added by snapshot {snapshot_id}) has lower bound {v} over fields {:?}, not above {}",
+                            floor.field_ids, floor.above
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(Self::stale(
+                        base,
+                        table,
+                        format!(
+                            "proof 5: {path} (added by snapshot {snapshot_id}) has no lower bound for any of fields {:?}",
+                            floor.field_ids
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Walk the snapshots committed after `base` (exclusive) and reject the

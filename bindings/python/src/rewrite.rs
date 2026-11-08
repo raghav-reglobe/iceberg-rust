@@ -26,13 +26,14 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use iceberg::replace_file_rows::{
-    FileRowSource, FileRows, ReplaceFileRowsOutcome, RowBatches, RowSource,
-    replace_file_rows as replace_rows, replace_file_rows_from_sources as replace_rows_from_sources,
+    BoundFloor, FileRowSource, FileRows, ReplaceFileRowsOutcome, RowBatches, RowSource,
+    replace_file_rows_from_sources_with_floors as replace_rows_with_floors,
 };
 use iceberg::time_rewrite::{mysql_time_text_to_us as parse_time, rewrite_time_columns as rewrite};
 use iceberg::{ErrorKind, NamespaceIdent, TableIdent};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::runtime::runtime;
 
@@ -151,6 +152,24 @@ fn rewrite_time_columns(
     })
 }
 
+/// `appended_lower_bounds_above`: a list of `{"fields": [dotted names],
+/// "above": int}`, each a proof-5 floor (see `replace_file_rows`).
+fn bound_floors(groups: Option<Vec<Bound<'_, PyDict>>>) -> PyResult<Vec<BoundFloor>> {
+    let mut out = Vec::new();
+    for g in groups.unwrap_or_default() {
+        let fields: Vec<String> = g
+            .get_item("fields")?
+            .ok_or_else(|| PyValueError::new_err("a bound floor needs `fields`"))?
+            .extract()?;
+        let above: i64 = g
+            .get_item("above")?
+            .ok_or_else(|| PyValueError::new_err("a bound floor needs `above`"))?
+            .extract()?;
+        out.push(BoundFloor { fields, above });
+    }
+    Ok(out)
+}
+
 fn outcome_dict(out: &ReplaceFileRowsOutcome, dry_run: bool) -> HashMap<String, String> {
     HashMap::from([
         (
@@ -250,8 +269,14 @@ fn decode_ipc(path: &str, ipc: &[u8]) -> PyResult<Vec<RecordBatch>> {
 /// keys with that prefix from the snapshot the commit lands on. Returns a dict
 /// of strings; `rebase_rechecks` is a JSON list of `{attempt, expected,
 /// current, snapshots}`, one per attempt that found the table moved.
+/// `appended_lower_bounds_above` (proof 5): a list of `{"fields": [dotted
+/// names], "above": int}`; every data file appended after `base_snapshot`
+/// must have the minimum of its PRESENT lower bounds among each floor's
+/// fields strictly above `above` (microseconds for timestamp fields); none
+/// present refuses, as the stale-snapshot refusal with "proof 5" in it.
 #[pyfunction]
-#[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None))]
+#[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None, appended_lower_bounds_above=None))]
+#[allow(clippy::too_many_arguments)]
 fn replace_file_rows(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -261,7 +286,9 @@ fn replace_file_rows(
     dry_run: bool,
     snapshot_properties: Option<HashMap<String, String>>,
     carry_summary_prefix: Option<String>,
+    appended_lower_bounds_above: Option<Vec<Bound<'_, PyDict>>>,
 ) -> PyResult<HashMap<String, String>> {
+    let floors = bound_floors(appended_lower_bounds_above)?;
     let (catalog_name, namespace, table_name) = split_fqn(&table)?;
     let Some(props) = catalogs.get(&catalog_name).cloned() else {
         return Err(PyValueError::new_err(format!(
@@ -281,7 +308,14 @@ fn replace_file_rows(
         runtime().block_on(async move {
             let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
             let ident = TableIdent::new(namespace, table_name);
-            let out = replace_rows(
+            let files = files
+                .into_iter()
+                .map(|f| FileRowSource {
+                    data_file_path: f.data_file_path,
+                    source: Arc::new(f.batches) as Arc<dyn RowSource>,
+                })
+                .collect();
+            let out = replace_rows_with_floors(
                 catalog.as_ref(),
                 &ident,
                 base_snapshot,
@@ -289,6 +323,7 @@ fn replace_file_rows(
                 dry_run,
                 snapshot_properties.unwrap_or_default(),
                 carry_summary_prefix.as_deref(),
+                &floors,
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("replace file rows {table}: {e}")))?;
@@ -304,7 +339,8 @@ fn replace_file_rows(
 /// buffers; the write refuses when the second read yields a different row
 /// count. Gates, return dict and `dry_run` are those of `replace_file_rows`.
 #[pyfunction]
-#[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None))]
+#[pyo3(signature = (catalogs, table, base_snapshot, files, dry_run=false, snapshot_properties=None, carry_summary_prefix=None, appended_lower_bounds_above=None))]
+#[allow(clippy::too_many_arguments)]
 fn replace_file_rows_from_paths(
     py: Python<'_>,
     catalogs: HashMap<String, HashMap<String, String>>,
@@ -314,7 +350,9 @@ fn replace_file_rows_from_paths(
     dry_run: bool,
     snapshot_properties: Option<HashMap<String, String>>,
     carry_summary_prefix: Option<String>,
+    appended_lower_bounds_above: Option<Vec<Bound<'_, PyDict>>>,
 ) -> PyResult<HashMap<String, String>> {
+    let floors = bound_floors(appended_lower_bounds_above)?;
     let (catalog_name, namespace, table_name) = split_fqn(&table)?;
     let Some(props) = catalogs.get(&catalog_name).cloned() else {
         return Err(PyValueError::new_err(format!(
@@ -335,7 +373,7 @@ fn replace_file_rows_from_paths(
         runtime().block_on(async move {
             let catalog = crate::merge::get_or_build_catalog(&catalog_name, props).await?;
             let ident = TableIdent::new(namespace, table_name);
-            let out = replace_rows_from_sources(
+            let out = replace_rows_with_floors(
                 catalog.as_ref(),
                 &ident,
                 base_snapshot,
@@ -343,6 +381,7 @@ fn replace_file_rows_from_paths(
                 dry_run,
                 snapshot_properties.unwrap_or_default(),
                 carry_summary_prefix.as_deref(),
+                &floors,
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("replace file rows {table}: {e}")))?;
